@@ -642,6 +642,11 @@ async def run(settings: Settings | None = None) -> None:
                         condition_id=md.condition_id,
                     )
 
+                    # Don't post SELL orders if we don't hold the token (check BEFORE risk limits)
+                    if not paper_mode and market_inv <= 0:
+                        quote_intent.ask_size = None
+                        quote_intent.ask_price = None
+
                     # Apply drawdown adjustments
                     if dd_state.should_widen_quotes:
                         if quote_intent.bid_size:
@@ -661,11 +666,6 @@ async def run(settings: Settings | None = None) -> None:
                             quote_intent.bid_size *= res_mult
                         if quote_intent.ask_size:
                             quote_intent.ask_size *= res_mult
-
-                    # Don't post SELL orders if we don't hold the token
-                    if not paper_mode and market_inv <= 0:
-                        quote_intent.ask_size = None
-                        quote_intent.ask_price = None
 
                     # Execute
                     if quote_intent.has_bid or quote_intent.has_ask:
