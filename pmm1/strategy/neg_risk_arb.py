@@ -91,8 +91,8 @@ class NegRiskArbDetector:
         fee_rate: float = 0.002,  # 20bps per trade
         epsilon: float = 0.01,  # Min edge to execute (1 cent, was 0.005)
         safety_buffer: float = 0.002,  # Extra safety margin
-        min_size: float = 10.0,
-        max_size: float = 300.0,
+        min_size: float = 1.0,
+        max_size: float = 15.0,
         min_price: float = MIN_PRICE_FILTER,
         min_book_depth_usd: float = MIN_BOOK_DEPTH_USD,
         max_book_age_s: float = MAX_BOOK_AGE_S,

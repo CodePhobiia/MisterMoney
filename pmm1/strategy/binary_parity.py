@@ -60,8 +60,8 @@ class BinaryParityDetector:
         self,
         epsilon: float = 0.005,  # 0.5¢ minimum edge
         fee_rate: float = 0.002,  # 20bps per side
-        min_size: float = 10.0,
-        max_size: float = 500.0,
+        min_size: float = 1.0,
+        max_size: float = 15.0,
     ) -> None:
         self.epsilon = epsilon
         self.fee_rate = fee_rate

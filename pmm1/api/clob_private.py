@@ -97,7 +97,7 @@ class OpenOrder(BaseModel):
     outcome: str = ""
     owner: str = ""
     expiration: str = "0"
-    created_at: str = Field(alias="createdAt", default="")
+    created_at: str | int = Field(alias="createdAt", default="")
     associate_trades: list[dict[str, Any]] = Field(alias="associateTrades", default_factory=list)
 
     model_config = {"populate_by_name": True}

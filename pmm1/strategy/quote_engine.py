@@ -62,8 +62,8 @@ class QuoteEngine:
     def __init__(
         self,
         config: PricingConfig,
-        base_size: float = 50.0,
-        max_size: float = 500.0,
+        base_size: float = 5.0,
+        max_size: float = 20.0,
         size_decay_k: float = 0.1,
     ) -> None:
         self.config = config
