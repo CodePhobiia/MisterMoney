@@ -193,10 +193,14 @@ class RiskLimits:
 
         Returns a modified QuoteIntent with sizes reduced to comply with limits.
         """
-        # Per-market check
+        # Compute dollar exposure (shares × price)
+        bid_dollar = (intent.bid_size or 0) * (intent.bid_price or 0)
+        ask_dollar = (intent.ask_size or 0) * (intent.ask_price or 0)
+
+        # Per-market check (in dollar terms)
         market_check = self.check_per_market_gross(
             intent.condition_id,
-            (intent.bid_size or 0) + (intent.ask_size or 0),
+            bid_dollar + ask_dollar,
         )
         if not market_check.passed:
             max_add = market_check.adjustments.get("max_additional", 0)
@@ -205,15 +209,21 @@ class RiskLimits:
                 intent.ask_size = 0
                 logger.warning("risk_zeroed_quote", condition_id=intent.condition_id[:16], reason="per_market_gross")
                 return intent
-            half = max_add / 2
-            intent.bid_size = min(intent.bid_size or 0, half)
-            intent.ask_size = min(intent.ask_size or 0, half)
+            # Convert dollar max back to shares
+            if intent.bid_price and intent.bid_price > 0:
+                intent.bid_size = min(intent.bid_size or 0, max_add / intent.bid_price / 2)
+            if intent.ask_price and intent.ask_price > 0:
+                intent.ask_size = min(intent.ask_size or 0, max_add / intent.ask_price / 2)
 
-        # Event cluster check
+        # Recompute dollar exposure after per-market adjustment
+        bid_dollar = (intent.bid_size or 0) * (intent.bid_price or 0)
+        ask_dollar = (intent.ask_size or 0) * (intent.ask_price or 0)
+
+        # Event cluster check (in dollar terms)
         if event_id:
             cluster_check = self.check_per_event_cluster(
                 event_id,
-                (intent.bid_size or 0) + (intent.ask_size or 0),
+                bid_dollar + ask_dollar,
             )
             if not cluster_check.passed:
                 max_add = cluster_check.adjustments.get("max_additional", 0)
@@ -222,9 +232,10 @@ class RiskLimits:
                     intent.ask_size = 0
                     logger.warning("risk_zeroed_quote", condition_id=intent.condition_id[:16], reason="event_cluster")
                     return intent
-                half = max_add / 2
-                intent.bid_size = min(intent.bid_size or 0, half)
-                intent.ask_size = min(intent.ask_size or 0, half)
+                if intent.bid_price and intent.bid_price > 0:
+                    intent.bid_size = min(intent.bid_size or 0, max_add / intent.bid_price / 2)
+                if intent.ask_price and intent.ask_price > 0:
+                    intent.ask_size = min(intent.ask_size or 0, max_add / intent.ask_price / 2)
 
         # Total directional check
         net_add = (intent.bid_size or 0) - (intent.ask_size or 0)
