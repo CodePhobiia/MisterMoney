@@ -290,10 +290,13 @@ async def run(settings: Settings | None = None) -> None:
     if not paper_mode:
         try:
             balances = await clob_private.get_balances()
-            balance = float(balances.get("balance", 0))
-            allowance = float(balances.get("allowance", 0))
+            raw_balance = float(balances.get("balance", 0))
+            raw_allowance = float(balances.get("allowance", 0))
+            # CLOB returns raw USDC units (6 decimals) — convert to dollars
+            balance = raw_balance / 1e6 if raw_balance > 1000 else raw_balance
+            allowance = raw_allowance / 1e6 if raw_allowance > 1000 else raw_allowance
             state.inventory_manager.update_balances(balance, allowance)
-            logger.info("balances_loaded", balance=balance, allowance=allowance)
+            logger.info("balances_loaded", balance=f"${balance:.2f}", allowance=f"${allowance:.2f}", raw=raw_balance)
         except Exception as e:
             logger.warning("balances_load_failed", error=str(e))
 
@@ -443,6 +446,11 @@ async def run(settings: Settings | None = None) -> None:
                         state.mode = "FLATTEN_ONLY"
                     await asyncio.sleep(1.0)
                     continue
+                else:
+                    # Kill switch cleared — resume quoting
+                    if state.mode == "FLATTEN_ONLY":
+                        logger.info("kill_switch_cleared_resuming_quoting")
+                        state.mode = "QUOTING"
 
             # ── Drawdown check ──
             if state.drawdown.should_check_daily_reset():
