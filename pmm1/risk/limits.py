@@ -1,0 +1,238 @@
+"""Risk limits — hard caps from §14.
+
+| Limit                    | Default |
+|--------------------------|---------|
+| Per-market gross         | 2% NAV  |
+| Per-event cluster        | 5% NAV  |
+| Total directional net    | 10% NAV |
+| Total arb gross          | 25% NAV |
+| Max orders per market    | 3       |
+| Max quoted markets       | 20      |
+
+Dynamic caps shrink on: rising volatility, rising model error,
+falling time-to-catalyst, deepening drawdown, falling reward EV.
+"""
+
+from __future__ import annotations
+
+import structlog
+from pydantic import BaseModel
+
+from pmm1.settings import RiskConfig
+from pmm1.state.inventory import InventoryManager
+from pmm1.state.positions import PositionTracker
+from pmm1.strategy.quote_engine import QuoteIntent
+
+logger = structlog.get_logger(__name__)
+
+
+class LimitCheckResult(BaseModel):
+    """Result of a risk limit check."""
+
+    passed: bool = True
+    breaches: list[str] = []
+    adjustments: dict[str, float] = {}  # field → adjusted value
+
+
+class RiskLimits:
+    """Enforces hard risk caps on positions and orders."""
+
+    def __init__(
+        self,
+        config: RiskConfig,
+        position_tracker: PositionTracker,
+        inventory_manager: InventoryManager,
+    ) -> None:
+        self.config = config
+        self.positions = position_tracker
+        self.inventory = inventory_manager
+        self._nav: float = 0.0
+        # Dynamic multiplier (1.0 = normal, <1.0 = tighter)
+        self._dynamic_multiplier: float = 1.0
+
+    def update_nav(self, nav: float) -> None:
+        """Update current NAV for percentage-based limits."""
+        self._nav = nav
+
+    def set_dynamic_multiplier(self, multiplier: float) -> None:
+        """Adjust limits dynamically based on market conditions.
+
+        multiplier < 1.0 tightens limits (higher vol, drawdown, etc.)
+        """
+        self._dynamic_multiplier = max(0.1, min(1.0, multiplier))
+
+    def _effective_limit(self, base_limit: float) -> float:
+        """Apply dynamic multiplier to a base limit."""
+        return base_limit * self._dynamic_multiplier
+
+    def check_per_market_gross(
+        self,
+        condition_id: str,
+        proposed_additional: float = 0.0,
+    ) -> LimitCheckResult:
+        """Check per-market gross exposure limit (default: 2% NAV)."""
+        if self._nav <= 0:
+            return LimitCheckResult(passed=True)
+
+        pos = self.positions.get(condition_id)
+        current_gross = pos.gross_exposure if pos else 0.0
+        new_gross = current_gross + proposed_additional
+        limit = self._effective_limit(self.config.per_market_gross_nav) * self._nav
+
+        if new_gross > limit:
+            return LimitCheckResult(
+                passed=False,
+                breaches=[
+                    f"per_market_gross: {new_gross:.2f} > {limit:.2f} "
+                    f"({self.config.per_market_gross_nav*100:.1f}% NAV)"
+                ],
+                adjustments={"max_additional": max(0, limit - current_gross)},
+            )
+        return LimitCheckResult(passed=True)
+
+    def check_per_event_cluster(
+        self,
+        event_id: str,
+        proposed_additional: float = 0.0,
+    ) -> LimitCheckResult:
+        """Check per-event cluster exposure limit (default: 5% NAV)."""
+        if self._nav <= 0:
+            return LimitCheckResult(passed=True)
+
+        current_gross = self.positions.get_event_gross_exposure(event_id)
+        new_gross = current_gross + proposed_additional
+        limit = self._effective_limit(self.config.per_event_cluster_nav) * self._nav
+
+        if new_gross > limit:
+            return LimitCheckResult(
+                passed=False,
+                breaches=[
+                    f"per_event_cluster: {new_gross:.2f} > {limit:.2f} "
+                    f"({self.config.per_event_cluster_nav*100:.1f}% NAV)"
+                ],
+                adjustments={"max_additional": max(0, limit - current_gross)},
+            )
+        return LimitCheckResult(passed=True)
+
+    def check_total_directional(
+        self,
+        proposed_additional_net: float = 0.0,
+    ) -> LimitCheckResult:
+        """Check total directional net exposure limit (default: 10% NAV)."""
+        if self._nav <= 0:
+            return LimitCheckResult(passed=True)
+
+        current_net = self.positions.get_total_net_exposure()
+        new_net = current_net + abs(proposed_additional_net)
+        limit = self._effective_limit(self.config.total_directional_nav) * self._nav
+
+        if new_net > limit:
+            return LimitCheckResult(
+                passed=False,
+                breaches=[
+                    f"total_directional: {new_net:.2f} > {limit:.2f} "
+                    f"({self.config.total_directional_nav*100:.1f}% NAV)"
+                ],
+            )
+        return LimitCheckResult(passed=True)
+
+    def check_total_arb_gross(
+        self,
+        proposed_additional: float = 0.0,
+    ) -> LimitCheckResult:
+        """Check total arb gross exposure limit (default: 25% NAV)."""
+        if self._nav <= 0:
+            return LimitCheckResult(passed=True)
+
+        # Count arb positions (simplified: all positions for now)
+        current_arb = self.positions.get_total_gross_exposure()
+        new_arb = current_arb + proposed_additional
+        limit = self._effective_limit(self.config.total_arb_gross_nav) * self._nav
+
+        if new_arb > limit:
+            return LimitCheckResult(
+                passed=False,
+                breaches=[
+                    f"total_arb_gross: {new_arb:.2f} > {limit:.2f} "
+                    f"({self.config.total_arb_gross_nav*100:.1f}% NAV)"
+                ],
+            )
+        return LimitCheckResult(passed=True)
+
+    def check_order_count(
+        self,
+        token_id: str,
+        side: str,
+        current_count: int,
+    ) -> LimitCheckResult:
+        """Check max orders per market side (default: 3)."""
+        limit = self.config.max_orders_per_market_side
+        if current_count >= limit:
+            return LimitCheckResult(
+                passed=False,
+                breaches=[f"max_orders_per_side: {current_count} >= {limit}"],
+            )
+        return LimitCheckResult(passed=True)
+
+    def check_quoted_markets(self, current_count: int) -> LimitCheckResult:
+        """Check max quoted markets (default: 20)."""
+        limit = self.config.max_quoted_markets
+        if current_count >= limit:
+            return LimitCheckResult(
+                passed=False,
+                breaches=[f"max_quoted_markets: {current_count} >= {limit}"],
+            )
+        return LimitCheckResult(passed=True)
+
+    def apply_to_quote(
+        self,
+        intent: QuoteIntent,
+        event_id: str = "",
+    ) -> QuoteIntent:
+        """Apply all risk limits to a quote intent, adjusting sizes as needed.
+
+        Returns a modified QuoteIntent with sizes reduced to comply with limits.
+        """
+        # Per-market check
+        market_check = self.check_per_market_gross(
+            intent.condition_id,
+            (intent.bid_size or 0) + (intent.ask_size or 0),
+        )
+        if not market_check.passed:
+            max_add = market_check.adjustments.get("max_additional", 0)
+            if max_add <= 0:
+                intent.bid_size = 0
+                intent.ask_size = 0
+                logger.warning("risk_zeroed_quote", condition_id=intent.condition_id[:16], reason="per_market_gross")
+                return intent
+            half = max_add / 2
+            intent.bid_size = min(intent.bid_size or 0, half)
+            intent.ask_size = min(intent.ask_size or 0, half)
+
+        # Event cluster check
+        if event_id:
+            cluster_check = self.check_per_event_cluster(
+                event_id,
+                (intent.bid_size or 0) + (intent.ask_size or 0),
+            )
+            if not cluster_check.passed:
+                max_add = cluster_check.adjustments.get("max_additional", 0)
+                if max_add <= 0:
+                    intent.bid_size = 0
+                    intent.ask_size = 0
+                    logger.warning("risk_zeroed_quote", condition_id=intent.condition_id[:16], reason="event_cluster")
+                    return intent
+                half = max_add / 2
+                intent.bid_size = min(intent.bid_size or 0, half)
+                intent.ask_size = min(intent.ask_size or 0, half)
+
+        # Total directional check
+        net_add = (intent.bid_size or 0) - (intent.ask_size or 0)
+        dir_check = self.check_total_directional(net_add)
+        if not dir_check.passed:
+            # Scale down proportionally
+            intent.bid_size = (intent.bid_size or 0) * 0.5
+            intent.ask_size = (intent.ask_size or 0) * 0.5
+            logger.warning("risk_scaled_quote", condition_id=intent.condition_id[:16], reason="total_directional")
+
+        return intent
