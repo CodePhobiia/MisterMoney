@@ -619,6 +619,10 @@ async def run(settings: Settings | None = None) -> None:
                     # Fair value
                     fv_estimate = state.fair_value_model.compute_fair_value(features)
 
+                    # Skip extreme prices where min order can't be met profitably
+                    if fv_estimate.fair_value < 0.05 or fv_estimate.fair_value > 0.95:
+                        continue
+
                     # Inventory
                     pos = state.position_tracker.get(md.condition_id)
                     market_inv = pos.net_exposure if pos else 0.0

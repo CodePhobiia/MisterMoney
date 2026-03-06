@@ -35,10 +35,10 @@ pricing:
   reward_capture_weight: 0.7
 
 risk:
-  per_market_gross_nav: 0.05
-  per_event_cluster_nav: 0.10
-  total_directional_nav: 0.20
-  total_arb_gross_nav: 0.30
+  per_market_gross_nav: 0.08
+  per_event_cluster_nav: 0.15
+  total_directional_nav: 0.30
+  total_arb_gross_nav: 0.40
   daily_pause_drawdown_nav: 0.015
   daily_flatten_drawdown_nav: 0.04
 
