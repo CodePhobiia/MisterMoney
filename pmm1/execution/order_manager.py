@@ -173,6 +173,7 @@ class OrderManager:
                     expiration=expiration,
                     neg_risk=intent.neg_risk,
                     post_only=self._post_only,
+                    tick_size=str(tick_size),
                 ))
         else:
             # No desired bid → cancel all live bids
@@ -216,6 +217,7 @@ class OrderManager:
                     expiration=expiration,
                     neg_risk=intent.neg_risk,
                     post_only=self._post_only,
+                    tick_size=str(tick_size),
                 ))
         else:
             for live in live_asks:

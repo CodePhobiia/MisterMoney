@@ -156,6 +156,8 @@ async def run(settings: Settings | None = None) -> None:
         api_passphrase=settings.api.api_passphrase,
         funder=settings.api.funder,
         wallet_address=settings.wallet.address,
+        private_key=settings.wallet.private_key,
+        chain_id=settings.wallet.chain_id,
     )
     data_api = DataApiClient(settings.api.data_url)
 
