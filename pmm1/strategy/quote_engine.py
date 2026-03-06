@@ -277,6 +277,15 @@ class QuoteEngine:
         bid_size = max(1.0, round(bid_size, 2))
         ask_size = max(1.0, round(ask_size, 2))
 
+        # Enforce minimum dollar value per order ($1 min on Polymarket)
+        min_dollar = 1.5  # $1.50 to clear the $1 minimum with margin
+        if bid_price > 0:
+            min_bid_shares = min_dollar / bid_price
+            bid_size = max(bid_size, round(min_bid_shares + 0.5, 2))
+        if ask_price > 0:
+            min_ask_shares = min_dollar / ask_price
+            ask_size = max(ask_size, round(min_ask_shares + 0.5, 2))
+
         intent = QuoteIntent(
             token_id=token_id,
             condition_id=condition_id,

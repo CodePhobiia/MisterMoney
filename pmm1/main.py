@@ -662,6 +662,11 @@ async def run(settings: Settings | None = None) -> None:
                         if quote_intent.ask_size:
                             quote_intent.ask_size *= res_mult
 
+                    # Don't post SELL orders if we don't hold the token
+                    if not paper_mode and market_inv <= 0:
+                        quote_intent.ask_size = None
+                        quote_intent.ask_price = None
+
                     # Execute
                     if quote_intent.has_bid or quote_intent.has_ask:
                         if paper_mode and paper_engine and paper_logger:
