@@ -1,0 +1,5 @@
+# Production overrides — inherits from default.yaml
+# Override any section here to customize for production deployment
+
+bot:
+  env: prod

@@ -1,0 +1,50 @@
+bot:
+  name: PMM-1
+  env: prod
+  max_markets: 20
+  quote_cycle_ms: 250
+  reconcile_orders_s: 30
+  reconcile_positions_s: 60
+
+wallet:
+  type: EOA
+  chain_id: 137
+
+market_filters:
+  min_time_to_end_hours: 24
+  min_volume_24h_usd: 50000
+  max_top_spread_cents: 4
+  min_depth_within_2c_shares: 2000
+  allow_sports: false
+  allow_crypto_intraday: false
+  require_clear_rules: true
+
+strategy:
+  enable_binary_parity: true
+  enable_neg_risk_arb: true
+  enable_market_making: true
+  enable_directional_overlay: false
+
+pricing:
+  base_half_spread_cents: 1.0
+  inventory_skew_gamma: 0.015
+  cluster_skew_eta: 0.02
+  take_threshold_cents: 0.8
+  reward_capture_weight: 0.7
+
+risk:
+  per_market_gross_nav: 0.02
+  per_event_cluster_nav: 0.05
+  total_directional_nav: 0.10
+  total_arb_gross_nav: 0.25
+  daily_pause_drawdown_nav: 0.015
+  daily_flatten_drawdown_nav: 0.04
+
+execution:
+  post_only: true
+  order_ttl_effective_s: 30
+  heartbeat_s: 5
+  ws_stale_kill_s: 2
+  max_batch_orders: 15
+  retry_backoff_initial_ms: 1000
+  retry_backoff_max_ms: 30000
