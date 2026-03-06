@@ -71,7 +71,9 @@ class HeartbeatState:
         """Send a single heartbeat. Returns True on success."""
         self._last_attempt_ts = time.time()
         try:
-            resp = await self._client.send_heartbeat()
+            # Pass previous heartbeat_id (or None on first call)
+            hb_id = self._last_heartbeat_id if self._last_heartbeat_id else None
+            resp = await self._client.send_heartbeat(heartbeat_id=hb_id)
             self._last_heartbeat_id = resp.heartbeat_id
             self._last_success_ts = time.time()
             self._consecutive_failures = 0

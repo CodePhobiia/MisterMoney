@@ -35,6 +35,7 @@ class UserWebSocket:
         api_key: str = "",
         api_secret: str = "",
         api_passphrase: str = "",
+        wallet_address: str = "",
         order_tracker: OrderTracker | None = None,
         reconnect_delay_s: float = 1.0,
         max_reconnect_delay_s: float = 30.0,
@@ -47,6 +48,7 @@ class UserWebSocket:
         self._api_key = api_key
         self._api_secret = api_secret
         self._api_passphrase = api_passphrase
+        self._wallet_address = wallet_address
         self._orders = order_tracker or OrderTracker()
         self._reconnect_delay = reconnect_delay_s
         self._max_reconnect_delay = max_reconnect_delay_s
@@ -64,29 +66,34 @@ class UserWebSocket:
         self._message_count: int = 0
         self._reconnect_count: int = 0
 
+    def _ws_is_open(self) -> bool:
+        """Check if the WebSocket connection is open (compatible with websockets 15.x+)."""
+        if self._ws is None:
+            return False
+        try:
+            from websockets.protocol import State
+            return self._ws.state is State.OPEN
+        except (ImportError, AttributeError):
+            return getattr(self._ws, 'open', False)
+
     @property
     def is_connected(self) -> bool:
-        return self._ws is not None and self._ws.open
+        return self._ws_is_open()
 
-    def _build_auth_message(self) -> dict[str, Any]:
-        """Build authentication message for the user WebSocket."""
-        timestamp = str(int(time.time()))
-        message = timestamp + "GET" + "/ws/user"
-        signature = hmac.new(
-            self._api_secret.encode("utf-8"),
-            message.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
+    def _build_auth_message(self, market_ids: list[str] | None = None) -> dict[str, Any]:
+        """Build authentication message for the user WebSocket.
 
+        Per Polymarket docs, the user channel auth uses raw credentials
+        (apiKey, secret, passphrase) — NOT an HMAC signature.
+        """
         return {
-            "type": "subscribe",
-            "channel": "user",
             "auth": {
                 "apiKey": self._api_key,
-                "signature": signature,
-                "timestamp": timestamp,
+                "secret": self._api_secret,
                 "passphrase": self._api_passphrase,
             },
+            "markets": market_ids or [],
+            "type": "user",
         }
 
     async def connect(self) -> None:
@@ -94,8 +101,8 @@ class UserWebSocket:
         logger.info("user_ws_connecting", url=self._ws_url)
         self._ws = await websockets.connect(
             self._ws_url,
-            ping_interval=20,
-            ping_timeout=10,
+            ping_interval=None,  # We handle PING/PONG at text level
+            ping_timeout=None,
             close_timeout=5,
             max_size=5 * 1024 * 1024,
         )
@@ -199,10 +206,22 @@ class UserWebSocket:
         if self._on_settlement:
             await self._on_settlement(msg)
 
+    async def _ping_loop(self) -> None:
+        """Send PING text every 10s as required by Polymarket WS."""
+        while self._is_running and self._ws_is_open():
+            try:
+                await self._ws.send("PING")
+            except Exception:
+                break
+            await asyncio.sleep(10)
+
     async def _listen_loop(self) -> None:
         """Main message processing loop."""
         if not self._ws:
             return
+
+        # Start PING heartbeat in parallel
+        ping_task = asyncio.create_task(self._ping_loop())
 
         try:
             async for message in self._ws:
@@ -210,11 +229,20 @@ class UserWebSocket:
                     break
                 if isinstance(message, bytes):
                     message = message.decode("utf-8")
+                # Skip PONG responses
+                if message.strip() == "PONG":
+                    continue
                 await self._handle_message(message)
         except websockets.ConnectionClosed as e:
             logger.warning("user_ws_closed", code=e.code, reason=e.reason)
         except Exception as e:
             logger.error("user_ws_error", error=str(e))
+        finally:
+            ping_task.cancel()
+            try:
+                await ping_task
+            except asyncio.CancelledError:
+                pass
 
     async def _run_with_reconnect(self) -> None:
         """Run the WebSocket with automatic reconnection."""
@@ -252,7 +280,7 @@ class UserWebSocket:
     async def stop(self) -> None:
         """Stop the WebSocket connection."""
         self._is_running = False
-        if self._ws and self._ws.open:
+        if self._ws_is_open():
             await self._ws.close()
         if self._task and not self._task.done():
             self._task.cancel()

@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+
+# runtime artifacts
+pmm1/**/__pycache__/
+data/recordings/

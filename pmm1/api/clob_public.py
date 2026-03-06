@@ -127,8 +127,12 @@ class ClobPublicClient:
 
     async def get_server_time(self) -> int:
         """Get server time in epoch seconds."""
-        data = await self._get("/time")
-        return int(data)
+        session = await self._get_session()
+        url = f"{self.base_url}/time"
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+            return int(text.strip())
 
     async def get_order_book(self, token_id: str) -> OrderBookResponse:
         """Fetch full order book for a token (asset) ID."""

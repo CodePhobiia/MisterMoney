@@ -145,14 +145,14 @@ class DataApiClient:
 
         while True:
             params: dict[str, Any] = {
-                "address": address,
+                "user": address,  # API uses "user" not "address"
                 "limit": str(limit),
                 "offset": str(current_offset),
             }
             if market:
                 params["market"] = market
             if redeemed is not None:
-                params["redeemed"] = str(redeemed).lower()
+                params["redeemable"] = str(redeemed).lower()  # API uses "redeemable"
 
             data = await self._get("/positions", params=params)
             items = data if isinstance(data, list) else data.get("positions", [])

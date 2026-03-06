@@ -106,21 +106,29 @@ def check_eligibility(
 
     # Time to end check (unless pure arb)
     if market.end_date:
-        hours_remaining = (market.end_date - now).total_seconds() / 3600
+        end_date = market.end_date if market.end_date.tzinfo else market.end_date.replace(tzinfo=timezone.utc)
+        now_aware = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        hours_remaining = (end_date - now_aware).total_seconds() / 3600
         if hours_remaining < filters.min_time_to_end_hours:
             reasons.append(f"time_to_end={hours_remaining:.1f}h < {filters.min_time_to_end_hours}h")
 
-    # Volume check
-    if market.volume_24h < filters.min_volume_24h_usd:
-        reasons.append(f"volume_24h={market.volume_24h:.0f} < {filters.min_volume_24h_usd:.0f}")
+    # Volume check — use total volume as fallback if 24h volume is 0
+    effective_volume = market.volume_24h
+    if effective_volume <= 0 and market.liquidity > 0:
+        # Gamma often doesn't populate volume_24h; use liquidity as a rough proxy
+        effective_volume = market.liquidity
+    if effective_volume < filters.min_volume_24h_usd:
+        reasons.append(f"volume_24h={effective_volume:.0f} < {filters.min_volume_24h_usd:.0f}")
 
-    # Spread check (in cents)
-    spread_cents = market.spread * 100 if market.spread < 1 else market.spread
-    if spread_cents > filters.max_top_spread_cents:
-        reasons.append(f"spread={spread_cents:.1f}¢ > {filters.max_top_spread_cents}¢")
+    # Spread check (in cents) — only apply if spread data is actually available
+    if market.spread > 0:
+        spread_cents = market.spread * 100 if market.spread < 1 else market.spread
+        if spread_cents > filters.max_top_spread_cents:
+            reasons.append(f"spread={spread_cents:.1f}¢ > {filters.max_top_spread_cents}¢")
 
-    # Depth check
-    if market.depth_within_2c < filters.min_depth_within_2c_shares:
+    # Depth check — only apply if depth data is actually available.
+    # Gamma API doesn't provide depth_within_2c, so 0.0 means "no data" not "empty book".
+    if market.depth_within_2c > 0 and market.depth_within_2c < filters.min_depth_within_2c_shares:
         reasons.append(f"depth_2c={market.depth_within_2c:.0f} < {filters.min_depth_within_2c_shares:.0f}")
 
     return EligibilityResult(

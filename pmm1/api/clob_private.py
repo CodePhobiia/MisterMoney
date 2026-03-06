@@ -139,15 +139,20 @@ def _build_hmac_signature(
 ) -> str:
     """Build HMAC-SHA256 signature for API authentication.
 
-    The signature message is: timestamp + method + path + body
+    Matches the py-clob-client SDK signing:
+    - Secret is base64url-decoded before use as HMAC key
+    - Message is: timestamp + method + path + body
+    - Result is base64url-encoded
     """
-    message = timestamp + method.upper() + path + body
-    signature = hmac.new(
-        api_secret.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return signature
+    import base64
+
+    base64_secret = base64.urlsafe_b64decode(api_secret)
+    message = str(timestamp) + method.upper() + path
+    if body:
+        # Match SDK: replace single quotes with double quotes for consistency
+        message += body.replace("'", '"')
+    h = hmac.new(base64_secret, message.encode("utf-8"), hashlib.sha256)
+    return base64.urlsafe_b64encode(h.digest()).decode("utf-8")
 
 
 class ClobPrivateClient:
@@ -160,12 +165,14 @@ class ClobPrivateClient:
         api_secret: str = "",
         api_passphrase: str = "",
         funder: str = "",
+        wallet_address: str = "",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.api_secret = api_secret
         self.api_passphrase = api_passphrase
         self.funder = funder
+        self.wallet_address = wallet_address
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -181,15 +188,20 @@ class ClobPrivateClient:
             await self._session.close()
 
     def _auth_headers(self, method: str, path: str, body: str = "") -> dict[str, str]:
-        """Build authentication headers for a request."""
+        """Build authentication headers for a request.
+
+        Matches the py-clob-client SDK header format (Level 2 auth):
+        POLY_ADDRESS, POLY_SIGNATURE, POLY_TIMESTAMP, POLY_API_KEY, POLY_PASSPHRASE
+        """
         timestamp = str(int(time.time()))
         signature = _build_hmac_signature(
             self.api_secret, timestamp, method, path, body
         )
         headers = {
-            "POLY_API_KEY": self.api_key,
+            "POLY_ADDRESS": self.wallet_address,
             "POLY_SIGNATURE": signature,
             "POLY_TIMESTAMP": timestamp,
+            "POLY_API_KEY": self.api_key,
             "POLY_PASSPHRASE": self.api_passphrase,
         }
         if self.funder:
@@ -208,7 +220,8 @@ class ClobPrivateClient:
         url = f"{self.base_url}{path}"
 
         import json as json_mod
-        body_str = json_mod.dumps(json_body) if json_body else ""
+        # Use compact separators matching SDK: json.dumps(body, separators=(",", ":"))
+        body_str = json_mod.dumps(json_body, separators=(",", ":"), ensure_ascii=False) if json_body is not None else ""
         auth_headers = self._auth_headers(method.upper(), path, body_str)
 
         headers = {
@@ -218,8 +231,9 @@ class ClobPrivateClient:
 
         logger.debug("clob_private_request", method=method, path=path)
 
+        # Send pre-serialized body to match the signature exactly
         async with session.request(
-            method, url, json=json_body, params=params, headers=headers
+            method, url, data=body_str if body_str else None, params=params, headers=headers
         ) as resp:
             if resp.status == 425:
                 raise ClobRestartError("Matching engine restarting (425)")
@@ -335,33 +349,52 @@ class ClobPrivateClient:
         market: str | None = None,
         asset_id: str | None = None,
     ) -> list[OpenOrder]:
-        """Get all open orders, optionally filtered by market or asset."""
+        """Get all open orders, optionally filtered by market or asset.
+
+        Uses GET /data/orders per the SDK (not /orders which is POST-only).
+        """
         params: dict[str, Any] = {}
         if market:
             params["market"] = market
         if asset_id:
             params["asset_id"] = asset_id
 
-        data = await self._request("GET", "/orders", params=params)
-        orders_data = data if isinstance(data, list) else data.get("orders", [])
+        data = await self._request("GET", "/data/orders", params=params)
+        # SDK returns paginated: {"data": [...], "next_cursor": "..."}
+        if isinstance(data, dict):
+            orders_data = data.get("data", data.get("orders", []))
+        else:
+            orders_data = data
         orders = [OpenOrder.model_validate(o) for o in orders_data]
         logger.debug("open_orders_fetched", count=len(orders))
         return orders
 
-    async def send_heartbeat(self) -> HeartbeatResponse:
+    async def send_heartbeat(self, heartbeat_id: str | None = None) -> HeartbeatResponse:
         """Send a REST heartbeat to keep orders alive.
 
         Must be sent every 5s (with 10s + 5s server grace).
         Failure → server cancels all orders.
+
+        Uses POST /v1/heartbeats with a JSON body per the SDK.
         """
-        data = await self._request("GET", "/heartbeat")
+        payload = {"heartbeat_id": heartbeat_id}
+        data = await self._request("POST", "/v1/heartbeats", json_body=payload)
         resp = HeartbeatResponse.model_validate(data)
         logger.debug("heartbeat_sent", heartbeat_id=resp.heartbeat_id)
         return resp
 
-    async def get_balances(self) -> dict[str, Any]:
-        """Get account balances (USDC allowance + balance)."""
-        data = await self._request("GET", "/balance")
+    async def get_balances(self, signature_type: int = 0) -> dict[str, Any]:
+        """Get account balances (USDC allowance + balance).
+
+        Uses GET /balance-allowance per the SDK.
+        Requires asset_type (CONDITIONAL or COLLATERAL) and signature_type.
+        """
+        params = {
+            "asset_type": "COLLATERAL",
+            "token_id": "",
+            "signature_type": str(signature_type),
+        }
+        data = await self._request("GET", "/balance-allowance", params=params)
         logger.debug("balances_fetched", data=data)
         return data
 

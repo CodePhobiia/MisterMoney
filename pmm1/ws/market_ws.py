@@ -66,9 +66,19 @@ class MarketWebSocket:
     def book_manager(self) -> BookManager:
         return self._books
 
+    def _ws_is_open(self) -> bool:
+        """Check if the WebSocket connection is open (compatible with websockets 15.x+)."""
+        if self._ws is None:
+            return False
+        try:
+            from websockets.protocol import State
+            return self._ws.state is State.OPEN
+        except (ImportError, AttributeError):
+            return getattr(self._ws, 'open', False)
+
     @property
     def is_connected(self) -> bool:
-        return self._ws is not None and self._ws.open
+        return self._ws_is_open()
 
     @property
     def seconds_since_last_message(self) -> float:
@@ -86,8 +96,8 @@ class MarketWebSocket:
         logger.info("market_ws_connecting", url=self._ws_url)
         self._ws = await websockets.connect(
             self._ws_url,
-            ping_interval=20,
-            ping_timeout=10,
+            ping_interval=None,  # We handle PING/PONG at text level
+            ping_timeout=None,
             close_timeout=5,
             max_size=10 * 1024 * 1024,  # 10 MB max message
         )
@@ -95,7 +105,7 @@ class MarketWebSocket:
 
     async def subscribe(self, asset_ids: list[str]) -> None:
         """Subscribe to asset IDs for book updates."""
-        if not self._ws or not self._ws.open:
+        if not self._ws_is_open():
             raise ConnectionError("WebSocket not connected")
 
         new_assets = set(asset_ids) - self._subscribed_assets
@@ -103,11 +113,10 @@ class MarketWebSocket:
         if not new_assets:
             return
 
-        # Polymarket WS subscription message format
+        # Polymarket WS subscription message format (per docs)
         sub_msg = {
-            "type": "subscribe",
-            "channel": "market",
             "assets_ids": list(new_assets),  # Note: assets_ids (plural)
+            "type": "market",
         }
 
         await self._ws.send(json.dumps(sub_msg))
@@ -116,13 +125,12 @@ class MarketWebSocket:
 
     async def unsubscribe(self, asset_ids: list[str]) -> None:
         """Unsubscribe from asset IDs."""
-        if not self._ws or not self._ws.open:
+        if not self._ws_is_open():
             return
 
         unsub_msg = {
-            "type": "unsubscribe",
-            "channel": "market",
             "assets_ids": asset_ids,
+            "operation": "unsubscribe",
         }
         await self._ws.send(json.dumps(unsub_msg))
         self._subscribed_assets -= set(asset_ids)
@@ -227,10 +235,22 @@ class MarketWebSocket:
             if self._on_tick_change:
                 await self._on_tick_change(asset_id, new_tick_decimal)
 
+    async def _ping_loop(self) -> None:
+        """Send PING text every 10s as required by Polymarket WS."""
+        while self._is_running and self._ws_is_open():
+            try:
+                await self._ws.send("PING")
+            except Exception:
+                break
+            await asyncio.sleep(10)
+
     async def _listen_loop(self) -> None:
         """Main message processing loop."""
         if not self._ws:
             return
+
+        # Start PING heartbeat in parallel
+        ping_task = asyncio.create_task(self._ping_loop())
 
         try:
             async for message in self._ws:
@@ -238,11 +258,20 @@ class MarketWebSocket:
                     break
                 if isinstance(message, bytes):
                     message = message.decode("utf-8")
+                # Skip PONG responses
+                if message.strip() == "PONG":
+                    continue
                 await self._handle_message(message)
         except websockets.ConnectionClosed as e:
             logger.warning("market_ws_closed", code=e.code, reason=e.reason)
         except Exception as e:
             logger.error("market_ws_error", error=str(e))
+        finally:
+            ping_task.cancel()
+            try:
+                await ping_task
+            except asyncio.CancelledError:
+                pass
 
     async def _run_with_reconnect(self) -> None:
         """Run the WebSocket with automatic reconnection."""
@@ -283,7 +312,7 @@ class MarketWebSocket:
     async def stop(self) -> None:
         """Stop the WebSocket connection."""
         self._is_running = False
-        if self._ws and self._ws.open:
+        if self._ws_is_open():
             await self._ws.close()
         if self._task and not self._task.done():
             self._task.cancel()

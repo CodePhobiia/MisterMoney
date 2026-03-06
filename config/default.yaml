@@ -12,9 +12,9 @@ wallet:
 
 market_filters:
   min_time_to_end_hours: 24
-  min_volume_24h_usd: 50000
-  max_top_spread_cents: 4
-  min_depth_within_2c_shares: 2000
+  min_volume_24h_usd: 1000
+  max_top_spread_cents: 10
+  min_depth_within_2c_shares: 0
   allow_sports: false
   allow_crypto_intraday: false
   require_clear_rules: true
@@ -44,7 +44,7 @@ execution:
   post_only: true
   order_ttl_effective_s: 30
   heartbeat_s: 5
-  ws_stale_kill_s: 2
+  ws_stale_kill_s: 10
   max_batch_orders: 15
   retry_backoff_initial_ms: 1000
   retry_backoff_max_ms: 30000

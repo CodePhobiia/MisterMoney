@@ -35,9 +35,9 @@ class MarketFiltersConfig(BaseModel):
     """Universe selection filters."""
 
     min_time_to_end_hours: int = 24
-    min_volume_24h_usd: float = 50_000
-    max_top_spread_cents: float = 4.0
-    min_depth_within_2c_shares: float = 2000
+    min_volume_24h_usd: float = 1_000  # Lowered from 50k; Gamma volume_24h often sparse
+    max_top_spread_cents: float = 10.0  # Widened from 4c; let scoring handle preference
+    min_depth_within_2c_shares: float = 0  # Gamma doesn't provide depth; skip by default
     allow_sports: bool = False
     allow_crypto_intraday: bool = False
     require_clear_rules: bool = True
@@ -101,7 +101,7 @@ class ExecutionConfig(BaseModel):
     post_only: bool = True
     order_ttl_effective_s: int = 30
     heartbeat_s: int = 5
-    ws_stale_kill_s: int = 2
+    ws_stale_kill_s: int = 10
     max_batch_orders: int = 15
     retry_backoff_initial_ms: int = 1000
     retry_backoff_max_ms: int = 30000
@@ -206,7 +206,22 @@ def load_settings(
                 override_data = yaml.safe_load(f) or {}
             yaml_data = _deep_merge(yaml_data, override_data)
 
+    # Load .env file if present (dotenv-style)
+    env_file = project_root / ".env"
+    if env_file.exists():
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                # Don't override existing env vars
+                if k not in os.environ:
+                    os.environ[k] = v
+
     # Inject sensitive fields from environment into yaml_data before Settings parse
+    # Support both PMM1_* prefixed names and the direct names from .env
     env_mappings = {
         "PMM1_WALLET_PRIVATE_KEY": ("wallet", "private_key"),
         "PMM1_WALLET_ADDRESS": ("wallet", "address"),
@@ -216,6 +231,14 @@ def load_settings(
         "PMM1_API_FUNDER": ("api", "funder"),
         "PMM1_REDIS_URL": ("storage", "redis_url"),
         "PMM1_POSTGRES_DSN": ("storage", "postgres_dsn"),
+        # Direct .env names (without PMM1_ prefix)
+        "PRIVATE_KEY": ("wallet", "private_key"),
+        "WALLET_ADDRESS": ("wallet", "address"),
+        "CHAIN_ID": ("wallet", "chain_id"),
+        "CLOB_HOST": ("api", "clob_url"),
+        "POLY_API_KEY": ("api", "api_key"),
+        "POLY_API_SECRET": ("api", "api_secret"),
+        "POLY_PASSPHRASE": ("api", "api_passphrase"),
     }
 
     for env_var, (section, key) in env_mappings.items():

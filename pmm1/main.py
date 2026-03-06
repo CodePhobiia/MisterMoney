@@ -153,6 +153,7 @@ async def run(settings: Settings | None = None) -> None:
         api_secret=settings.api.api_secret,
         api_passphrase=settings.api.api_passphrase,
         funder=settings.api.funder,
+        wallet_address=settings.wallet.address,
     )
     data_api = DataApiClient(settings.api.data_url)
 
@@ -335,6 +336,7 @@ async def run(settings: Settings | None = None) -> None:
         api_key=settings.api.api_key,
         api_secret=settings.api.api_secret,
         api_passphrase=settings.api.api_passphrase,
+        wallet_address=settings.wallet.address,
         order_tracker=state.order_tracker,
         on_reconnect=on_reconnect,
     )
