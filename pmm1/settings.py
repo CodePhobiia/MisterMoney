@@ -20,6 +20,8 @@ class BotConfig(BaseModel):
     quote_cycle_ms: int = 250
     reconcile_orders_s: int = 30
     reconcile_positions_s: int = 60
+    paper_mode: bool = True
+    paper_nav: float = 100.0
 
 
 class WalletConfig(BaseModel):

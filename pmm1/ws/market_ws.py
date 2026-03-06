@@ -46,7 +46,9 @@ class MarketWebSocket:
         on_tick_change: Callable[[str, Decimal], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
         self._ws_url = ws_url
-        self._books = book_manager or BookManager()
+        # IMPORTANT: don't use `book_manager or BookManager()` because an empty
+        # BookManager is falsy (__len__ == 0) and would incorrectly create a new instance.
+        self._books = book_manager if book_manager is not None else BookManager()
         self._reconnect_delay = reconnect_delay_s
         self._max_reconnect_delay = max_reconnect_delay_s
 

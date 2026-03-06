@@ -279,6 +279,9 @@ class FeatureEngine:
         time_to_resolution_hours = float("inf")
         time_to_resolution_fraction = 0.0
         if end_date is not None:
+            # Gamma may provide naive datetimes; normalize to UTC-aware for safe subtraction.
+            if end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=timezone.utc)
             delta = (end_date - now_dt).total_seconds()
             time_to_resolution_hours = max(0, delta / 3600)
 

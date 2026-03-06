@@ -5,6 +5,8 @@ bot:
   quote_cycle_ms: 250
   reconcile_orders_s: 30
   reconcile_positions_s: 60
+  paper_mode: true
+  paper_nav: 100.0
 
 wallet:
   type: EOA

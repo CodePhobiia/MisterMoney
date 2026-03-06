@@ -66,6 +66,8 @@ from pmm1.ws.market_ws import MarketWebSocket
 from pmm1.ws.user_ws import UserWebSocket
 from pmm1.analytics.metrics import MetricsCollector
 from pmm1.analytics.pnl import PnLTracker
+from pmm1.paper.engine import PaperEngine
+from pmm1.paper.logger import PaperLogger
 
 logger: structlog.stdlib.BoundLogger = None  # type: ignore
 
@@ -257,45 +259,78 @@ async def run(settings: Settings | None = None) -> None:
                 except Exception:
                     state.tick_sizes[token_id] = Decimal("0.01")
 
-    # ── 7. Load open orders and balances ──
-    try:
-        balances = await clob_private.get_balances()
-        balance = float(balances.get("balance", 0))
-        allowance = float(balances.get("allowance", 0))
-        state.inventory_manager.update_balances(balance, allowance)
-        logger.info("balances_loaded", balance=balance, allowance=allowance)
-    except Exception as e:
-        logger.warning("balances_load_failed", error=str(e))
+    # ── Paper mode setup ──
+    paper_mode = settings.bot.paper_mode
+    paper_engine: PaperEngine | None = None
+    paper_logger: PaperLogger | None = None
 
-    try:
-        open_orders = await clob_private.get_open_orders()
-        logger.info("open_orders_loaded", count=len(open_orders))
-    except Exception as e:
-        logger.warning("open_orders_load_failed", error=str(e))
+    if paper_mode:
+        paper_engine = PaperEngine(settings.bot.paper_nav)
+        paper_logger = PaperLogger()
+        # In paper mode, set virtual balance so NAV is correct
+        state.inventory_manager.update_balances(settings.bot.paper_nav, settings.bot.paper_nav)
+        logger.info(
+            "paper_mode_enabled",
+            paper_nav=settings.bot.paper_nav,
+        )
+        print()
+        print("=" * 50)
+        print("  PMM-1 PAPER MODE")
+        print(f"  Starting NAV: ${settings.bot.paper_nav:.2f}")
+        print(f"  Markets: {len(state.active_markets)}")
+        print(f"  Strategies: parity={'ON' if settings.strategy.enable_binary_parity else 'OFF'}, "
+              f"neg_risk={'ON' if settings.strategy.enable_neg_risk_arb else 'OFF'}, "
+              f"mm={'ON' if settings.strategy.enable_market_making else 'OFF'}")
+        print("=" * 50)
+        print()
+
+    # ── 7. Load open orders and balances ──
+    if not paper_mode:
+        try:
+            balances = await clob_private.get_balances()
+            balance = float(balances.get("balance", 0))
+            allowance = float(balances.get("allowance", 0))
+            state.inventory_manager.update_balances(balance, allowance)
+            logger.info("balances_loaded", balance=balance, allowance=allowance)
+        except Exception as e:
+            logger.warning("balances_load_failed", error=str(e))
+
+        try:
+            open_orders = await clob_private.get_open_orders()
+            logger.info("open_orders_loaded", count=len(open_orders))
+        except Exception as e:
+            logger.warning("open_orders_load_failed", error=str(e))
+    else:
+        logger.info("paper_mode_skip_balances", paper_nav=settings.bot.paper_nav)
 
     # ── Initialize managers ──
-    order_manager = OrderManager(
-        client=clob_private,
-        order_tracker=state.order_tracker,
-        order_ttl_s=settings.execution.order_ttl_effective_s,
-        post_only=settings.execution.post_only,
-    )
-    order_manager.set_server_time_offset(server_time if server_time else int(time.time()))
+    order_manager: OrderManager | None = None
+    heartbeat: HeartbeatState | None = None
+    reconciler: Reconciler | None = None
 
-    heartbeat = HeartbeatState(
-        client=clob_private,
-        interval_s=settings.execution.heartbeat_s,
-    )
+    if not paper_mode:
+        order_manager = OrderManager(
+            client=clob_private,
+            order_tracker=state.order_tracker,
+            order_ttl_s=settings.execution.order_ttl_effective_s,
+            post_only=settings.execution.post_only,
+        )
+        order_manager.set_server_time_offset(server_time if server_time else int(time.time()))
 
-    reconciler = Reconciler(
-        clob_client=clob_private,
-        data_client=data_api,
-        order_tracker=state.order_tracker,
-        position_tracker=state.position_tracker,
-        wallet_address=settings.wallet.address,
-        reconcile_orders_s=settings.bot.reconcile_orders_s,
-        reconcile_positions_s=settings.bot.reconcile_positions_s,
-    )
+        heartbeat = HeartbeatState(
+            client=clob_private,
+            interval_s=settings.execution.heartbeat_s,
+        )
+
+        reconciler = Reconciler(
+            clob_client=clob_private,
+            data_client=data_api,
+            order_tracker=state.order_tracker,
+            position_tracker=state.position_tracker,
+            wallet_address=settings.wallet.address,
+            reconcile_orders_s=settings.bot.reconcile_orders_s,
+            reconcile_positions_s=settings.bot.reconcile_positions_s,
+        )
 
     recorder = LiveRecorder()
     parquet_writer = ParquetWriter(settings.storage.parquet_dir)
@@ -321,8 +356,9 @@ async def run(settings: Settings | None = None) -> None:
 
     async def on_reconnect() -> None:
         """Callback after user WS reconnect — trigger reconciliation."""
-        logger.info("post_reconnect_reconciliation")
-        await reconciler.full_reconciliation()
+        if reconciler:
+            logger.info("post_reconnect_reconciliation")
+            await reconciler.full_reconciliation()
 
     market_ws = MarketWebSocket(
         ws_url=settings.api.ws_market_url,
@@ -331,15 +367,17 @@ async def run(settings: Settings | None = None) -> None:
         on_trade=on_trade,
     )
 
-    user_ws = UserWebSocket(
-        ws_url=settings.api.ws_user_url,
-        api_key=settings.api.api_key,
-        api_secret=settings.api.api_secret,
-        api_passphrase=settings.api.api_passphrase,
-        wallet_address=settings.wallet.address,
-        order_tracker=state.order_tracker,
-        on_reconnect=on_reconnect,
-    )
+    user_ws: UserWebSocket | None = None
+    if not paper_mode:
+        user_ws = UserWebSocket(
+            ws_url=settings.api.ws_user_url,
+            api_key=settings.api.api_key,
+            api_secret=settings.api.api_secret,
+            api_passphrase=settings.api.api_passphrase,
+            wallet_address=settings.wallet.address,
+            order_tracker=state.order_tracker,
+            on_reconnect=on_reconnect,
+        )
 
     # ── 10. Start all background tasks ──
     shutdown_event = asyncio.Event()
@@ -352,16 +390,24 @@ async def run(settings: Settings | None = None) -> None:
     signal.signal(signal.SIGTERM, handle_signal)
 
     market_ws_task = market_ws.start(all_token_ids)
-    user_ws_task = user_ws.start()
-    heartbeat_task = heartbeat.start()
-    reconcile_task = reconciler.start()
+    if user_ws:
+        user_ws_task = user_ws.start()
+    if heartbeat:
+        heartbeat_task = heartbeat.start()
+    if reconciler:
+        reconcile_task = reconciler.start()
     recorder_task = recorder.start()
 
     # Wait briefly for WS connections to establish
-    await asyncio.sleep(2.0)
+    warmup_s = 5.0 if paper_mode else 2.0
+    logger.info("warmup_wait", seconds=warmup_s, paper_mode=paper_mode)
+    await asyncio.sleep(warmup_s)
 
     # Initialize drawdown with current NAV
-    nav = state.inventory_manager.get_total_nav_estimate()
+    if paper_mode and paper_engine:
+        nav = paper_engine.get_nav(state.book_manager)
+    else:
+        nav = state.inventory_manager.get_total_nav_estimate()
     state.drawdown.initialize(nav)
     state.risk_limits.update_nav(nav)
 
@@ -377,36 +423,47 @@ async def run(settings: Settings | None = None) -> None:
             cycle_start = time.time()
             cycle_count += 1
 
-            # ── Kill switch check ──
-            state.kill_switch.check_stale_feed(market_ws.seconds_since_last_message)
-            state.kill_switch.check_heartbeat(
-                heartbeat.is_healthy, heartbeat.consecutive_failures
-            )
+            # ── Kill switch check (skip in paper mode) ──
+            if not paper_mode:
+                state.kill_switch.check_stale_feed(market_ws.seconds_since_last_message)
+                state.kill_switch.check_heartbeat(
+                    heartbeat.is_healthy, heartbeat.consecutive_failures
+                )
 
-            if state.kill_switch.is_triggered:
-                if state.mode != "FLATTEN_ONLY":
-                    logger.critical(
-                        "kill_switch_active",
-                        reasons=[r.value for r in state.kill_switch.active_reasons],
-                    )
-                    await order_manager.cancel_all()
-                    state.mode = "FLATTEN_ONLY"
-                await asyncio.sleep(1.0)
-                continue
+                if state.kill_switch.is_triggered:
+                    if state.mode != "FLATTEN_ONLY":
+                        logger.critical(
+                            "kill_switch_active",
+                            reasons=[r.value for r in state.kill_switch.active_reasons],
+                        )
+                        if order_manager:
+                            await order_manager.cancel_all()
+                        state.mode = "FLATTEN_ONLY"
+                    await asyncio.sleep(1.0)
+                    continue
 
             # ── Drawdown check ──
             if state.drawdown.should_check_daily_reset():
-                nav = state.inventory_manager.get_total_nav_estimate()
+                if paper_mode and paper_engine:
+                    nav = paper_engine.get_nav(state.book_manager)
+                else:
+                    nav = state.inventory_manager.get_total_nav_estimate()
                 state.drawdown.reset_daily(nav)
 
-            nav = state.inventory_manager.get_total_nav_estimate()
+            if paper_mode and paper_engine:
+                nav = paper_engine.get_nav(state.book_manager)
+            else:
+                nav = state.inventory_manager.get_total_nav_estimate()
             dd_state = state.drawdown.update(nav)
             state.risk_limits.update_nav(nav)
 
             if dd_state.should_flatten_only:
                 if state.mode != "FLATTEN_ONLY":
                     logger.critical("drawdown_flatten_only", tier=dd_state.tier.value)
-                    await order_manager.cancel_all()
+                    if order_manager:
+                        await order_manager.cancel_all()
+                    if paper_engine:
+                        paper_engine.cancel_all_orders()
                     state.mode = "FLATTEN_ONLY"
                     state.kill_switch.trigger_drawdown()
                 await asyncio.sleep(1.0)
@@ -417,6 +474,12 @@ async def run(settings: Settings | None = None) -> None:
                 state.risk_limits.set_dynamic_multiplier(0.5)
             else:
                 state.risk_limits.set_dynamic_multiplier(1.0)
+
+            # ── Paper mode: check fills from previous cycle ──
+            if paper_mode and paper_engine and paper_logger:
+                new_fills = paper_engine.check_fills(state.book_manager)
+                for fill in new_fills:
+                    paper_logger.log_fill(fill.to_dict())
 
             # ── Quote each market ──
             markets_quoted = 0
@@ -433,7 +496,11 @@ async def run(settings: Settings | None = None) -> None:
                     continue
 
                 book = state.book_manager.get(token_id)
-                if book is None or book.is_stale:
+                if book is None:
+                    continue
+                # In paper mode, relax staleness to 120s (books still valid, just quiet markets)
+                stale_threshold = 120.0 if paper_mode else 2.0
+                if book.age_seconds > stale_threshold:
                     continue
 
                 tick_size = state.tick_sizes.get(token_id, Decimal("0.01"))
@@ -449,25 +516,45 @@ async def run(settings: Settings | None = None) -> None:
                 # ── Check arb opportunities first ──
                 if settings.strategy.enable_binary_parity:
                     book_no = state.book_manager.get(md.token_id_no)
-                    if book and book_no and not book_no.is_stale:
+                    book_no_fresh = book_no and book_no.age_seconds <= stale_threshold if book_no else False
+                    if book and book_no and book_no_fresh:
                         arb_orders = state.parity_detector.scan(
                             book, book_no, md.condition_id,
                             md.token_id_yes, md.token_id_no,
                         )
                         if arb_orders and not dd_state.should_pause_taker:
-                            arb_reqs = [
-                                CreateOrderRequest(
-                                    token_id=o.token_id,
-                                    price=o.price,
-                                    size=o.size,
-                                    side=OrderSide(o.side),
-                                    order_type=OrderType.FOK,
-                                    neg_risk=o.neg_risk,
-                                    post_only=False,
+                            if paper_mode and paper_engine and paper_logger:
+                                # Log arb detection and submit to paper engine
+                                paper_logger.log_arb(
+                                    arb_type="binary_parity",
+                                    condition_id=md.condition_id,
+                                    details={"num_orders": len(arb_orders)},
                                 )
-                                for o in arb_orders
-                            ]
-                            await order_manager.execute_arb(arb_reqs)
+                                paper_engine.submit_arb_orders([
+                                    {
+                                        "token_id": o.token_id,
+                                        "condition_id": md.condition_id,
+                                        "side": o.side,
+                                        "price": o.price,
+                                        "size": o.size,
+                                        "neg_risk": o.neg_risk,
+                                    }
+                                    for o in arb_orders
+                                ])
+                            elif order_manager:
+                                arb_reqs = [
+                                    CreateOrderRequest(
+                                        token_id=o.token_id,
+                                        price=o.price,
+                                        size=o.size,
+                                        side=OrderSide(o.side),
+                                        order_type=OrderType.FOK,
+                                        neg_risk=o.neg_risk,
+                                        post_only=False,
+                                    )
+                                    for o in arb_orders
+                                ]
+                                await order_manager.execute_arb(arb_reqs)
                             continue
 
                 # ── Neg-risk arb ──
@@ -484,19 +571,37 @@ async def run(settings: Settings | None = None) -> None:
                             outcomes, books, md.event_id
                         )
                         if arb_orders and not dd_state.should_pause_taker:
-                            arb_reqs = [
-                                CreateOrderRequest(
-                                    token_id=o.token_id,
-                                    price=o.price,
-                                    size=o.size,
-                                    side=OrderSide(o.side),
-                                    order_type=OrderType.FOK,
-                                    neg_risk=True,
-                                    post_only=False,
+                            if paper_mode and paper_engine and paper_logger:
+                                paper_logger.log_arb(
+                                    arb_type="neg_risk",
+                                    event_id=md.event_id,
+                                    details={"num_orders": len(arb_orders)},
                                 )
-                                for o in arb_orders
-                            ]
-                            await order_manager.execute_arb(arb_reqs)
+                                paper_engine.submit_arb_orders([
+                                    {
+                                        "token_id": o.token_id,
+                                        "condition_id": md.condition_id,
+                                        "side": o.side,
+                                        "price": o.price,
+                                        "size": o.size,
+                                        "neg_risk": True,
+                                    }
+                                    for o in arb_orders
+                                ])
+                            elif order_manager:
+                                arb_reqs = [
+                                    CreateOrderRequest(
+                                        token_id=o.token_id,
+                                        price=o.price,
+                                        size=o.size,
+                                        side=OrderSide(o.side),
+                                        order_type=OrderType.FOK,
+                                        neg_risk=True,
+                                        post_only=False,
+                                    )
+                                    for o in arb_orders
+                                ]
+                                await order_manager.execute_arb(arb_reqs)
                             continue
 
                 # ── Market making ──
@@ -549,12 +654,40 @@ async def run(settings: Settings | None = None) -> None:
 
                     # Execute
                     if quote_intent.has_bid or quote_intent.has_ask:
-                        result = await order_manager.diff_and_apply(
-                            quote_intent, tick_size
-                        )
-                        orders_submitted += result.get("submitted", 0)
-                        orders_canceled += result.get("canceled", 0)
-                        markets_quoted += 1
+                        if paper_mode and paper_engine and paper_logger:
+                            # Paper mode: submit to paper engine, log the quote
+                            paper_engine.cancel_all_orders(token_id)  # replace previous quotes
+                            paper_engine.submit_quote(
+                                token_id=token_id,
+                                condition_id=md.condition_id,
+                                bid_price=quote_intent.bid_price,
+                                bid_size=quote_intent.bid_size,
+                                ask_price=quote_intent.ask_price,
+                                ask_size=quote_intent.ask_size,
+                                strategy="mm",
+                                neg_risk=md.neg_risk,
+                            )
+                            paper_logger.log_quote(
+                                token_id=token_id,
+                                condition_id=md.condition_id,
+                                bid_price=quote_intent.bid_price,
+                                bid_size=quote_intent.bid_size,
+                                ask_price=quote_intent.ask_price,
+                                ask_size=quote_intent.ask_size,
+                                reservation_price=quote_intent.reservation_price,
+                                fair_value=fv_estimate.fair_value,
+                                half_spread=quote_intent.half_spread,
+                                inventory=market_inv,
+                            )
+                            orders_submitted += (1 if quote_intent.has_bid else 0) + (1 if quote_intent.has_ask else 0)
+                            markets_quoted += 1
+                        elif order_manager:
+                            result = await order_manager.diff_and_apply(
+                                quote_intent, tick_size
+                            )
+                            orders_submitted += result.get("submitted", 0)
+                            orders_canceled += result.get("canceled", 0)
+                            markets_quoted += 1
 
                         # Record for backtest
                         recorder.record_quote_intent(
@@ -581,17 +714,42 @@ async def run(settings: Settings | None = None) -> None:
             )
 
             if cycle_count % 100 == 0:
-                logger.info(
-                    "quote_cycle_summary",
-                    cycle=cycle_count,
-                    markets_quoted=markets_quoted,
-                    submitted=orders_submitted,
-                    canceled=orders_canceled,
-                    cycle_ms=f"{cycle_duration:.1f}",
-                    mode=state.mode,
-                    nav=f"{nav:.2f}",
-                    dd_tier=dd_state.tier.value,
-                )
+                if paper_mode and paper_engine and paper_logger:
+                    # Paper mode summary with PnL snapshot
+                    snap = paper_engine.snapshot(state.book_manager)
+                    paper_logger.log_pnl(snap.to_dict())
+                    pos_summary = paper_engine.get_position_summary()
+                    log_stats = paper_logger.get_stats()
+
+                    logger.info(
+                        "paper_cycle_summary",
+                        cycle=cycle_count,
+                        markets_quoted=markets_quoted,
+                        submitted=orders_submitted,
+                        nav=f"${snap.nav:.2f}",
+                        pnl=f"${snap.pnl:.4f}",
+                        pnl_pct=f"{snap.pnl_pct:.2f}%",
+                        cash=f"${snap.cash:.2f}",
+                        positions=snap.num_positions,
+                        open_orders=snap.num_open_orders,
+                        fills=snap.total_fills,
+                        volume=f"${snap.total_volume:.2f}",
+                        quotes_logged=log_stats["quotes_logged"],
+                        arbs_logged=log_stats["arbs_logged"],
+                        cycle_ms=f"{cycle_duration:.1f}",
+                    )
+                else:
+                    logger.info(
+                        "quote_cycle_summary",
+                        cycle=cycle_count,
+                        markets_quoted=markets_quoted,
+                        submitted=orders_submitted,
+                        canceled=orders_canceled,
+                        cycle_ms=f"{cycle_duration:.1f}",
+                        mode=state.mode,
+                        nav=f"{nav:.2f}",
+                        dd_tier=dd_state.tier.value,
+                    )
 
             # ── Sleep until next cycle ──
             elapsed = time.time() - cycle_start
@@ -600,26 +758,52 @@ async def run(settings: Settings | None = None) -> None:
 
     except Exception as e:
         logger.critical("main_loop_crashed", error=str(e), exc_info=True)
-        try:
-            await order_manager.cancel_all()
-        except Exception:
-            pass
+        if order_manager:
+            try:
+                await order_manager.cancel_all()
+            except Exception:
+                pass
     finally:
         # ── Shutdown ──
         state.mode = "SHUTDOWN"
         logger.info("pmm1_shutting_down")
 
         # Cancel all orders
-        try:
-            await order_manager.cancel_all()
-        except Exception:
-            pass
+        if order_manager:
+            try:
+                await order_manager.cancel_all()
+            except Exception:
+                pass
+
+        # Paper mode final summary
+        if paper_mode and paper_engine and paper_logger:
+            snap = paper_engine.snapshot(state.book_manager)
+            paper_logger.log_pnl(snap.to_dict())
+            pos_summary = paper_engine.get_position_summary()
+            log_stats = paper_logger.get_stats()
+
+            print()
+            print("=" * 50)
+            print("  PMM-1 PAPER MODE — FINAL SUMMARY")
+            print(f"  NAV: ${snap.nav:.2f} (started at ${paper_engine.initial_nav:.2f})")
+            print(f"  PnL: ${snap.pnl:.4f} ({snap.pnl_pct:.2f}%)")
+            print(f"  Cash: ${snap.cash:.2f}")
+            print(f"  Positions: {snap.num_positions}")
+            print(f"  Total fills: {snap.total_fills}")
+            print(f"  Total volume: ${snap.total_volume:.2f}")
+            print(f"  Quotes logged: {log_stats['quotes_logged']}")
+            print(f"  Arbs detected: {log_stats['arbs_logged']}")
+            print("=" * 50)
+            print()
 
         # Stop all tasks
-        await heartbeat.stop()
+        if heartbeat:
+            await heartbeat.stop()
         await market_ws.stop()
-        await user_ws.stop()
-        await reconciler.stop()
+        if user_ws:
+            await user_ws.stop()
+        if reconciler:
+            await reconciler.stop()
         await recorder.stop()
 
         # Close clients
