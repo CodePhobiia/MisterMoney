@@ -281,15 +281,28 @@ async def run(settings: Settings | None = None) -> None:
         sampling_markets = await rewards_client.fetch_sampling_markets()
         logger.info("sampling_markets_fetched", count=len(sampling_markets))
         
+        # Build token_id → RewardInfo lookup (Gamma returns empty condition_ids,
+        # so we must match by token_id instead)
+        token_to_reward: dict[str, Any] = {}
+        for ri in sampling_markets.values():
+            for tid in ri.token_ids:
+                token_to_reward[tid] = ri
+        
         # Mark reward eligibility and update reward data
+        matched = 0
         for m in all_markets:
+            # Try condition_id match first, then token_id match
             reward_info = sampling_markets.get(m.condition_id)
+            if not reward_info:
+                reward_info = token_to_reward.get(m.token_id_yes) or token_to_reward.get(m.token_id_no)
             if reward_info:
                 m.reward_eligible = True
                 m.reward_daily_rate = reward_info.daily_rate
                 m.reward_min_size = reward_info.min_size
                 m.reward_max_spread = reward_info.max_spread
                 state.reward_eligible.add(m.condition_id)
+                matched += 1
+        logger.info("reward_matching_done", matched=matched, total=len(all_markets), token_index_size=len(token_to_reward))
     except Exception as e:
         logger.warning("sampling_markets_fetch_failed", error=str(e))
     finally:
@@ -627,7 +640,7 @@ async def run(settings: Settings | None = None) -> None:
                 
                 # Get all live order IDs
                 live_orders = [
-                    order for order in state.order_tracker.get_live_orders()
+                    order for order in state.order_tracker.get_active_orders()
                     if order.order_id
                 ]
                 if not live_orders:
