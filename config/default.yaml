@@ -1,7 +1,7 @@
 bot:
   name: PMM-1
   env: prod
-  max_markets: 8
+  max_markets: 12
   quote_cycle_ms: 1000
   reconcile_orders_s: 30
   reconcile_positions_s: 60
@@ -14,8 +14,8 @@ wallet:
 
 market_filters:
   min_time_to_end_hours: 24
-  min_volume_24h_usd: 250000
-  max_top_spread_cents: 2
+  min_volume_24h_usd: 50000
+  max_top_spread_cents: 5
   min_depth_within_2c_shares: 0
   allow_sports: false
   allow_crypto_intraday: false

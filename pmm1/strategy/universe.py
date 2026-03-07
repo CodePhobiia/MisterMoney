@@ -136,6 +136,12 @@ def check_eligibility(
     if market.depth_within_2c > 0 and market.depth_within_2c < filters.min_depth_within_2c_shares:
         reasons.append(f"depth_2c={market.depth_within_2c:.0f} < {filters.min_depth_within_2c_shares:.0f}")
 
+    # Midpoint filter: skip extreme prices where MM can't profit
+    # Markets at $0.01 or $0.99 have no spread to capture
+    mid = (market.best_bid + market.best_ask) / 2 if market.best_bid > 0 and market.best_ask > 0 else 0
+    if mid > 0 and (mid < 0.05 or mid > 0.95):
+        reasons.append(f"extreme_price_mid={mid:.3f}")
+
     return EligibilityResult(
         condition_id=market.condition_id,
         eligible=len(reasons) == 0,
