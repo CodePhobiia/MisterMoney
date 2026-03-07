@@ -85,6 +85,14 @@ class Database:
             logger.error("sql_execute_failed", sql=sql[:100], error=str(e))
             raise
 
+    async def executemany(
+        self,
+        sql: str,
+        parameters_list: list[tuple[Any, ...]] | list[dict[str, Any]],
+    ) -> None:
+        """Alias for execute_many (backwards compat)."""
+        return await self.execute_many(sql, parameters_list)
+
     async def execute_many(
         self,
         sql: str,

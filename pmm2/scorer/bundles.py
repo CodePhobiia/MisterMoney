@@ -80,7 +80,8 @@ def generate_bundles(
         return bundles
 
     # Per-market capital limit: scale-aware
-    per_market_cap = max(nav * 0.03, 8.0)
+    # B1 needs 2 × min_order_size ($10), so floor must cover that
+    per_market_cap = max(nav * 0.08, 2.5 * min_order_size)
 
     # Tick size (convert string to float)
     try:

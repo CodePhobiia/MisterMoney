@@ -12,9 +12,11 @@ from v3.providers.registry import ProviderRegistry
 from v3.evidence.graph import EvidenceGraph
 from v3.evidence.db import Database
 from v3.evidence.entities import FairValueSignal, RoutePlan
+from v3.evidence.normalizer import EvidenceNormalizer
 from v3.intake.schemas import MarketMeta
 from v3.intake.gamma_sync import GammaSync
 from v3.intake.source_registry import SourceRegistry
+from v3.intake.evidence_collector import EvidenceCollector
 from v3.routing.orchestrator import RouteOrchestrator
 from v3.routing.change_detector import ChangeDetector
 from .logger import ShadowLogger
@@ -62,6 +64,12 @@ class ShadowRunner:
         self.source_registry = SourceRegistry()
         self.orchestrator = RouteOrchestrator(registry, evidence_graph, db)
         self.change_detector = ChangeDetector(db)
+        
+        # Initialize evidence collection
+        self.evidence_collector = EvidenceCollector(
+            evidence_graph=evidence_graph,
+            normalizer=EvidenceNormalizer()
+        )
         
         # Initialize logging and metrics
         self.logger = ShadowLogger(config.get("log_dir", "data/v3/shadow"))
@@ -173,13 +181,32 @@ class ShadowRunner:
                 condition_id=market.condition_id,
                 event_type=change_event.event_type)
         
-        # 3. Fetch evidence
+        # 3. Collect fresh evidence if needed
+        existing_evidence = await self.evidence_graph.get_evidence_bundle(
+            condition_id=market.condition_id,
+            max_items=5
+        )
+        
+        if len(existing_evidence) == 0:
+            # No evidence yet — collect some
+            log.info("collecting_evidence", condition_id=market.condition_id)
+            try:
+                collected = await self.evidence_collector.collect_for_market(market)
+                log.info("evidence_collected",
+                        condition_id=market.condition_id,
+                        count=len(collected))
+            except Exception as e:
+                log.warning("evidence_collection_failed",
+                          condition_id=market.condition_id,
+                          error=str(e))
+        
+        # 4. Fetch full evidence bundle (now includes freshly collected items)
         evidence = await self.evidence_graph.get_evidence_bundle(
             condition_id=market.condition_id,
             max_items=50
         )
         
-        # 4. Build route plan
+        # 5. Build route plan
         plan = RoutePlan(
             condition_id=market.condition_id,
             route=route,
@@ -187,7 +214,7 @@ class ShadowRunner:
             reason=f"Classified as {route} via source registry"
         )
         
-        # 5. Execute route
+        # 6. Execute route
         try:
             signal = await self.orchestrator.execute(
                 plan=plan,
@@ -206,7 +233,7 @@ class ShadowRunner:
                     uncertainty=signal.uncertainty,
                     latency_ms=eval_duration_ms)
             
-            # 6. Record latency metrics
+            # 7. Record latency metrics
             for model in signal.models_used:
                 self.latency_tracker.record(
                     route=route,
@@ -214,10 +241,10 @@ class ShadowRunner:
                     latency_ms=eval_duration_ms
                 )
             
-            # 7. Log signal
+            # 8. Log signal
             await self._log_signal(signal, market, eval_duration_ms)
             
-            # 8. Record prediction for Brier scoring
+            # 9. Record prediction for Brier scoring
             await self.brier_tracker.record_prediction(
                 condition_id=market.condition_id,
                 route=route,
