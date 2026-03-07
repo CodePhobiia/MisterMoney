@@ -90,3 +90,38 @@ execution:
   max_batch_orders: 15
   retry_backoff_initial_ms: 1000
   retry_backoff_max_ms: 30000
+
+# PMM-2 (Advanced Market Maker) — DISABLED by default
+pmm2:
+  enabled: false
+  shadow_mode: true  # True = log decisions, don't execute
+  live_capital_pct: 0.0  # 0 = shadow, 0.1 = 10%, 1.0 = full
+  
+  # Loop cadences (seconds unless noted)
+  allocator_interval_sec: 60.0
+  scoring_check_sec: 30.0
+  universe_refresh_sec: 300.0
+  queue_update_ms: 250.0
+  medium_loop_sec: 10.0
+  
+  # Limits
+  max_markets_active: 12
+  max_slots_total: 48
+  
+  # Allocator scoring parameters
+  min_positive_return_bps: 6.0
+  corr_penalty_lambda: 0.20
+  churn_penalty_phi: 0.15
+  queue_uncertainty_psi: 0.10
+  
+  # Persistence parameters
+  hysteresis_base_usdc: 0.25
+  scoring_extra_usdc: 0.40
+  eta_extra_usdc: 0.30
+  max_reprices_per_minute: 2
+  
+  # Risk limits (NAV fractions)
+  per_market_cap_nav: 0.03
+  per_event_cap_nav: 0.06
+  total_active_cap_nav: 0.30
+  per_market_cap_floor: 8.0
