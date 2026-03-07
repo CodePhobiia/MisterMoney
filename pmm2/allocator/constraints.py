@@ -25,7 +25,7 @@ class AllocationConstraints(BaseModel):
     total_slots: int = 48  # max order slots
     per_market_cap_frac: float = 0.03  # 3% of NAV per market
     per_market_cap_floor: float = 8.0  # minimum $8 per market (scale-aware)
-    per_event_cap_frac: float = 0.06  # 6% of NAV per event cluster
+    per_event_cap_frac: float = 0.10  # 10% of NAV per event cluster (allows floor to work)
     active_cap_frac: float = 0.30  # max 30% of NAV actively quoted
 
 

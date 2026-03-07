@@ -36,18 +36,18 @@ class AdjustedScorer:
 
     def __init__(
         self,
-        corr_lambda: float = 0.20,
-        churn_phi: float = 0.15,
-        queue_psi: float = 0.10,
-        inventory_mu: float = 0.05,
+        corr_lambda: float = 0.0020,  # 20 bps
+        churn_phi: float = 0.0015,  # 15 bps
+        queue_psi: float = 0.0010,  # 10 bps
+        inventory_mu: float = 0.0005,  # 5 bps
     ):
         """Initialize adjusted scorer.
 
         Args:
-            corr_lambda: correlation penalty coefficient (0.20 = 20 bps per correlated position)
-            churn_phi: churn penalty coefficient (0.15 = 15 bps for entering/exiting)
-            queue_psi: queue uncertainty penalty coefficient (0.10 = 10 bps per unit uncertainty)
-            inventory_mu: inventory penalty coefficient (0.05 = 5 bps per unit exposure)
+            corr_lambda: correlation penalty coefficient (0.0020 = 20 bps per correlated position)
+            churn_phi: churn penalty coefficient (0.0015 = 15 bps for entering/exiting)
+            queue_psi: queue uncertainty penalty coefficient (0.0010 = 10 bps per unit uncertainty)
+            inventory_mu: inventory penalty coefficient (0.0005 = 5 bps per unit exposure)
         """
         self.corr_lambda = corr_lambda
         self.churn_phi = churn_phi

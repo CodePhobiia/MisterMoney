@@ -138,6 +138,15 @@ class ReallocationHysteresis:
                 condition_id=condition_id,
             )
             return (True, "new_market")
+        
+        # If we have no current capital, allow entry without history requirement
+        if current_cap == 0.0 and target_cap > 0.0:
+            logger.debug(
+                "hysteresis_new_entry",
+                condition_id=condition_id,
+                target_cap=target_cap,
+            )
+            return (True, "new_entry")
 
         # Check if rank has been stable
         if len(state.rank_history) >= self.min_persistence_cycles:
