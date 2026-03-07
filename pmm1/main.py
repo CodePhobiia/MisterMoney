@@ -193,6 +193,7 @@ async def run(settings: Settings | None = None) -> None:
                 slug=market.market_slug,
                 active=market.active,
                 closed=market.closed,
+                accepting_orders=market.accepting_orders,
                 enable_order_book=market.enable_order_book,
                 neg_risk=market.neg_risk,
                 neg_risk_market_id=market.neg_risk_market_id,

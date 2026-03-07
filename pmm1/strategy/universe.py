@@ -25,6 +25,7 @@ class MarketMetadata(BaseModel):
     slug: str = ""
     active: bool = True
     closed: bool = False
+    accepting_orders: bool = True
     enable_order_book: bool = True
     neg_risk: bool = False
     neg_risk_market_id: str = ""
@@ -87,6 +88,8 @@ def check_eligibility(
         reasons.append("not_active")
     if market.closed:
         reasons.append("closed")
+    if not market.accepting_orders:
+        reasons.append("not_accepting_orders")
 
     # Must have order book enabled
     if not market.enable_order_book:
