@@ -1178,6 +1178,15 @@ async def run(settings: Settings | None = None) -> None:
                             # Bid would cross the ask — place below best ask - tick
                             quote_intent.bid_price = ba.price_float - float(tick_size)
 
+                    # Final min-size enforcement (after all multipliers)
+                    MIN_SHARES_FINAL = 5.0
+                    if quote_intent.bid_size is not None and quote_intent.bid_size < MIN_SHARES_FINAL:
+                        quote_intent.bid_size = None
+                        quote_intent.bid_price = None
+                    if quote_intent.ask_size is not None and quote_intent.ask_size < MIN_SHARES_FINAL:
+                        quote_intent.ask_size = None
+                        quote_intent.ask_price = None
+
                     # Execute
                     if quote_intent.has_bid or quote_intent.has_ask:
                         if paper_mode and paper_engine and paper_logger:
@@ -1359,6 +1368,14 @@ async def run(settings: Settings | None = None) -> None:
                                         quote_intent_no.ask_price = bb_no.price_float + float(tick_size_no)
                                     if ba_no and quote_intent_no.bid_price and quote_intent_no.bid_price >= ba_no.price_float:
                                         quote_intent_no.bid_price = ba_no.price_float - float(tick_size_no)
+
+                                # Final min-size enforcement for NO (after all multipliers)
+                                if quote_intent_no.bid_size is not None and quote_intent_no.bid_size < 5.0:
+                                    quote_intent_no.bid_size = None
+                                    quote_intent_no.bid_price = None
+                                if quote_intent_no.ask_size is not None and quote_intent_no.ask_size < 5.0:
+                                    quote_intent_no.ask_size = None
+                                    quote_intent_no.ask_price = None
 
                                 # Execute NO token quote
                                 if quote_intent_no.has_bid or quote_intent_no.has_ask:
