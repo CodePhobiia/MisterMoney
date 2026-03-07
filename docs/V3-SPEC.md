@@ -1,318 +1,787 @@
 # MisterMoney V3 — Resolution Intelligence Layer
 
-*Spec by Butters, 2026-03-07*
+*Spec v2.0 — Rewritten 2026-03-07 incorporating quant review*
+*Original concept: Butters. Production architecture: Theyab's quant analyst. Final spec: Butters.*
 
-## 1. Why V3
+---
 
-V1 makes markets. V2 allocates capital intelligently. But both treat fair value as book midpoint — they have zero opinion on whether a market *should* be at 60¢ or 80¢.
+## 0. Design Principles
 
-Polymarket markets resolve based on **written rules**, not price. The title is not the payout rule. Clarifications happen. Disputes take 4-6 days. Resolution sources are specific and documented.
+1. **AI is a signal layer, not an execution layer.** V3 adjusts fair value and skew. It never overrides V1 risk limits, V2 allocation, or hard safety rails.
+2. **Deterministic first, AI second.** If you can check the resolution source with an API call, don't burn $0.03 on an LLM to guess.
+3. **Route, don't broadcast.** Different market types need different model combinations. No fixed committee runs on every market.
+4. **Blind before market-aware.** Models produce probability estimates without seeing the current market price. Anchoring is the enemy.
+5. **Evidence, not prose.** Every model returns structured schemas with cited evidence, falsifiers, and uncertainty. If it can't cite, it says "no edge."
+6. **Escalate only when EV justifies cost.** Most markets don't deserve frontier-model spend most of the time.
+7. **Calibrate on outcomes, not vibes.** The final probability comes from a learned stacker trained on resolved markets, not from a weighted median.
+8. **LLMs complement quant models, they don't replace them.** Barrier probabilities, hazard models, and calibration are math. Rule parsing, evidence synthesis, and dispute detection are LLM territory.
 
-An AI that can read rules, interpret news, and assess probability has **genuine alpha** that pure math cannot replicate. This is the one domain where LLMs decisively outperform quantitative models.
+---
 
-## 2. Architecture — Multi-Model Ensemble
-
-V3 does NOT replace V1/V2. It produces a **fair value adjustment signal** that V2's scorer consumes.
+## 1. Architecture Overview
 
 ```
-┌─────────────────────────────────────────────┐
-│                V3 Intelligence Layer         │
-│                                             │
-│  ┌──────────┐ ┌──────────┐ ┌──────────────┐│
-│  │  Model A  │ │  Model B  │ │   Model C    ││
-│  │ Opus 4.6  │ │Sonnet 4.6 │ │ Gemini 3 Pro ││
-│  │           │ │           │ │              ││
-│  │Resolution │ │  News &   │ │  Probability ││
-│  │Rule Reader│ │ Sentiment │ │  Synthesizer ││
-│  └─────┬─────┘ └─────┬─────┘ └──────┬───────┘│
-│        │              │              │        │
-│        └──────────┬───┴──────────────┘        │
-│                   ▼                           │
-│          ┌──────────────┐                     │
-│          │  Ensemble     │                     │
-│          │  Aggregator   │                     │
-│          │  (weighted    │                     │
-│          │   median)     │                     │
-│          └──────┬───────┘                     │
-│                 ▼                              │
-│        ┌─────────────────┐                    │
-│        │ Fair Value Delta │                    │
-│        │  per market      │                    │
-│        └────────┬────────┘                    │
-└─────────────────┼─────────────────────────────┘
-                  ▼
-         V2 Scorer (adjusts reservation price)
-                  ▼
-         V1 Execution (quotes with directional skew)
+                    ┌─────────────────────────────────┐
+                    │         TIER 0: DETERMINISTIC    │
+                    │                                  │
+                    │  • Parse market metadata         │
+                    │  • Fetch rule text/clarifications │
+                    │  • Check resolution sources       │
+                    │  • Microstructure features        │
+                    │  • Change detection               │
+                    │  • Market-type classification      │
+                    └──────────────┬──────────────────┘
+                                   │
+                          anything changed?
+                                   │
+                         ┌─────────▼──────────┐
+                         │  TIER 1: TRIAGE     │
+                         │  Sonnet 4.6         │
+                         │                     │
+                         │  • News scan        │
+                         │  • Entity extraction │
+                         │  • Rule→schema      │
+                         │  • Escalate? Y/N    │
+                         └────────┬────────────┘
+                                  │
+                        EV > Cost + buffer?
+                                  │
+              ┌───────────────────┼───────────────────┐
+              │                   │                    │
+    ┌─────────▼────────┐ ┌───────▼────────┐ ┌────────▼────────┐
+    │  TYPE 1: NUMERIC  │ │ TYPE 2: RULES  │ │ TYPE 3: DOSSIER │
+    │                   │ │                │ │                  │
+    │ Deterministic     │ │ Opus 4.6       │ │ Gemini 3.1 Pro  │
+    │ barrier/hazard    │ │ rule lawyer    │ │ long-context     │
+    │ + AI for regime   │ │ + GPT-5.4     │ │ + Opus challenger│
+    │   shifts only     │ │   judge        │ │ + GPT-5.4 judge │
+    └─────────┬─────────┘ └───────┬────────┘ └────────┬────────┘
+              │                   │                    │
+              └───────────────────┼────────────────────┘
+                                  │
+                    ┌─────────────▼──────────────┐
+                    │   TIER 3: CALIBRATION       │
+                    │                             │
+                    │  Learned logit-space stacker │
+                    │  + uncertainty estimation    │
+                    │  + dynamic hurdle gate       │
+                    │  + edge-after-uncertainty    │
+                    │    skew formula              │
+                    └─────────────┬───────────────┘
+                                  │
+                                  ▼
+                        V2 Scorer (capped skew)
+                                  ▼
+                        V1 Execution (quotes)
 ```
 
-## 3. The Three Roles
+---
 
-### 3.1 Model A — Resolution Rule Reader (Opus 4.6)
+## 2. Tier 0 — Deterministic Layer
 
-**Job**: Read the market's resolution rules, resolution source, and any clarifications. Produce a structured assessment.
+Runs on **every market, every cycle** (no API cost). Pure Python/SQL.
 
-**Input** (per market, every 30 minutes):
-```json
-{
-  "question": "Will Bitcoin reach $100,000 by June 30, 2026?",
-  "description": "This market resolves YES if Bitcoin...",
-  "resolution_source": "CoinGecko BTC/USD spot price",
-  "resolution_rules": "Resolves YES if the CoinGecko...",
-  "clarifications": ["Clarification 1: ...", "..."],
-  "current_mid": 0.62,
-  "end_date": "2026-06-30T23:59:59Z",
-  "hours_to_resolution": 2784
-}
-```
-
-**Output**:
-```json
-{
-  "rule_clarity_score": 0.85,        // 0-1, how unambiguous the rules are
-  "dispute_risk": 0.05,             // P(dispute)
-  "resolution_complexity": "simple", // simple, conditional, multi-step
-  "key_criteria": [                  // what specifically must happen
-    "BTC/USD spot on CoinGecko >= $100,000",
-    "At any point before June 30, 2026 23:59 UTC"
-  ],
-  "ambiguities": [                   // identified issues
-    "Does not specify which CoinGecko pair (BTC/USD vs BTC/USDT)"
-  ],
-  "early_resolution_possible": true, // can resolve before end_date?
-  "placeholder_risk": false          // is this an "Other" outcome?
-}
-```
-
-**Why Opus**: Highest reasoning capability. Rule interpretation requires nuanced reading comprehension and edge case detection. Worth the cost for the 30-min cadence.
-
-### 3.2 Model B — News & Sentiment Analyst (Sonnet 4.6)
-
-**Job**: Monitor real-time news, social media, and data sources. Detect events that shift market probabilities.
-
-**Input** (per market, every 5 minutes):
-```json
-{
-  "question": "Will Bitcoin reach $100,000 by June 30, 2026?",
-  "current_mid": 0.62,
-  "key_criteria": ["BTC/USD >= $100,000 before June 30"],  // from Model A
-  "recent_news": [
-    {"source": "Reuters", "title": "Bitcoin surges past $95,000...", "ts": "..."},
-    {"source": "Twitter/X", "summary": "Whale alert: 10,000 BTC moved to...", "ts": "..."}
-  ],
-  "current_btc_price": 94500,  // from data feeds where applicable
-  "resolution_source_current_value": "94,500"  // if checkable
-}
-```
-
-**Output**:
-```json
-{
-  "sentiment_score": 0.7,           // -1 (very bearish) to +1 (very bullish)
-  "event_impact": "moderate",       // none, low, moderate, high, critical
-  "probability_shift": +0.05,       // suggested probability adjustment
-  "confidence": 0.6,                // how confident in the shift
-  "reasoning": "BTC at $94.5K, only $5.5K from target with 4 months remaining...",
-  "catalysts": [
-    {"event": "BTC crossed $94K", "impact": "+3%", "confidence": 0.7},
-    {"event": "Fed meeting next week", "impact": "±5%", "confidence": 0.4}
-  ],
-  "stale_market_flag": false         // true if mid hasn't moved but world has
-}
-```
-
-**Why Sonnet**: Fast, cheap, good at summarization and pattern matching. The 5-min cadence needs throughput over depth.
-
-### 3.3 Model C — Probability Synthesizer (Gemini 3 Pro)
-
-**Job**: Take Model A's rule assessment and Model B's news analysis, plus market data, and produce a calibrated probability estimate.
-
-**Input** (per market, every 15 minutes):
-```json
-{
-  "question": "Will Bitcoin reach $100,000 by June 30, 2026?",
-  "current_mid": 0.62,
-  "rule_assessment": { /* Model A output */ },
-  "news_analysis": { /* Model B output */ },
-  "historical_similar_markets": [
-    {"question": "Will BTC reach $50K by Dec 2024?", "resolved": "YES", "final_mid_before": 0.75}
-  ],
-  "time_series": {
-    "mid_24h_ago": 0.58,
-    "mid_7d_ago": 0.55,
-    "volume_24h": 250000
-  }
-}
-```
-
-**Output**:
-```json
-{
-  "fair_value": 0.68,               // Model C's probability estimate
-  "confidence_interval": [0.60, 0.76],
-  "edge_vs_market": +0.06,          // fair_value - current_mid
-  "edge_confidence": 0.55,          // how confident in the edge
-  "recommended_skew": "BUY",        // BUY, SELL, or NEUTRAL
-  "max_edge_to_capture": 0.04,      // don't skew more than this (conservative)
-  "reasoning": "Rule is clear. BTC at $94.5K with 4 months, historical base rate for similar 'reach $X' markets with asset within 6% of target is ~70%"
-}
-```
-
-**Why Gemini**: Strong at structured reasoning and calibration. Google's training data includes extensive probability/forecasting research.
-
-## 4. Ensemble Aggregator
-
-The three models disagree. The aggregator resolves disagreements:
+### 2.1 Market Metadata Parser
 
 ```python
-def aggregate_fair_value(
-    model_a_rule_clarity: float,
-    model_b_probability_shift: float,
-    model_b_confidence: float,
-    model_c_fair_value: float,
-    model_c_confidence: float,
-    current_mid: float,
-) -> FairValueSignal:
-    """
-    Weighted median of model outputs.
-    
-    Weights:
-    - Model C gets base weight (it's the synthesizer)
-    - Model B's shift is applied proportional to its confidence
-    - Model A doesn't produce a probability — it modulates confidence
-      (low rule_clarity → widen confidence interval → reduce edge capture)
-    
-    If models strongly disagree (>15% spread), reduce overall confidence.
-    If rule_clarity < 0.5, halve max edge capture.
-    If dispute_risk > 0.2, set recommended_skew to NEUTRAL.
-    """
+class MarketMetadata(BaseModel):
+    condition_id: str
+    question: str
+    description: str
+    resolution_source: str
+    resolution_rules: str
+    clarifications: list[str]
+    end_date: datetime
+    market_type: MarketType          # NUMERIC, RULE_HEAVY, DOCUMENT_RICH
+    resolution_source_type: SourceType  # API_CHECKABLE, HUMAN_JUDGED, ORACLE_BASED
+    tags: list[str]                  # politics, crypto, sports, science, etc.
 ```
 
-**Output: FairValueSignal**
+### 2.2 Resolution Source Checker
+
+For machine-readable markets, **check the actual source**:
+
+```python
+class SourceCheck(BaseModel):
+    source_name: str           # "CoinGecko BTC/USD", "ESPN NBA scores"
+    current_value: float | str
+    threshold: float | str
+    operator: str              # ">=", "<=", "==", "contains"
+    distance_to_threshold: float
+    last_checked: datetime
+    checkable: bool            # False if source is human judgment
+```
+
+If BTC is at $99,500 and the threshold is $100,000, that's a deterministic signal worth more than any LLM opinion.
+
+### 2.3 Change Detection
+
+```python
+class ChangeEvent(BaseModel):
+    event_type: str   # "clarification_added", "source_crossed_band",
+                      # "mid_stale_but_world_changed", "rule_updated",
+                      # "new_evidence", "approaching_resolution"
+    severity: float   # 0-1
+    details: str
+    timestamp: datetime
+```
+
+**Trigger condition for Tier 1:**
+```
+trigger_t = 𝟙[new_evidence ∨ clarification_changed ∨ source_crossed_band
+             ∨ (|Δmid| < ε ∧ world_changed) ∨ high_EV_candidate]
+```
+
+If `trigger_t = 0`, Tier 0 emits the last cached signal. No API calls.
+
+### 2.4 Market-Type Classification
+
+```python
+class MarketType(str, Enum):
+    NUMERIC = "numeric"           # BTC>$100K, team scores, CPI prints
+    RULE_HEAVY = "rule_heavy"     # policy, legal, approval, wording-sensitive
+    DOCUMENT_RICH = "document_rich"  # court rulings, regulatory, multi-doc
+    SIMPLE_BINARY = "simple_binary"  # straightforward yes/no, clear resolution
+```
+
+Classification rules (deterministic, no LLM needed):
+- Has `resolution_source` matching a known API → NUMERIC
+- Rule text > 500 words or > 2 clarifications → RULE_HEAVY or DOCUMENT_RICH
+- Multiple related documents or PDFs referenced → DOCUMENT_RICH
+- Short rules, clear source, no clarifications → SIMPLE_BINARY
+
+### 2.5 Microstructure Features
+
+Computed from V1/V2 data (no API cost):
+```python
+class MicrostructureFeatures(BaseModel):
+    mid: float
+    spread_cents: float
+    depth_at_best: float
+    volume_24h: float
+    toxicity_score: float          # from V2 calibration
+    our_inventory: float
+    time_to_resolution_hours: float
+    mid_velocity_1h: float         # how fast mid is moving
+    volume_spike: bool             # volume > 3x 7-day average
+```
+
+---
+
+## 3. Tier 1 — Triage (Sonnet 4.6)
+
+**Model**: Claude Sonnet 4.6 with adaptive thinking
+**When**: Only when Tier 0 fires a trigger
+**Cost**: ~$0.001-0.005 per call (fast, cheap, high-volume)
+
+### 3.1 Purpose
+
+Sonnet answers ONE question: **"Does this market need specialist escalation right now?"**
+
+It also extracts structured data for downstream use.
+
+### 3.2 Input (blind — no market price)
+
+```json
+{
+  "question": "Will Bitcoin reach $100,000 by June 30, 2026?",
+  "rules": "This market resolves YES if...",
+  "clarifications": ["..."],
+  "change_events": [{"type": "source_crossed_band", "details": "BTC at $99,500"}],
+  "source_check": {"current_value": 99500, "threshold": 100000, "distance": 500},
+  "market_type": "NUMERIC",
+  "time_to_resolution_hours": 2784
+}
+```
+
+**Note: `current_mid` is NOT passed.** Blind by design.
+
+### 3.3 Output Schema
+
+```json
+{
+  "needs_escalation": true,
+  "escalation_reason": "Source within 0.5% of threshold, high-EV regime shift",
+  "market_type_override": null,
+  "extracted_entities": {
+    "resolution_source": "CoinGecko BTC/USD spot",
+    "threshold": 100000,
+    "window_end": "2026-06-30T23:59:59Z",
+    "key_conditions": ["BTC/USD >= $100,000 at any point before deadline"]
+  },
+  "rule_schema": {
+    "source": "CoinGecko BTC/USD",
+    "operator": ">=",
+    "threshold": 100000,
+    "window_start": "2026-01-01T00:00:00Z",
+    "window_end": "2026-06-30T23:59:59Z",
+    "edge_cases": ["Does not specify which CoinGecko pair"]
+  },
+  "news_summary": "BTC crossed $99K for first time, $500 from target",
+  "triage_score": 0.85,
+  "estimated_specialist_value": 0.04
+}
+```
+
+### 3.4 Escalation Gate
+
+```
+escalate = needs_escalation ∧ (EV_possible > Cost_API + Cost_latency + buffer)
+```
+
+Where:
+- `EV_possible = estimated_specialist_value × our_capital_in_market × time_horizon`
+- `Cost_API` = estimated token cost for the specialist path
+- `Cost_latency` = opportunity cost of waiting for response
+- `buffer` = configurable margin (default: $0.02)
+
+Most markets most of the time: **no escalation, use cached signal.**
+
+---
+
+## 4. Tier 2 — Specialist Escalation
+
+Called conditionally based on market type and triage output.
+
+### 4.1 Type 1: Numeric Markets — Deterministic + Conditional AI
+
+**Default**: No LLM. Use quantitative models:
+
+```python
+class NumericSignal(BaseModel):
+    """Barrier/survival probability for numeric threshold markets."""
+    p_barrier: float              # P(source crosses threshold before deadline)
+    p_barrier_low: float
+    p_barrier_high: float
+    model_type: str               # "gbm_barrier", "hazard_rate", "empirical"
+    current_distance_pct: float   # distance to threshold as % of current value
+    implied_vol: float            # if available from options/historical
+    time_remaining_fraction: float
+```
+
+For a BTC-at-$100K market with BTC at $94.5K:
+- Distance: 5.8%
+- Time: 4 months
+- Historical BTC vol: ~60% annualized
+- Barrier probability via GBM: ~72%
+
+**AI escalation only when**:
+- Regime shift detected (news of regulatory ban, ETF approval, etc.)
+- Source behavior is anomalous (exchange outage, data feed divergence)
+- Rule ambiguity discovered by Tier 0 or Tier 1
+
+When escalated: Sonnet interprets the event → if material, GPT-5.4 judges impact on barrier probability.
+
+### 4.2 Type 2: Rule-Heavy Markets — Opus Rule Lawyer + GPT Judge
+
+**Pass A — Blind Rule Analysis (Opus 4.6, adaptive thinking)**
+
+Input:
+```json
+{
+  "rules": "Full resolution rules text...",
+  "clarifications": ["..."],
+  "evidence": [{"source": "Reuters", "claim": "...", "timestamp": "..."}],
+  "extracted_entities": { /* from Sonnet triage */ }
+}
+```
+
+**No market price. No mid. No spread. Blind.**
+
+Output:
+```json
+{
+  "p_blind": 0.67,
+  "p_low": 0.58,
+  "p_high": 0.75,
+  "rule_clarity": 0.85,
+  "dispute_risk": 0.05,
+  "resolution_complexity": "conditional",
+  "key_criteria": [
+    "Senate must pass bill with majority vote",
+    "President must sign within 10 business days"
+  ],
+  "ambiguities": [
+    "Rules say 'pass' but don't specify whether committee passage counts"
+  ],
+  "evidence": [
+    {
+      "id": "ev_001",
+      "source_type": "reuters",
+      "timestamp": "2026-03-07T12:00:00Z",
+      "claim": "Senate committee voted 12-8 to advance bill",
+      "direction": "YES",
+      "strength": 0.6,
+      "reliability": 0.95
+    }
+  ],
+  "falsifiers": [
+    "Presidential veto threat from March 5 press conference",
+    "Filibuster possible — 60-vote threshold unclear in rules"
+  ],
+  "uncertainty_reasons": [
+    "Committee passage vs. floor vote ambiguity",
+    "No historical precedent for this bill type"
+  ],
+  "edge_or_no_edge": "edge",
+  "reasoning_trace": "..."
+}
+```
+
+**Pass B — Market-Aware Decision (GPT-5.4)**
+
+Now show the model what it's trading against:
+```json
+{
+  "p_blind": 0.67,
+  "p_interval": [0.58, 0.75],
+  "evidence_summary": [/* from Opus */],
+  "current_mid": 0.62,
+  "spread_cents": 1.0,
+  "depth_at_best": 5000,
+  "our_inventory": 15.0,
+  "toxicity_score": 0.12,
+  "time_to_resolution_hours": 720
+}
+```
+
+Output:
+```json
+{
+  "action": "BUY",
+  "confidence": 0.6,
+  "max_skew_cents": 2.0,
+  "why_market_is_stale": "Committee vote result from 6 hours ago not priced in. Mid should be 65-67¢, currently 62¢.",
+  "why_market_is_NOT_stale": null,
+  "edge_after_costs": 0.03
+}
+```
+
+**Escalate to GPT-5.4-pro only when**:
+- Model disagreement > 15%
+- EV of the market justifies the cost
+- Rule ambiguity is high AND our capital exposure is significant
+
+### 4.3 Type 3: Document-Rich Markets — Gemini Dossier + Opus Challenger
+
+**Pass A — Dossier Synthesis (Gemini 3.1 Pro, 1M-token context)**
+
+Input: Full document bundle — PDFs, articles, ruling texts, regulatory filings. Gemini's 1M-token window handles what other models can't.
+
+Output: Same evidence graph schema as Opus, plus:
+```json
+{
+  "document_count": 12,
+  "total_tokens_processed": 245000,
+  "cross_document_contradictions": [
+    "Document A says 'by end of Q2', Document B says 'by June 30 EOD' — ambiguous if these are the same deadline"
+  ],
+  "key_document": "Federal Register Vol. 91 No. 45, pages 12001-12015"
+}
+```
+
+**Pass B — Adversarial Challenge (Opus 4.6)**
+
+Opus receives Gemini's synthesis and tries to break it:
+```json
+{
+  "gemini_assessment": { /* full output */ },
+  "task": "Find errors, missing evidence, or overconfident claims in this assessment. If the assessment is sound, say so."
+}
+```
+
+**Pass C — Final Judgment (GPT-5.4)**
+
+Same market-aware pass as Type 2.
+
+### 4.4 Simple Binary Markets — Sonnet Only
+
+For straightforward markets with clear rules and obvious resolution:
+- Sonnet triage output IS the specialist output
+- No escalation unless change detected
+- Cheapest path
+
+---
+
+## 5. Tier 3 — Calibration Layer
+
+### 5.1 Calibrated Stacker (Logit-Space)
+
+Replace the weighted median with a learned linear model in logit space:
+
+```
+ℓ_t = α + β₀·logit(m_t) + β₁·logit(p_opus) + β₂·logit(p_gemini) + β₃·logit(p_gpt)
+       + β₄·s_sonnet + β₅·c_rule - β₆·r_dispute - β₇·d_disagree + β₈·f_freshness
+
+p̂_t = σ(ℓ_t)
+```
+
+Where:
+| Variable | Description |
+|----------|-------------|
+| `m_t` | Current market prior (mid) |
+| `p_opus` | Opus blind probability estimate |
+| `p_gemini` | Gemini blind probability estimate |
+| `p_gpt` | GPT blind probability estimate |
+| `s_sonnet` | Sonnet triage score |
+| `c_rule` | Rule clarity (0-1) |
+| `r_dispute` | Dispute risk (0-1) |
+| `d_disagree` | Cross-model dispersion: `std([p_opus, p_gemini, p_gpt])` |
+| `f_freshness` | Evidence freshness (recency-weighted) |
+
+**When not all models ran** (most common case): missing logits default to `logit(m_t)` (market prior), effectively zeroing their contribution.
+
+### 5.2 Calibration Training
+
+**Training data**: Every resolved market where we logged model predictions.
+
+```python
+# For each resolved market:
+X = [logit(m_t), logit(p_opus), logit(p_gemini), logit(p_gpt),
+     s_sonnet, c_rule, r_dispute, d_disagree, f_freshness]
+y = 1 if resolved_YES else 0
+
+# Fit logistic regression (with regularization)
+from sklearn.linear_model import LogisticRegression
+calibrator = LogisticRegression(C=1.0, max_iter=1000)
+calibrator.fit(X_train, y_train)
+
+# Post-hoc: isotonic regression for residual miscalibration
+from sklearn.isotonic import IsotonicRegression
+iso = IsotonicRegression(out_of_bounds='clip')
+iso.fit(calibrator.predict_proba(X_val)[:, 1], y_val)
+```
+
+**Cold start**: Until we have 50+ resolved markets with model predictions, use `β₀ = 1.0` (trust market) and all other β = 0 (ignore models). Gradually increase model weights as data accumulates.
+
+### 5.3 Uncertainty Estimation
+
+```
+u_t = a₀ + a₁·model_dispersion + a₂·rule_ambiguity + a₃·source_age + a₄·missing_evidence
+```
+
+| Component | Weight | Description |
+|-----------|--------|-------------|
+| `a₀` | 0.05 | Base uncertainty floor |
+| `model_dispersion` | `std([p_opus, p_gemini, p_gpt])` | Models disagree |
+| `rule_ambiguity` | `1 - c_rule` | Rules are unclear |
+| `source_age` | `hours_since_last_source_check / 24` | Data is stale |
+| `missing_evidence` | count of `uncertainty_reasons` / 5 | Evidence gaps |
+
+### 5.4 Dynamic Hurdle Gate
+
+**Do not trade on model signal unless edge exceeds hurdle:**
+
+```
+|p̂_t - m_t| > h_t
+```
+
+Where:
+```
+h_t = h₀ + h_model + h_resolution + h_tox
+```
+
+| Component | Default | Description |
+|-----------|---------|-------------|
+| `h₀` | 0.03 (3¢) | Base hurdle — minimum edge to act |
+| `h_model` | `0.02 × d_disagree / 0.1` | Higher when models disagree |
+| `h_resolution` | `0.02 × (1 - c_rule)` | Higher when rules are ambiguous |
+| `h_tox` | `0.01 × toxicity_score` | Higher in toxic markets |
+
+If hurdle not met → `skew_t = 0` → V3 emits no signal → V2 uses market mid as fair value.
+
+### 5.5 Edge-After-Uncertainty Skew Formula
+
+When hurdle is met:
+
+```
+skew_t = clip(k · (p̂_t - m_t) · (1 - u_t) · liq_t · tox_t,  -s_max, s_max)
+```
+
+Where:
+- `k` = aggressiveness parameter (default: 1.0)
+- `liq_t` = liquidity multiplier: `min(1.0, depth_at_best / 5000)`
+- `tox_t` = toxicity discount: `max(0.2, 1.0 - toxicity_score)`
+- `s_max` = maximum skew (default: 5¢, configurable)
+
+### 5.6 Output: FairValueSignal
+
 ```python
 class FairValueSignal(BaseModel):
     condition_id: str
-    fair_value: float          # ensemble probability
-    confidence: float          # 0-1
-    edge_vs_market: float      # fair_value - mid
-    recommended_skew: str      # BUY, SELL, NEUTRAL
-    max_skew_cents: float      # max cents to skew our quotes
-    rule_clarity: float        # from Model A
-    dispute_risk: float        # from Model A
-    model_agreement: float     # how much models agree (0-1)
-    stale_flag: bool           # Model B says market hasn't moved but should have
-    timestamp: str
+    p_calibrated: float           # calibrated probability
+    p_interval: tuple[float, float]  # confidence interval
+    uncertainty: float            # u_t
+    edge_vs_market: float         # p̂_t - m_t
+    hurdle: float                 # h_t
+    hurdle_met: bool              # |edge| > hurdle
+    skew_cents: float             # skew_t × 100
+    recommended_action: str       # BUY, SELL, NEUTRAL
+    evidence_count: int
+    model_agreement: float        # 1 - d_disagree
+    rule_clarity: float
+    dispute_risk: float
+    freshness: float
+    specialist_path: str          # "numeric", "rule_heavy", "dossier", "simple"
+    models_called: list[str]      # ["sonnet_4.6"] or ["sonnet_4.6", "opus_4.6", "gpt_5.4"]
+    total_cost_usd: float         # actual API cost for this signal
+    timestamp: datetime
 ```
 
-## 5. Integration with V2
+---
 
-V3 doesn't touch orders directly. It feeds into V2's scorer:
+## 6. Model Assignments
+
+### 6.1 Sonnet 4.6 — Hot-Path Triage & Extraction
+
+**Role**: First-pass classifier. Runs on every triggered market.
+**Strengths**: Fast, cheap, web search/fetch, adaptive thinking.
+**Used for**:
+- News triage and entity extraction
+- Rule-to-schema extraction
+- "Does this market need escalation?" classification
+- Simple binary market probability (when no escalation needed)
+
+**Thinking mode**: Adaptive (let the model decide thinking depth).
+**Cost**: ~$3/MTok input, ~$15/MTok output. Cheap enough for hot path.
+
+### 6.2 Opus 4.6 — Rule Lawyer & Adversarial Challenger
+
+**Role**: Deep rule analysis. Called conditionally.
+**Strengths**: Highest reasoning, adversarial analysis, nuance detection.
+**Used for**:
+- Rule ambiguity analysis (Type 2 markets)
+- Adversarial challenge of Gemini dossiers (Type 3 markets)
+- Dispute risk assessment near resolution
+- Edge case detection when another model found large edge
+
+**Thinking mode**: Adaptive (extended thinking when rules are complex).
+**When NOT to call**: Clear rules, no clarifications, simple binary, no change detected.
+**Cost**: ~$15/MTok input, ~$75/MTok output. Reserve for high-value decisions.
+
+### 6.3 Gemini 3.1 Pro — Long-Context Dossier Model
+
+**Model**: `gemini-3.1-pro-preview` (NOT gemini-3-pro-preview — deprecated March 9, 2026)
+**Role**: Document synthesis. Called for Type 3 markets.
+**Strengths**: 1M-token context, structured outputs, search grounding, function calling.
+**Used for**:
+- Multi-document evidence synthesis
+- PDF/regulatory filing analysis
+- Large clarification bundles
+- Cross-document contradiction detection
+
+**Alternative for high-volume extraction**: Gemini 3.1 Flash-Lite (cheaper, faster, Google positions it for high-volume agentic tasks). Reserve Pro for hard cases.
+
+**Cost**: Token-based, pricing changes above 200K tokens. Simulate from traces.
+
+### 6.4 GPT-5.4 / GPT-5.4-pro — Orchestrator & Final Judge
+
+**Role**: Market-aware decision maker. Final call on action.
+**Strengths**: 1M-token context, web search, file search, tool use.
+**Used for**:
+- Pass B (market-aware decision) in all escalated paths
+- Default judge when only one specialist ran
+- Orchestration when multiple specialists disagree
+
+**Escalate to GPT-5.4-pro when**:
+- EV is high (>$0.50 potential edge × our capital)
+- Model disagreement > 15%
+- Market is capital-intensive (>$50 our exposure)
+- Ambiguity is high enough that a bad read costs real money
+
+**Cost**: Token-based. Verify exact model IDs available in account before production wiring.
+
+---
+
+## 7. Integration with V2
+
+V3 feeds into V2's scorer via `FairValueSignal`:
 
 ```python
 # In pmm2/scorer/combined.py
 async def score_bundle(self, market, bundle, reservation_price, nav):
     # ... existing EV components ...
-    
+
     # V3 fair value adjustment
     v3_signal = self.v3_engine.get_signal(market.condition_id)
-    if v3_signal and v3_signal.confidence > 0.4:
-        # Adjust reservation price toward V3's fair value
-        adjusted_r = reservation_price + v3_signal.max_skew_cents / 100.0
-        # If V3 says BUY, we lower our bid less (more aggressive buying)
-        # If V3 says SELL, we raise our ask less (more aggressive selling)
+
+    if v3_signal and v3_signal.hurdle_met:
+        # Apply capped skew to reservation price
+        skew = v3_signal.skew_cents / 100.0
+        adjusted_r = reservation_price + skew
+
+        # V3 NEVER overrides:
+        # - V1 risk limits
+        # - V2 allocation caps
+        # - Circuit breakers
+        # - Position limits
 ```
 
-**V3 never overrides V2's risk limits.** It can skew our quotes by at most `max_skew_cents` (default: 2¢). If V3 is very confident, it can go up to 5¢. It cannot:
-- Exceed position limits
-- Override circuit breakers
-- Force trades in tripped markets
-- Ignore resolution risk from its own Model A
+---
 
-## 6. News & Data Sources
+## 8. Data Pipeline
 
-### Free / Built-in
-- **Polymarket API**: Market metadata, resolution rules, clarifications
-- **Web search**: Headlines, breaking news (via Brave API)
-- **Wikipedia**: Background context for political/sports markets
-- **Social media**: X/Twitter trending topics (via web scrape)
+### 8.1 Free / Built-in Sources
 
-### Paid (optional, worth it)
-- **NewsAPI.org** ($449/mo): Real-time news from 150K+ sources
-- **Polygon.io** ($99/mo): Real-time crypto/stock prices for financial markets
-- **Associated Press API**: Authoritative news for political markets
+| Source | What | Cadence |
+|--------|------|---------|
+| Polymarket API | Market metadata, rules, clarifications | Every cycle |
+| Brave Search API | Breaking news headlines | On trigger |
+| Web fetch | Resolution source values (CoinGecko, ESPN, etc.) | 1-5 min for active |
+| Wikipedia | Background context | On first encounter |
+| V1/V2 telemetry | Microstructure, toxicity, fills | Real-time |
+| SQLite (PMM-2) | Historical fills, markout data | On demand |
 
-### Resolution Source Checking
-For markets where the resolution source is programmatic (e.g., CoinGecko price, sports scores):
-- V3 can CHECK the actual source in real time
-- If BTC is at $99,500 and the resolution threshold is $100,000, that's a 99%+ probability
-- This is the purest form of alpha: reading the resolution source before other traders update their orders
+### 8.2 Paid Sources (when justified by AUM)
 
-## 7. Cadences
+| Source | Cost | Value |
+|--------|------|-------|
+| NewsAPI.org | $449/mo | Real-time news from 150K+ sources |
+| Polygon.io | $99/mo | Real-time crypto/stock prices |
+| AP API | Variable | Authoritative political/event news |
 
-| Loop | Interval | Model | What |
-|------|----------|-------|------|
-| Rule refresh | 30 min | Opus 4.6 | Re-read rules, check for clarifications |
-| News scan | 5 min | Sonnet 4.6 | Check news, social, data feeds |
-| Synthesis | 15 min | Gemini 3 Pro | Produce updated probability |
-| Ensemble | 15 min | Local (no API) | Aggregate, produce FairValueSignal |
-| Alert | Event-driven | Sonnet 4.6 | Critical event detected → immediate update |
+### 8.3 Resolution Source Registry
 
-**Cost estimate** (12 active markets):
-- Opus: 12 markets × 2/hour × ~$0.03/call = ~$0.72/hour = **$17/day**
-- Sonnet: 12 × 12/hour × ~$0.005/call = ~$0.72/hour = **$17/day**
-- Gemini: 12 × 4/hour × ~$0.01/call = ~$0.48/hour = **$12/day**
-- **Total: ~$46/day** at 12 markets
+Maintain a mapping of known resolution sources to API endpoints:
 
-Scale to 30 markets: ~$115/day. This must generate >$115/day in alpha to be worth it.
+```python
+SOURCE_REGISTRY = {
+    "coingecko_btc_usd": {
+        "url": "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+        "parser": lambda r: r["bitcoin"]["usd"],
+        "type": "numeric",
+        "refresh_seconds": 60,
+    },
+    "espn_nba_scores": {
+        "url": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+        "parser": parse_espn_scores,
+        "type": "numeric",
+        "refresh_seconds": 30,
+    },
+    # ... extensible
+}
+```
 
-## 8. Safety Rails
+This is the highest-alpha component of V3. When you can check the resolution source programmatically, you know the answer before the market does.
 
-1. **Max skew = 5¢**: V3 can never move our quotes more than 5 cents from book mid
-2. **Confidence floor = 0.4**: Below this, V3 signal is ignored
-3. **Model agreement gate**: If models disagree by >15%, halve the skew
-4. **Rule clarity gate**: If clarity < 0.5, max skew drops to 1¢
-5. **Dispute gate**: If dispute_risk > 0.2, recommended_skew = NEUTRAL
-6. **Stale model detection**: If a model hasn't responded in 2× its expected cadence, use last signal with decaying confidence
-7. **Human override**: `/v3 pause` stops all AI signals, `/v3 override <market> <probability>` sets a manual fair value
-8. **Shadow first**: V3 runs 10 days in shadow before any live skew
+---
 
-## 9. What This Enables
+## 9. Cost Model
 
-**Without V3** (V1+V2): We make money from spread capture, queue optimization, and rewards. Our fair value = book midpoint. We have zero opinion on direction.
+### 9.1 Token-Based Estimation (Not Per-Call)
 
-**With V3**: We have an *informed opinion* on every market. When BTC is at $99,500 and the market says 62¢ for "BTC to $100K", we know that's mispriced and aggressively skew our quotes. When a market's resolution rules are ambiguous and a clarification just dropped, we pull our quotes before others react.
+All API providers bill by tokens. Additional charges apply for tool use.
 
-**The alpha sources**:
-1. **Stale market detection**: Mid hasn't moved but the world has → skew first
-2. **Resolution source reading**: Check the actual data source → update before crowd
-3. **Rule interpretation**: Understand edge cases competitors don't → avoid bad markets
-4. **Event reaction speed**: News breaks → update fair values in 5 minutes vs hours
-5. **Dispute prediction**: Spot ambiguous rules → reduce exposure before disputes
+| Provider | Model | Input | Output | Notes |
+|----------|-------|-------|--------|-------|
+| Anthropic | Sonnet 4.6 | $3/MTok | $15/MTok | +$10/1K web searches |
+| Anthropic | Opus 4.6 | $15/MTok | $75/MTok | +$10/1K web searches |
+| Google | Gemini 3.1 Pro | Varies | Varies | Price changes >200K tokens |
+| OpenAI | GPT-5.4 | Varies | Varies | +charges for web/file search |
+| OpenAI | GPT-5.4-pro | Higher | Higher | Only for high-EV escalation |
 
-## 10. Build Plan
+### 9.2 Cost Simulation
 
-| Sprint | What | Estimate |
-|--------|------|----------|
-| V3-S1 | Data pipeline (news feeds, resolution source checker) | 2-3 days |
-| V3-S2 | Model A — Rule Reader (Opus) | 2 days |
-| V3-S3 | Model B — News Analyst (Sonnet) | 2 days |
-| V3-S4 | Model C — Probability Synthesizer (Gemini) | 2 days |
-| V3-S5 | Ensemble aggregator + FairValueSignal | 1 day |
-| V3-S6 | V2 integration (scorer adjustment) | 1 day |
-| V3-S7 | Shadow mode (10 days observation) | 10 days calendar |
-| V3-S8 | Live with 1¢ max skew | 1 week |
-| V3-S9 | Full production (5¢ max skew) | ongoing |
+Before production, run the full pipeline on 100 historical markets and measure:
+- Actual tokens consumed per market type
+- Tool usage charges
+- Escalation frequency
+- Total daily cost at various market counts
 
-**Total dev: ~10-12 days. Calendar: ~4 weeks to full production.**
+### 9.3 Expected Cost Reduction vs V3-v1
 
-## 11. The Vision
+The event-driven + routing architecture should reduce API spend by 70-85% compared to fixed-cadence polling:
+- Most markets on most cycles: $0 (Tier 0 only, no trigger)
+- Triggered but not escalated: ~$0.003 (Sonnet triage only)
+- Fully escalated: ~$0.05-0.15 (specialist + judge)
 
-V1 = hands. V2 = brain. V3 = eyes and ears.
+At 12 markets: estimated **$5-15/day** (down from ~$46/day in v1 spec).
 
-The complete system:
-- **V1** executes orders safely and fast
-- **V2** decides where to put capital and when to move orders
-- **V3** sees the world and forms opinions about what markets are worth
-- **V4** (future): cross-market graph intelligence — "if Market A resolves YES, Markets B, C, D all shift"
+---
 
-This is the correct sequence. Each layer earns the right for the next.
+## 10. Safety Rails
+
+1. **Max skew = 5¢**: V3 cannot move quotes more than 5 cents from market mid
+2. **Dynamic hurdle gate**: Must clear `h_t` before any skew applied
+3. **Uncertainty dampening**: High uncertainty → skew multiplied by `(1 - u_t)` → approaches zero
+4. **Dispute gate**: If `dispute_risk > 0.2` → action = NEUTRAL, skew = 0
+5. **Model agreement gate**: If `d_disagree > 0.15` → halve max skew
+6. **Stale model detection**: Signal confidence decays 10%/hour when models haven't refreshed
+7. **Cold start protection**: Until 50+ calibration samples, all β except β₀ (market prior) = 0
+8. **Human overrides**: `/v3 pause`, `/v3 override <market> <probability>`, `/v3 cost-limit <$/day>`
+9. **Shadow mode**: V3 runs 10+ days in shadow before any live skew. Log everything, trade nothing.
+10. **Evidence requirement**: If specialist returns `edge_or_no_edge: "no_edge"`, signal is suppressed regardless of calibrator output
+
+---
+
+## 11. Research Path
+
+### 11.1 Model Evaluation
+
+Before production routing:
+
+1. Run all four models on 200+ resolved Polymarket markets
+2. Score each on:
+   - Rule parsing accuracy (did it identify the correct resolution criteria?)
+   - Stale-market detection (did it catch when mid should have moved?)
+   - Probability calibration (Brier score on resolved outcomes)
+   - Realized post-trade edge (if we had traded the signal, what was PnL?)
+3. Use OpenAI Evals with external models/custom endpoints for cross-vendor comparison
+4. Pick routing thresholds from data, not taste
+
+### 11.2 Calibration Feedback Loop
+
+```
+Market resolves → record (features, prediction, outcome) → retrain stacker weekly
+                                                         → update routing thresholds monthly
+                                                         → publish calibration report daily
+```
+
+### 11.3 A/B Testing
+
+Run two V3 configurations simultaneously in shadow:
+- Configuration A: current routing + weights
+- Configuration B: experimental changes
+- Compare Brier scores, edge capture, cost efficiency
+
+---
+
+## 12. Build Plan
+
+| Sprint | What | Days | Dependencies |
+|--------|------|------|--------------|
+| V3-S0 | Source registry + deterministic checker | 2 | None |
+| V3-S1 | Change detection + trigger logic | 2 | S0 |
+| V3-S2 | Market-type classifier | 1 | S0 |
+| V3-S3 | Sonnet triage (Tier 1) + escalation gate | 3 | S1, S2 |
+| V3-S4 | Opus rule lawyer (Type 2 specialist) | 2 | S3 |
+| V3-S5 | Gemini dossier model (Type 3 specialist) | 2 | S3 |
+| V3-S6 | GPT-5.4 judge (Pass B, market-aware) | 2 | S4, S5 |
+| V3-S7 | Calibrated stacker + uncertainty + hurdle | 3 | S6 |
+| V3-S8 | V2 integration (FairValueSignal → scorer) | 1 | S7 |
+| V3-S9 | Shadow mode + logging + cost tracking | 2 | S8 |
+| V3-S10 | Model evaluation on historical markets | 5 | S9 |
+| V3-S11 | Calibration training (50+ resolved markets) | ongoing | S10 |
+| V3-S12 | Live with 1¢ max skew | 1 week calendar | S11 |
+| V3-S13 | Full production (5¢ max skew) | ongoing | S12 |
+
+**Dev time: ~25 days. Calendar: ~6 weeks to shadow, ~3 months to full production.**
+(Longer than v1 spec — but it ships a system that actually works.)
+
+---
+
+## 13. What V3 Does NOT Do
+
+- **Does not replace V1 or V2.** It's a signal layer.
+- **Does not override risk limits.** Ever.
+- **Does not use LLMs for barrier probability on numeric markets.** That's quant math.
+- **Does not assume LLMs are always right.** The calibrator can learn to ignore unreliable models.
+- **Does not run frontier models when a $0 deterministic check suffices.**
+- **Does not pass market price to blind estimation passes.** Anti-anchoring by design.
+- **Does not ship a weighted median.** The calibrated stacker is the production aggregator.
+
+---
+
+*V1 = hands. V2 = brain. V3 = eyes, ears, and judgment.*
+
+*The right system is not "AI instead of quant." It's deterministic tools + cheap triage + conditional specialists + learned calibration. The LLMs earn their keep by doing what math cannot: reading rules, synthesizing evidence, and detecting when the world changed but the market didn't notice.*
