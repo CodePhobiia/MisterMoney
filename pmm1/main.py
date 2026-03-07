@@ -779,40 +779,40 @@ async def run(settings: Settings | None = None) -> None:
             if not paper_mode and order_manager:
                 try:
                     exit_signals = await exit_manager.evaluate_all(state.active_markets)
-                    for signal in exit_signals:
+                    for exit_sig in exit_signals:
                         # Determine tick size for the token
                         sig_tick = state.tick_sizes.get(
-                            signal.token_id, Decimal("0.01")
+                            exit_sig.token_id, Decimal("0.01")
                         )
                         # Look up neg_risk from market metadata
-                        sig_md = state.active_markets.get(signal.condition_id)
+                        sig_md = state.active_markets.get(exit_sig.condition_id)
                         sig_neg_risk = sig_md.neg_risk if sig_md else False
 
-                        if signal.price and signal.price > 0:
+                        if exit_sig.price and exit_sig.price > 0:
                             result = await order_manager.submit_exit(
-                                token_id=signal.token_id,
-                                condition_id=signal.condition_id,
-                                price=signal.price,
-                                size=signal.size,
+                                token_id=exit_sig.token_id,
+                                condition_id=exit_sig.condition_id,
+                                price=exit_sig.price,
+                                size=exit_sig.size,
                                 tick_size=sig_tick,
-                                urgency=signal.urgency,
+                                urgency=exit_sig.urgency,
                                 neg_risk=sig_neg_risk,
                             )
                             if result.get("submitted"):
                                 orders_submitted += 1
                                 logger.info(
                                     "exit_order_submitted",
-                                    reason=signal.reason,
-                                    token_id=signal.token_id[:16],
-                                    size=signal.size,
-                                    price=signal.price,
-                                    urgency=signal.urgency,
+                                    reason=exit_sig.reason,
+                                    token_id=exit_sig.token_id[:16],
+                                    size=exit_sig.size,
+                                    price=exit_sig.price,
+                                    urgency=exit_sig.urgency,
                                 )
                             elif result.get("error"):
                                 logger.warning(
                                     "exit_order_failed",
-                                    reason=signal.reason,
-                                    token_id=signal.token_id[:16],
+                                    reason=exit_sig.reason,
+                                    token_id=exit_sig.token_id[:16],
                                     error=result["error"],
                                 )
                 except Exception as e:
