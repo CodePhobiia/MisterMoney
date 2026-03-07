@@ -18,6 +18,8 @@ from v3.evidence.entities import (
 )
 from v3.intake.schemas import MarketMeta
 from v3.routes.simple import SimpleRoute
+from v3.routes.rule_heavy import RuleHeavyRoute
+from v3.routes.dossier import DossierRoute
 
 log = structlog.get_logger()
 
@@ -52,7 +54,9 @@ class RouteOrchestrator:
         
         # Initialize routes
         self.simple_route = SimpleRoute(registry, evidence_graph)
-        # TODO: Initialize numeric, rule, dossier routes when ready
+        self.rule_route = RuleHeavyRoute(registry, evidence_graph)
+        self.dossier_route = DossierRoute(registry, evidence_graph)
+        # TODO: Initialize numeric route when ready
     
     async def execute(self,
                      plan: RoutePlan,
@@ -138,16 +142,31 @@ class RouteOrchestrator:
                                        reason="Numeric route not yet implemented")
         
         elif plan.route == "rule":
-            # TODO: Implement rule route
-            log.warning("rule_route_not_implemented", condition_id=plan.condition_id)
-            return self._neutral_signal(plan.condition_id, "rule",
-                                       reason="Rule route not yet implemented")
+            return await self.rule_route.execute(
+                condition_id=plan.condition_id,
+                market=market,
+                evidence_bundle=evidence,
+                rule_text=rule_text,
+                clarifications=getattr(market, 'clarifications', []),
+            )
         
         elif plan.route == "dossier":
-            # TODO: Implement dossier route
-            log.warning("dossier_route_not_implemented", condition_id=plan.condition_id)
-            return self._neutral_signal(plan.condition_id, "dossier",
-                                       reason="Dossier route not yet implemented")
+            # Fetch documents from evidence items
+            doc_ids = set(item.doc_id for item in evidence if item.doc_id)
+            documents = []
+            for doc_id in doc_ids:
+                doc = await self.evidence_graph.get_document(doc_id)
+                if doc:
+                    documents.append(doc)
+            
+            return await self.dossier_route.execute(
+                condition_id=plan.condition_id,
+                market=market,
+                documents=documents,
+                evidence=evidence,
+                rule_text=rule_text,
+                clarifications=getattr(market, 'clarifications', []),
+            )
         
         else:
             log.error("unknown_route", route=plan.route, condition_id=plan.condition_id)
