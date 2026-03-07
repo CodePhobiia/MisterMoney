@@ -254,7 +254,7 @@ class DossierRoute:
             p_hat=synthesis_data.get("p_hat", 0.5),
             uncertainty=synthesis_data.get("uncertainty", 0.3),
             evidence_ids=synthesis_data.get("evidence_ids", []),
-            model="claude-sonnet-4.6-fallback",
+            model="claude-sonnet-4-6",
             reasoning_summary=" | ".join(reasoning_parts),
         )
         
@@ -374,7 +374,7 @@ class DossierRoute:
             p_hat=challenge_data.get("p_hat", 0.5),
             uncertainty=challenge_data.get("uncertainty", 0.3),
             evidence_ids=challenge_data.get("evidence_ids", []),
-            model="claude-opus-4.6",
+            model="claude-opus-4-6",
             reasoning_summary=" | ".join(reasoning_parts),
         )
         

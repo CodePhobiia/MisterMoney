@@ -212,7 +212,7 @@ async def test_evidence_layer():
             route="rule",
             evidence_ids=["test_ev_001", "test_ev_002"],
             counterevidence_ids=[],
-            models_used=["claude-sonnet-4.5", "gpt-5.4"],
+            models_used=["claude-sonnet-4-6", "gpt-5.4"],
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
         )
         
