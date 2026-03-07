@@ -99,7 +99,7 @@ class V1StateSnapshot:
 
             # Get positions
             if hasattr(bot_state, "position_tracker"):
-                positions = bot_state.position_tracker.get_all_positions()
+                positions = bot_state.position_tracker.get_active_positions()
 
                 for pos in positions:
                     pos_dict = {

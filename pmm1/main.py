@@ -315,6 +315,14 @@ async def run(settings: Settings | None = None) -> None:
     finally:
         await rewards_client.close()
 
+    # Attach clients to state for PMM-2 shadow mode access
+    state.gamma_client = gamma
+    state.rewards_client = RewardsClient(
+        base_url=settings.api.clob_url,
+        api_key=settings.api.api_key,
+        api_secret=settings.api.api_secret,
+    )
+
     # ── 5. Select universe ──
     selected = select_universe(
         all_markets,
