@@ -695,7 +695,6 @@ async def run(settings: Settings | None = None) -> None:
                     await rewards_client_rebate.close()
                     logger.info(
                         "rebate_check",
-                        event="rebate_check",
                         maker_address=settings.wallet.address,
                         date=rebate_date,
                         data=rebate_data,

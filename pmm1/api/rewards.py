@@ -153,7 +153,16 @@ class RewardsClient:
                 )
                 return {}
 
-            data = await resp.json()
+            raw = await resp.json()
+
+        # Response may be wrapped: {"data": [...]} or just [...]
+        if isinstance(raw, dict) and "data" in raw:
+            data = raw["data"]
+        elif isinstance(raw, list):
+            data = raw
+        else:
+            logger.error("sampling_markets_unexpected_format", type=type(raw).__name__)
+            return {}
 
         # Parse response into RewardInfo dict
         result: dict[str, RewardInfo] = {}
