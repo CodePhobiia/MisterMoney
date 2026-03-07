@@ -755,8 +755,19 @@ async def run(settings: Settings | None = None) -> None:
                         continue  # Can't meet Polymarket minimum
                     # Get current book to price the sell
                     book = state.book_manager.get(token_id_held)
+                    best_bid = None
                     if book and book.best_bid and book.best_bid > 0:
-                        sell_price = book.best_bid  # Sell at best bid (market sell)
+                        best_bid = book.best_bid
+                    else:
+                        # No WS book — fetch via REST
+                        try:
+                            rest_book = await clob_public.get_order_book(token_id_held)
+                            if rest_book and rest_book.bids:
+                                best_bid = float(rest_book.bids[0].price)
+                        except Exception:
+                            pass
+                    if best_bid and best_bid > 0:
+                        sell_price = best_bid
                         from pmm1.strategy.quote_engine import QuoteIntent
                         unwind_intent = QuoteIntent(
                             condition_id=token_id_held,
