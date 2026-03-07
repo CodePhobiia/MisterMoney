@@ -443,6 +443,27 @@ async def run(settings: Settings | None = None) -> None:
             price = float(price_str) if price_str else 0.0
             size = float(size_str) if size_str else 0.0
             
+            if size <= 0 or price <= 0:
+                return
+            
+            # Find market info for this token
+            market_question = ""
+            condition_id = None
+            for md in state.active_markets.values():
+                if md.token_id_yes == token_id or md.token_id_no == token_id:
+                    condition_id = md.condition_id
+                    market_question = md.question
+                    break
+            
+            # Determine if side is missing (WS sometimes omits it)
+            if not side:
+                # Check the tracked order
+                tracked = state.order_tracker.get(order_id)
+                if tracked:
+                    side = tracked.side
+            
+            dollar_value = size * price
+            
             # Log fill details
             logger.info(
                 "fill_detected",
@@ -451,48 +472,45 @@ async def run(settings: Settings | None = None) -> None:
                 side=side,
                 price=price,
                 size=size,
+                dollar_value=round(dollar_value, 2),
+                market=market_question[:40] if market_question else "?",
             )
             
             # Update position tracker
-            # Find the condition_id for this token_id
-            condition_id = None
-            for md in state.active_markets.values():
-                if md.token_id_yes == token_id or md.token_id_no == token_id:
-                    condition_id = md.condition_id
-                    break
-            
             if condition_id:
                 pos = state.position_tracker.get(condition_id)
                 if pos:
-                    # Convert side to BUY/SELL
                     fill_side = "BUY" if side == "BUY" else "SELL"
                     pos.apply_fill(token_id, fill_side, size, price, fee=0.0)
-                    logger.info(
-                        "position_updated_from_fill",
-                        condition_id=condition_id[:16],
-                        token_id=token_id[:16],
-                        new_yes_size=pos.yes_size,
-                        new_no_size=pos.no_size,
-                    )
             
-            # Only notify + record if this is OUR order (tracked by order manager)
-            is_our_order = order_id and state.order_tracker.get(order_id) is not None
+            # Compute PnL for SELL fills
+            pnl_text = ""
+            if side == "SELL" and condition_id:
+                pos = state.position_tracker.get(condition_id)
+                avg_entry = pos.yes_avg_price if pos and pos.yes_avg_price > 0 else 0
+                if not avg_entry and pos:
+                    avg_entry = pos.no_avg_price  # NO token sell
+                if avg_entry > 0:
+                    pnl = (price - avg_entry) * size
+                    pnl_pct = ((price / avg_entry) - 1) * 100
+                    pnl_emoji = "📈" if pnl >= 0 else "📉"
+                    pnl_text = f"\n{pnl_emoji} PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)"
             
-            if is_our_order:
-                # Send Telegram notification
-                notification = format_fill_notification(
-                    side=side or "UNKNOWN",
-                    size=size,
-                    price=price,
-                    token_id=token_id,
-                    order_id=order_id,
-                )
-                asyncio.create_task(send_telegram(notification))
-                
-                # Record fill for escalation ladder
+            # Always send Telegram for fills from the user WS
+            # (user WS only sends OUR fills, not other users')
+            emoji = "🟢" if side == "BUY" else "🔴"
+            market_line = f"\n📊 {market_question[:50]}" if market_question else ""
+            notification = (
+                f"{emoji} *{side or 'FILL'}*: {size:.1f} shares @ ${price:.3f}\n"
+                f"💵 Value: ${dollar_value:.2f}"
+                f"{pnl_text}"
+                f"{market_line}"
+            )
+            asyncio.create_task(send_telegram(notification))
+            
+            # Record fill for escalation ladder
+            if hasattr(state, 'fill_escalator'):
                 state.fill_escalator.record_fill()
-            else:
-                logger.debug("fill_not_our_order", order_id=order_id[:16] if order_id else "?")
         except Exception as e:
             logger.error("on_fill_callback_error", error=str(e))
 
