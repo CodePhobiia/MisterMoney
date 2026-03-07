@@ -121,35 +121,57 @@ class GoogleProvider(BaseProvider):
         session = await self._get_session()
         
         # Convert messages to Gemini format
+        system_parts = []
         contents = []
         for msg in messages:
-            role = "user" if msg.get("role") in ["user", "system"] else "model"
-            contents.append({
-                "role": role,
-                "parts": [{"text": msg.get("content", "")}]
-            })
+            if msg.get("role") == "system":
+                system_parts.append({"text": msg.get("content", "")})
+            else:
+                role = "user" if msg.get("role") == "user" else "model"
+                contents.append({
+                    "role": role,
+                    "parts": [{"text": msg.get("content", "")}]
+                })
         
-        # Build request body
-        body: dict[str, Any] = {
-            "model": self.config.model,
-            "contents": contents,
-            "generationConfig": {
-                "maxOutputTokens": max_tokens or self.config.max_tokens_out,
-                "temperature": 0.1,
-            }
+        if not contents:
+            contents = [{"role": "user", "parts": [{"text": ""}]}]
+        
+        # Build generation config
+        gen_config: dict[str, Any] = {
+            "maxOutputTokens": max_tokens or self.config.max_tokens_out,
+            "temperature": 0.1,
         }
         
         # Add response format hint if requested
         if response_format:
-            # Append JSON instruction to last user message
-            if contents and contents[-1]["role"] == "user":
-                contents[-1]["parts"][0]["text"] += "\n\nIMPORTANT: Respond with valid JSON only."
+            gen_config["responseMimeType"] = "application/json"
+        
+        # Build inner request (CCA wraps in project/model/request)
+        inner_request: dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": gen_config,
+        }
+        if system_parts:
+            inner_request["systemInstruction"] = {"parts": system_parts}
+        
+        # Build CCA outer body
+        body: dict[str, Any] = {
+            "project": self.project_id,
+            "model": self.config.model,
+            "request": inner_request,
+            "userAgent": "mistermoney-v3",
+            "requestId": f"mm-{int(time.time() * 1000)}",
+        }
         
         # Make request with exponential backoff for 403 errors
         headers = {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",
-            "x-goog-api-client": "v3-resolution-intelligence",
+            "Client-Metadata": json.dumps({
+                "ideType": "IDE_UNSPECIFIED",
+                "platform": "PLATFORM_UNSPECIFIED",
+                "pluginType": "GEMINI",
+            }),
         }
         
         max_retries = 3
@@ -272,20 +294,26 @@ class GoogleProvider(BaseProvider):
             
             session = await self._get_session()
             
-            # Simple test request
+            # Simple test request using CCA format
             body = {
+                "project": self.project_id,
                 "model": self.config.model,
-                "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
-                "generationConfig": {
-                    "maxOutputTokens": 10,
-                    "temperature": 0.1,
-                }
+                "request": {
+                    "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+                    "generationConfig": {"maxOutputTokens": 10, "temperature": 0.1},
+                },
+                "userAgent": "mistermoney-v3",
+                "requestId": f"mm-health-{int(time.time() * 1000)}",
             }
             
             headers = {
                 "Authorization": f"Bearer {self.access_token}",
                 "Content-Type": "application/json",
-                "x-goog-api-client": "v3-resolution-intelligence",
+                "Client-Metadata": json.dumps({
+                    "ideType": "IDE_UNSPECIFIED",
+                    "platform": "PLATFORM_UNSPECIFIED",
+                    "pluginType": "GEMINI",
+                }),
             }
             
             timeout = aiohttp.ClientTimeout(total=15)
@@ -296,6 +324,10 @@ class GoogleProvider(BaseProvider):
                 timeout=timeout,
             ) as resp:
                 if resp.status == 200:
+                    return True
+                elif resp.status == 429:
+                    # Rate limited but reachable — treat as healthy
+                    logger.info("google_health_check_rate_limited", status=429)
                     return True
                 else:
                     error_text = await resp.text()

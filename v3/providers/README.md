@@ -5,78 +5,77 @@ OAuth-based provider adapters for MisterMoney V3 Resolution Intelligence.
 ## Status
 
 ### Working ✅
-- **Anthropic Claude Sonnet 4.6** - Extended thinking, prompt caching, tool use
-- **Anthropic Claude Opus 4.6** - Extended thinking, prompt caching, tool use
+- **Anthropic Claude Sonnet 4.6** — Hot-path triage, prompt caching, tool use
+- **Anthropic Claude Opus 4.6** — Rule lawyer, adversarial challenger
+- **OpenAI GPT-5.4** — Online judge, orchestrator (Codex Responses API)
+- **Google Gemini 3 Pro Preview** — Long-context dossier (Cloud Code Assist OAuth)
 
-### Not Working ❌
-- **OpenAI GPT-5.4** - API format mismatch ("Input must be a list" error)
-- **OpenAI GPT-5.4-pro** - Not supported in current ChatGPT Pro subscription
-- **Google Gemini 3.1 Pro** - OAuth token expired, needs re-authentication
+### Unavailable ⚠️
+- **OpenAI GPT-5.4-pro** — Not supported via Codex ChatGPT endpoint ("not supported when using Codex with a ChatGPT account"). Needs standard OpenAI API key for async adjudication.
 
 ## Usage
 
 ```python
 from v3.providers import ProviderRegistry
 
-# Initialize registry
 registry = ProviderRegistry()
 await registry.initialize()
 
-# Get provider
+# Available roles: "sonnet", "opus", "gpt54", "gemini"
 provider = await registry.get("sonnet")
 
-# Make request
 response = await provider.complete(
     messages=[
         {"role": "system", "content": "You are a market analyst."},
-        {"role": "user", "content": "Analyze this market..."}
+        {"role": "user", "content": "Analyze this market..."},
     ],
-    max_tokens=4096,
     reasoning_effort="medium",  # low/medium/high
 )
 
 print(response.text)
 print(f"Tokens: {response.input_tokens} in, {response.output_tokens} out")
-print(f"Latency: {response.latency_ms}ms")
-print(f"Cache hit: {response.cache_hit}")
+print(f"Latency: {response.latency_ms:.0f}ms")
 
-# Cleanup
 await registry.close_all()
 ```
 
-## Features
+## Provider Details
 
-### Anthropic Providers
-- ✅ Extended thinking with configurable budget
-- ✅ Prompt caching (automatically enabled for system prompts)
-- ✅ Tool use support
-- ✅ Structured output (via system prompt enforcement)
-- ✅ Health checks
+### Anthropic (OAT token, no refresh needed)
+- Extended thinking with configurable budget
+- Prompt caching (auto-enabled for system prompts)
+- Tool use support
+- Token: `sk-ant-oat01-...` from auth-profiles.json
+
+### OpenAI (Codex OAuth, auto-refresh)
+- Codex Responses API: `chatgpt.com/backend-api/codex/responses`
+- Input must be list of `{role, content}`, `store: false` required
+- SSE streaming response parsing
+
+### Google (CCA OAuth, auto-refresh)
+- Cloud Code Assist: `cloudcode-pa.googleapis.com/v1internal:generateContent`
+- CCA wraps request in `{project, model, request: {contents, generationConfig}}`
+- Model names without `models/` prefix
+- 429 rate limits = healthy but throttled
+- Token auto-refreshed via `oauth2.googleapis.com/token`
 
 ### Rate Limiting
 In-memory sliding window tracking (RPM/TPM). Redis integration deferred to Sprint 1.
 
-## Testing
-
-```bash
-python3 -m v3.providers.test_providers
-```
-
 ## Architecture
 
-- `base.py` - Abstract base classes (ProviderConfig, ProviderResponse, BaseProvider)
-- `anthropic_adapter.py` - Anthropic Claude integration
-- `openai_adapter.py` - OpenAI Codex integration (currently broken)
-- `google_adapter.py` - Google Gemini integration (token expired)
-- `registry.py` - Provider instance manager
-- `rate_tracker.py` - Rate limit tracking
-- `test_providers.py` - Live integration tests
+- `base.py` — Abstract base classes
+- `anthropic_adapter.py` — Anthropic Claude integration
+- `openai_adapter.py` — OpenAI Codex integration
+- `google_adapter.py` — Google CCA integration
+- `registry.py` — Provider instance manager
+- `rate_tracker.py` — Rate limit tracking
+- `test_providers.py` — Live integration tests
 
-## Next Steps (Sprint 1+)
+## Key Lessons
 
-1. Fix OpenAI Codex API format (investigate correct request structure)
-2. Re-authenticate Google Gemini CLI OAuth
-3. Add Redis-based rate limiting
-4. Add retry logic with exponential backoff
-5. Add circuit breakers for failing providers
-6. Add metrics collection (latency, tokens, costs)
+1. Codex API: `input` must be list, `store: false` required, no `max_output_tokens`
+2. CCA API: body is `{project, model, request: {...}}` not flat `{contents, generationConfig}`
+3. CCA model names: `gemini-3-pro-preview` not `models/gemini-3-pro-preview`
+4. CCA rate limit (429) during health check = provider is reachable, not broken
+5. GPT-5.4-pro not available via Codex endpoint — needs standard API key

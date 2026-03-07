@@ -66,23 +66,26 @@ class OpenAIProvider(BaseProvider):
         start_time = time.time()
         session = await self._get_session()
         
-        # Extract system and user messages
+        # Separate system instructions from conversation messages
         system_content = ""
-        user_content = ""
+        input_messages = []
         
         for msg in messages:
             if msg.get("role") == "system":
                 system_content += msg.get("content", "") + "\n"
-            elif msg.get("role") == "user":
-                user_content += msg.get("content", "") + "\n"
+            else:
+                input_messages.append({"role": msg["role"], "content": msg.get("content", "")})
         
-        # Build request body
+        if not input_messages:
+            input_messages = [{"role": "user", "content": ""}]
+        
+        # Build request body — Codex API requires input as list, store=false, no max_output_tokens
         body: dict[str, Any] = {
             "model": self.config.model,
             "instructions": system_content.strip(),
-            "input": user_content.strip(),
+            "input": input_messages,
             "stream": True,
-            "max_output_tokens": max_tokens or self.config.max_tokens_out,
+            "store": False,
         }
         
         # Add reasoning effort
@@ -144,12 +147,13 @@ class OpenAIProvider(BaseProvider):
                 if not final_response:
                     raise ValueError("No completed response received from SSE stream")
                 
-                # Extract response text
+                # Extract response text — completed event wraps in .response
+                resp_obj = final_response.get("response", final_response)
                 text = ""
-                output_list = final_response.get("output", [])
+                output_list = resp_obj.get("output", [])
                 for output_item in output_list:
                     for content_block in output_item.get("content", []):
-                        if content_block.get("type") == "text":
+                        if content_block.get("type") in ("output_text", "text"):
                             text += content_block.get("text", "")
                 
                 # Parse structured output if response_format was requested
@@ -161,7 +165,7 @@ class OpenAIProvider(BaseProvider):
                         logger.warning("failed_to_parse_json", error=str(e), text=text[:200])
                 
                 # Extract token usage
-                usage = final_response.get("usage", {})
+                usage = resp_obj.get("usage", {})
                 input_tokens = usage.get("input_tokens", 0)
                 output_tokens = usage.get("output_tokens", 0)
                 
@@ -184,7 +188,7 @@ class OpenAIProvider(BaseProvider):
                     latency_ms=latency_ms,
                     cache_hit=False,
                     model=self.config.model,
-                    provider_state_ref=final_response.get("id"),
+                    provider_state_ref=resp_obj.get("id"),
                 )
                 
         except aiohttp.ClientResponseError as e:
@@ -212,9 +216,9 @@ class OpenAIProvider(BaseProvider):
             body = {
                 "model": self.config.model,
                 "instructions": "You are a helpful assistant.",
-                "input": "Say hello",
-                "stream": True,  # API requires stream
-                "max_output_tokens": 10,
+                "input": [{"role": "user", "content": "Say hello"}],
+                "stream": True,
+                "store": False,
                 "reasoning": {"effort": "low"},
             }
             

@@ -110,51 +110,49 @@ class ProviderRegistry:
                 except Exception as e:
                     logger.error("failed_to_create_gpt54", error=str(e))
                 
-                # GPT-5.4-pro (skip - not supported in current ChatGPT subscription)
-                # try:
-                #     gpt54pro_config = ProviderConfig(
-                #         provider="openai",
-                #         model="gpt-5.4-pro",
-                #         max_tokens_out=8192,
-                #         timeout_ms=120000,
-                #         rate_limit_rpm=20,
-                #     )
-                #     gpt54pro = OpenAIProvider(gpt54pro_config, token)
-                #     self.providers["gpt54pro"] = gpt54pro
-                #     logger.info("created_provider", role="gpt54pro", model="gpt-5.4-pro")
-                # except Exception as e:
-                #     logger.error("failed_to_create_gpt54pro", error=str(e))
-                pass
+                # GPT-5.4-pro (async adjudicator, high-EV only)
+                try:
+                    gpt54pro_config = ProviderConfig(
+                        provider="openai",
+                        model="gpt-5.4-pro",
+                        max_tokens_out=8192,
+                        timeout_ms=120000,
+                        rate_limit_rpm=20,
+                    )
+                    gpt54pro = OpenAIProvider(gpt54pro_config, token)
+                    self.providers["gpt54pro"] = gpt54pro
+                    logger.info("created_provider", role="gpt54pro", model="gpt-5.4-pro")
+                except Exception as e:
+                    logger.error("failed_to_create_gpt54pro", error=str(e))
         
-        # Create Google provider (skip - token needs re-authentication)
-        # google_profile = lobotomy_auth.get("profiles", {}).get("google-gemini-cli:talmerri@gmail.com")
-        # if google_profile:
-        #     access = google_profile.get("access")
-        #     refresh = google_profile.get("refresh")
-        #     expires = google_profile.get("expires")
-        #     project_id = google_profile.get("projectId")
-        #     
-        #     if all([access, refresh, expires, project_id]):
-        #         try:
-        #             gemini_config = ProviderConfig(
-        #                 provider="google",
-        #                 model="models/gemini-3.1-pro-preview",
-        #                 max_tokens_out=8192,
-        #                 timeout_ms=30000,
-        #                 rate_limit_rpm=60,
-        #             )
-        #             gemini = GoogleProvider(
-        #                 gemini_config,
-        #                 access,
-        #                 refresh,
-        #                 expires,
-        #                 project_id,
-        #             )
-        #             self.providers["gemini"] = gemini
-        #             logger.info("created_provider", role="gemini", model="gemini-3.1-pro-preview")
-        #         except Exception as e:
-        #             logger.error("failed_to_create_gemini", error=str(e))
-        pass
+        # Create Google provider (CCA OAuth with auto-refresh)
+        google_profile = lobotomy_auth.get("profiles", {}).get("google-gemini-cli:talmerri@gmail.com")
+        if google_profile:
+            access = google_profile.get("access")
+            refresh = google_profile.get("refresh")
+            expires = google_profile.get("expires")
+            project_id = google_profile.get("projectId")
+            
+            if all([access, refresh, expires, project_id]):
+                try:
+                    gemini_config = ProviderConfig(
+                        provider="google",
+                        model="gemini-3-pro-preview",
+                        max_tokens_out=8192,
+                        timeout_ms=30000,
+                        rate_limit_rpm=60,
+                    )
+                    gemini = GoogleProvider(
+                        gemini_config,
+                        access,
+                        refresh,
+                        expires,
+                        project_id,
+                    )
+                    self.providers["gemini"] = gemini
+                    logger.info("created_provider", role="gemini", model="gemini-3-pro-preview")
+                except Exception as e:
+                    logger.error("failed_to_create_gemini", error=str(e))
         
         # Run health checks
         for role, provider in list(self.providers.items()):
