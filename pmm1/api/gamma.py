@@ -178,6 +178,8 @@ class GammaClient:
         closed: bool = False,
         limit: int = 100,
         offset: int = 0,
+        order_by: str = "",
+        ascending: bool = False,
     ) -> list[GammaMarket]:
         """Fetch markets directly (not via events)."""
         all_markets: list[GammaMarket] = []
@@ -190,6 +192,9 @@ class GammaClient:
                 "limit": str(limit),
                 "offset": str(current_offset),
             }
+            if order_by:
+                params["order"] = order_by
+                params["ascending"] = str(ascending).lower()
             data = await self._get("/markets", params=params)
 
             if not data:

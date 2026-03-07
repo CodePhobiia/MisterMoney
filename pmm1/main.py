@@ -183,13 +183,16 @@ async def run(settings: Settings | None = None) -> None:
     # ── Initialize state ──
     state = BotState(settings)
 
-    # ── 4. Fetch universe ──
+    # ── 4. Fetch universe (ordered by 24h volume for best market selection) ──
     logger.info("fetching_universe")
-    events = await gamma.get_active_events()
     all_markets: list[MarketMetadata] = []
 
-    for event in events:
-        for market in event.markets:
+    # Fetch top markets DIRECTLY from Gamma /markets endpoint, ordered by volume
+    try:
+        raw_markets = await gamma.get_markets(
+            active=True, closed=False, order_by="volume24hr", limit=200,
+        )
+        for market in raw_markets:
             token_ids = market.token_ids
             if len(token_ids) < 2:
                 continue
@@ -197,7 +200,7 @@ async def run(settings: Settings | None = None) -> None:
                 condition_id=market.condition_id,
                 token_id_yes=token_ids[0],
                 token_id_no=token_ids[1] if len(token_ids) > 1 else "",
-                event_id=event.id,
+                event_id="",  # Not available from /markets endpoint
                 question=market.question,
                 slug=market.market_slug,
                 active=market.active,
@@ -218,6 +221,41 @@ async def run(settings: Settings | None = None) -> None:
                 reward_max_spread=market.rewards_max_spread,
             )
             all_markets.append(md)
+        logger.info("universe_from_markets_api", count=len(all_markets))
+    except Exception as e:
+        logger.warning("markets_api_failed_falling_back_to_events", error=str(e))
+        # Fallback to events endpoint
+        events = await gamma.get_active_events()
+        for event in events:
+            for market in event.markets:
+                token_ids = market.token_ids
+                if len(token_ids) < 2:
+                    continue
+                md = MarketMetadata(
+                    condition_id=market.condition_id,
+                    token_id_yes=token_ids[0],
+                    token_id_no=token_ids[1] if len(token_ids) > 1 else "",
+                    event_id=event.id,
+                    question=market.question,
+                    slug=market.market_slug,
+                    active=market.active,
+                    closed=market.closed,
+                    accepting_orders=market.accepting_orders,
+                    enable_order_book=market.enable_order_book,
+                    neg_risk=market.neg_risk,
+                    neg_risk_market_id=market.neg_risk_market_id,
+                    end_date=market.end_date,
+                    game_start_time=None,
+                    volume_24h=market.volume_24hr,
+                    liquidity=market.liquidity,
+                    spread=market.spread,
+                    best_bid=market.best_bid,
+                    best_ask=market.best_ask,
+                    reward_daily_rate=market.rewards_daily_rate,
+                    reward_min_size=market.rewards_min_size,
+                    reward_max_spread=market.rewards_max_spread,
+                )
+                all_markets.append(md)
 
     # Fetch reward-eligible markets
     try:
