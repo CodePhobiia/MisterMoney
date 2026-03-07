@@ -660,9 +660,9 @@ async def run(settings: Settings | None = None) -> None:
                 book_depth = 0.0
                 if book:
                     levels = book._bids if side == "BUY" else book._asks
-                    for lvl in levels.values():
-                        if abs(lvl.price_float - price) < 0.001:
-                            book_depth = lvl.size_float
+                    for lvl_price, lvl_size in levels.items():
+                        if abs(float(lvl_price) - price) < 0.001:
+                            book_depth = float(lvl_size)
                             break
                 pmm2_on_order_live(pmm2_runtime, order_id, token_id, side, price, size, book_depth)
             elif status in ("CANCELED", "CANCELLED"):

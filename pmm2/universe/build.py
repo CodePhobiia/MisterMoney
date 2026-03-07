@@ -107,7 +107,11 @@ async def build_enriched_universe(
         # Compute time to resolution
         hours_to_resolution = 0.0
         if market.end_date:
-            delta = market.end_date - now
+            end_dt = market.end_date
+            # Ensure timezone-aware comparison
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            delta = end_dt - now
             hours_to_resolution = max(0.0, delta.total_seconds() / 3600.0)
 
         # Compute ambiguity score
