@@ -107,12 +107,14 @@ def check_eligibility(
     if filters.require_clear_rules and not market.has_clear_rules:
         reasons.append("unclear_rules")
 
-    # Time to end check (unless pure arb)
+    # Hard end_date check: if market ended in the past, it's dead
     if market.end_date:
         end_date = market.end_date if market.end_date.tzinfo else market.end_date.replace(tzinfo=timezone.utc)
         now_aware = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
         hours_remaining = (end_date - now_aware).total_seconds() / 3600
-        if hours_remaining < filters.min_time_to_end_hours:
+        if hours_remaining < 0:
+            reasons.append("market_ended")
+        elif hours_remaining < filters.min_time_to_end_hours:
             reasons.append(f"time_to_end={hours_remaining:.1f}h < {filters.min_time_to_end_hours}h")
 
     # Volume check — use total volume as fallback if 24h volume is 0
