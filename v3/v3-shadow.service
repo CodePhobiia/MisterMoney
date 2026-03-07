@@ -1,0 +1,14 @@
+[Unit]
+Description=MisterMoney V3 Shadow Mode
+After=network.target postgresql.service redis.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/.openclaw/workspace/MisterMoney
+ExecStart=/usr/bin/python3 -m v3.shadow.main
+Restart=always
+RestartSec=30
+Environment=PYTHONPATH=/home/ubuntu/.openclaw/workspace/MisterMoney
+
+[Install]
+WantedBy=default.target
