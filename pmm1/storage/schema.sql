@@ -55,8 +55,8 @@ CREATE TABLE IF NOT EXISTS market_score (
 
 -- Queue state snapshots
 CREATE TABLE IF NOT EXISTS queue_state (
-    ts TEXT NOT NULL,
-    order_id TEXT NOT NULL,
+    order_id TEXT PRIMARY KEY,
+    token_id TEXT NOT NULL,
     condition_id TEXT NOT NULL,
     side TEXT,
     price REAL,
@@ -65,12 +65,11 @@ CREATE TABLE IF NOT EXISTS queue_state (
     est_ahead_mid REAL,
     est_ahead_high REAL,
     eta_sec REAL,
-    scoring INTEGER DEFAULT 0,
-    hold_ev_usdc REAL,
-    best_alt_action TEXT,
-    best_alt_ev_usdc REAL,
-    chosen_action TEXT,
-    PRIMARY KEY (ts, order_id)
+    fill_prob_30s REAL,
+    queue_uncertainty REAL,
+    is_scoring INTEGER DEFAULT 0,
+    entry_time REAL,
+    last_update REAL
 );
 
 -- Allocation decisions
