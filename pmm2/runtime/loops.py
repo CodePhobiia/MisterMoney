@@ -27,6 +27,7 @@ from pmm2.persistence.warmup import WarmupEstimator
 from pmm2.planner import DiffEngine, QuotePlanner
 from pmm2.queue import DepletionCalculator, FillHazard, QueueEstimator
 from pmm2.scorer.combined import MarketEVScorer
+from pmm2.shadow import CounterfactualEngine, ShadowDashboard, ShadowLogger, V1StateSnapshot
 from pmm2.universe.metadata import EnrichedMarket
 
 logger = structlog.get_logger(__name__)
@@ -81,6 +82,13 @@ class PMM2Runtime:
 
         self.planner = QuotePlanner(max_reprices_per_minute=config.max_reprices_per_minute)
         self.diff_engine = DiffEngine()
+
+        # Shadow mode components (always initialize, active when shadow_mode=True)
+        self.shadow_logger = ShadowLogger(db)
+        self.counterfactual_engine = CounterfactualEngine(self.shadow_logger)
+        self.shadow_dashboard = ShadowDashboard(self.counterfactual_engine)
+        self.last_milestone_reported = 0  # Track milestone reports
+        self.last_daily_report_time = 0.0  # Track daily shadow reports
 
         # State
         self.enriched_universe: list[EnrichedMarket] = []
@@ -280,17 +288,22 @@ class PMM2Runtime:
         """Full allocation cycle: score → allocate → plan → diff → execute.
 
         This is the main decision loop:
-        1. Score all markets in universe
-        2. Run capital allocator (greedy selection)
-        3. Generate quote plans from funded bundles
-        4. Diff target vs live orders
-        5. Execute mutations via V1 bridge
-        6. Persist decisions
+        1. Capture V1 state snapshot (shadow mode)
+        2. Score all markets in universe
+        3. Run capital allocator (greedy selection)
+        4. Generate quote plans from funded bundles
+        5. Diff target vs live orders
+        6. Execute mutations via V1 bridge (or log in shadow mode)
+        7. Compare counterfactual vs V1 (shadow mode)
+        8. Persist decisions
 
         Runs every 60s (configurable via allocator_interval_sec).
         """
         while self.running:
             try:
+                # 0. Capture V1 state snapshot (for shadow mode comparison)
+                v1_snapshot = V1StateSnapshot.capture(bot_state)
+                
                 # 1. Score all markets in universe
                 all_bundles = []
                 for market in self.enriched_universe:
@@ -354,7 +367,8 @@ class PMM2Runtime:
                     markets=len(new_plans),
                 )
 
-                # 4. Diff target vs live orders & execute
+                # 4. Diff target vs live orders & collect all mutations
+                all_mutations = []
                 for cid, target in new_plans.items():
                     # Get live orders for this market
                     if not hasattr(bot_state, "order_tracker"):
@@ -391,21 +405,89 @@ class PMM2Runtime:
                         )
                         continue
 
-                    # Execute through bridge
+                    # Collect mutations for batch execution
                     if mutations:
-                        result = await self.bridge.execute_mutations(mutations)
-                        self.planner.record_reprice(cid)
-                        logger.info(
-                            "pmm2_allocation_executed",
-                            condition_id=cid,
-                            mutations=len(mutations),
-                            **result,
-                        )
+                        all_mutations.extend(mutations)
+
+                # 5. Execute mutations through bridge (respects shadow mode)
+                if all_mutations:
+                    result = await self.bridge.execute_mutations(all_mutations)
+                    logger.info(
+                        "pmm2_allocation_executed",
+                        total_mutations=len(all_mutations),
+                        **result,
+                    )
 
                 # Update current plan
                 self.current_plan = new_plans
 
-                # 5. Persist decisions
+                # 6. Shadow mode: counterfactual comparison and logging
+                if self.config.shadow_mode:
+                    # Build PMM-2 plan summary
+                    pmm2_plan = {
+                        "markets": list(new_plans.keys()),
+                        "bundles": [
+                            {
+                                "market_condition_id": b.market_condition_id,
+                                "expected_return_bps": b.expected_return_bps,
+                                "is_reward_eligible": getattr(b, "is_reward_eligible", False),
+                            }
+                            for b in plan.funded_bundles
+                        ],
+                        "mutations": [
+                            {
+                                "action": m.action,
+                                "condition_id": m.condition_id,
+                                "token_id": m.token_id,
+                                "side": m.side,
+                                "price": m.price,
+                                "size": m.size,
+                                "order_id": m.order_id,
+                                "reason": m.reason,
+                            }
+                            for m in all_mutations
+                        ],
+                        "total_ev": sum(b.expected_return_bps for b in plan.funded_bundles) / 10000.0,
+                    }
+
+                    # Run counterfactual comparison
+                    comparison = self.counterfactual_engine.compare_cycle(v1_snapshot, pmm2_plan)
+
+                    # Log full cycle
+                    cycle_data = {
+                        "v1_state": v1_snapshot,
+                        "pmm2_plan": pmm2_plan,
+                        "comparison": comparison,
+                        "v1_markets": v1_snapshot.get("markets", []),
+                        "pmm2_markets": pmm2_plan["markets"],
+                        "v1_orders": v1_snapshot.get("orders", []),
+                        "pmm2_mutations": pmm2_plan["mutations"],
+                        "ev_breakdown": [
+                            {"condition_id": b.market_condition_id, "ev_bps": b.expected_return_bps}
+                            for b in plan.funded_bundles
+                        ],
+                        "allocator_output": {
+                            "funded_bundles": len(plan.funded_bundles),
+                            "total_capital_used": plan.total_capital_used,
+                        },
+                    }
+
+                    self.shadow_logger.log_allocation_cycle(cycle_data)
+
+                    # Check for milestone reports (every 100 cycles)
+                    cycle_num = self.counterfactual_engine.cycle_count
+                    if cycle_num % 100 == 0 and cycle_num > self.last_milestone_reported:
+                        await self.shadow_dashboard.send_milestone_report(cycle_num)
+                        self.last_milestone_reported = cycle_num
+
+                    logger.info(
+                        "shadow_cycle_logged",
+                        cycle=cycle_num,
+                        ev_delta=comparison.get("ev_delta", 0.0),
+                        ready_for_live=self.counterfactual_engine.is_ready_for_live(),
+                    )
+
+                # 7. Persist decisions
                 await self.allocator.persist_decisions(self.db, plan)
                 await self.scorer.persist_scores(all_bundles)
 
@@ -469,6 +551,17 @@ class PMM2Runtime:
                 # TODO: Refresh depletion rates from historical data
                 # active_tokens = list(self.queue_estimator.states.keys())
                 # await self.depletion_calc.calibrate(self.db, active_tokens)
+
+                # Shadow mode: send daily report (once per 24 hours)
+                if self.config.shadow_mode:
+                    current_time = time.time()
+                    time_since_last_report = current_time - self.last_daily_report_time
+                    
+                    # Send report every 24 hours (86400 seconds)
+                    if time_since_last_report >= 86400:
+                        await self.shadow_dashboard.send_daily_shadow_report()
+                        self.last_daily_report_time = current_time
+                        logger.info("shadow_daily_report_sent")
 
                 logger.info("pmm2_slow_cycle_complete")
 

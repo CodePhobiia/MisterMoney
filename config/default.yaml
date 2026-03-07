@@ -91,9 +91,9 @@ execution:
   retry_backoff_initial_ms: 1000
   retry_backoff_max_ms: 30000
 
-# PMM-2 (Advanced Market Maker) — DISABLED by default
+# PMM-2 (Advanced Market Maker) — SHADOW MODE ENABLED (Sprint 9)
 pmm2:
-  enabled: false
+  enabled: true  # Shadow mode enabled for validation
   shadow_mode: true  # True = log decisions, don't execute
   live_capital_pct: 0.0  # 0 = shadow, 0.1 = 10%, 1.0 = full
   

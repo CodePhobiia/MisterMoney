@@ -1,0 +1,191 @@
+"""Shadow dashboard — generates Telegram status reports.
+
+Produces human-readable summaries of shadow mode performance:
+- How many cycles analyzed
+- Positive EV percentage
+- Average EV delta per cycle
+- Reward market comparison (PMM-2 vs V1)
+- Churn reduction estimate
+- Launch readiness status (gates passed)
+"""
+
+from __future__ import annotations
+
+import structlog
+
+logger = structlog.get_logger(__name__)
+
+
+class ShadowDashboard:
+    """Generate shadow mode status for Telegram reporting."""
+
+    def __init__(self, counterfactual):
+        """Initialize shadow dashboard.
+
+        Args:
+            counterfactual: CounterfactualEngine instance
+        """
+        self.cf = counterfactual
+        logger.info("shadow_dashboard_initialized")
+
+    def generate_status(self) -> str:
+        """Generate Telegram-friendly shadow status.
+
+        Example:
+        🔮 PMM-2 Shadow Mode — Day 3
+
+        📊 150 cycles analyzed
+        ✅ 72% positive EV (gate: 70%)
+        📈 Avg EV delta: +$0.005/cycle
+        🎯 Reward markets: 8 vs V1's 3
+        ♻️ Churn: -15% vs V1
+
+        Launch readiness: ✅ READY (4/4 gates passed)
+
+        Returns:
+            Formatted status string
+        """
+        summary = self.cf.get_summary()
+        gates = self.cf.get_gates_status()
+
+        # Count gates passed
+        gates_passed = sum(1 for g in gates.values() if g)
+        total_gates = len(gates)
+
+        # Build status message
+        lines = [
+            "🔮 *PMM-2 Shadow Mode*",
+            "",
+            f"📊 {summary['cycles_run']} cycles analyzed",
+        ]
+
+        # Positive EV gate
+        ev_emoji = "✅" if gates.get("gate_1_positive_ev", False) else "⏳"
+        lines.append(
+            f"{ev_emoji} {summary['positive_ev_pct']:.1f}% positive EV (gate: 70%)"
+        )
+
+        # EV delta
+        ev_delta = summary["avg_ev_delta"]
+        ev_sign = "+" if ev_delta >= 0 else ""
+        lines.append(f"📈 Avg EV delta: {ev_sign}${ev_delta:.4f}/cycle")
+
+        # Reward markets
+        reward_emoji = "✅" if gates.get("gate_2_better_selection", False) else "⏳"
+        reward_improvement = summary["avg_reward_improvement"]
+        reward_sign = "+" if reward_improvement >= 0 else ""
+        lines.append(
+            f"{reward_emoji} Reward improvement: {reward_sign}{reward_improvement:.1f} markets"
+        )
+
+        # Churn reduction
+        churn_emoji = "✅" if gates.get("gate_3_lower_churn", False) else "⏳"
+        churn_reduction = summary["avg_churn_reduction"]
+        churn_pct = churn_reduction * 100
+        churn_sign = "-" if churn_reduction >= 0 else "+"
+        lines.append(f"{churn_emoji} Churn: {churn_sign}{abs(churn_pct):.1f}% vs V1")
+
+        # Market overlap
+        overlap = summary["avg_market_overlap"]
+        lines.append(f"🎯 Market overlap: {overlap:.1%}")
+
+        # Launch readiness
+        lines.append("")
+        if summary["ready_for_live"]:
+            lines.append(f"Launch readiness: ✅ *READY* ({gates_passed}/{total_gates} gates passed)")
+        else:
+            lines.append(
+                f"Launch readiness: ⏳ Not ready ({gates_passed}/{total_gates} gates passed)"
+            )
+
+            # Show which gates are blocking
+            blocking = []
+            if not gates.get("gate_1_positive_ev", False):
+                blocking.append("positive EV")
+            if not gates.get("gate_2_better_selection", False):
+                blocking.append("market selection")
+            if not gates.get("gate_3_lower_churn", False):
+                blocking.append("churn reduction")
+            if not gates.get("gate_4_enough_data", False):
+                blocking.append("data volume")
+
+            if blocking:
+                lines.append(f"Blocking: {', '.join(blocking)}")
+
+        return "\n".join(lines)
+
+    async def send_daily_shadow_report(self, chat_id: str = "7916400037"):
+        """Send daily shadow mode report via Telegram.
+
+        Args:
+            chat_id: Telegram chat ID to send to
+        """
+        try:
+            from pmm1.notifications import send_telegram
+
+            status = self.generate_status()
+            await send_telegram(status)
+
+            logger.info(
+                "shadow_daily_report_sent",
+                chat_id=chat_id,
+                cycles=self.cf.cycle_count,
+            )
+
+        except Exception as e:
+            logger.error(
+                "shadow_daily_report_failed",
+                error=str(e),
+                exc_info=True,
+            )
+
+    async def send_milestone_report(self, milestone: int):
+        """Send a report when reaching a cycle milestone.
+
+        Args:
+            milestone: cycle number reached (e.g., 100, 250, 500)
+        """
+        try:
+            from pmm1.notifications import send_telegram
+
+            summary = self.cf.get_summary()
+
+            message = (
+                f"🎯 *PMM-2 Milestone: {milestone} Cycles*\n\n"
+                f"{self.generate_status()}"
+            )
+
+            await send_telegram(message)
+
+            logger.info(
+                "shadow_milestone_report_sent",
+                milestone=milestone,
+                ready=summary["ready_for_live"],
+            )
+
+        except Exception as e:
+            logger.error(
+                "shadow_milestone_report_failed",
+                error=str(e),
+                exc_info=True,
+            )
+
+    def get_detailed_metrics(self) -> dict[str, any]:
+        """Get detailed metrics for programmatic access.
+
+        Returns:
+            Dict with all metrics and rolling averages
+        """
+        summary = self.cf.get_summary()
+        gates = self.cf.get_gates_status()
+
+        return {
+            "summary": summary,
+            "gates": gates,
+            "raw_metrics": {
+                "market_overlap_history": self.cf.metrics["market_overlap_pct"][-20:],
+                "reward_improvement_history": self.cf.metrics["pmm2_reward_markets"][-20:],
+                "churn_reduction_history": self.cf.metrics["pmm2_churn_reduction"][-20:],
+                "ev_delta_history": self.cf.metrics["ev_delta_per_cycle"][-20:],
+            },
+        }
