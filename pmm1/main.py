@@ -742,6 +742,17 @@ async def run(settings: Settings | None = None) -> None:
                         if quote_intent.ask_size:
                             quote_intent.ask_size *= res_mult
 
+                    # Crossing guard: ask must be above best bid, bid below best ask
+                    if book is not None:
+                        bb = book.get_best_bid()
+                        ba = book.get_best_ask()
+                        if bb and quote_intent.ask_price and quote_intent.ask_price <= bb.price_float:
+                            # Ask would cross the bid — place above best bid + tick
+                            quote_intent.ask_price = bb.price_float + float(tick_size)
+                        if ba and quote_intent.bid_price and quote_intent.bid_price >= ba.price_float:
+                            # Bid would cross the ask — place below best ask - tick
+                            quote_intent.bid_price = ba.price_float - float(tick_size)
+
                     # Execute
                     if quote_intent.has_bid or quote_intent.has_ask:
                         if paper_mode and paper_engine and paper_logger:
