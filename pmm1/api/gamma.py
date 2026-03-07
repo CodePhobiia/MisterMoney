@@ -41,6 +41,7 @@ class GammaMarket(BaseModel):
     rewards_min_size: float = Field(alias="rewardsMinSize", default=0.0)
     rewards_max_spread: float = Field(alias="rewardsMaxSpread", default=0.0)
     rewards_daily_rate: float = Field(alias="rewardsDailyRate", default=0.0)
+    fees_enabled: bool = Field(alias="feesEnabled", default=False)
 
     model_config = {"populate_by_name": True}
 

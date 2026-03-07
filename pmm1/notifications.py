@@ -58,6 +58,7 @@ def format_fill_notification(
     price: float,
     token_id: str,
     order_id: str,
+    is_scoring: bool = False,
 ) -> str:
     """Format a fill notification message.
     
@@ -67,13 +68,15 @@ def format_fill_notification(
         price: Fill price
         token_id: Token ID (first 16 chars will be shown)
         order_id: Order ID (first 16 chars will be shown)
+        is_scoring: Whether the order was scoring for rewards
     
     Returns:
         Formatted message string
     """
     emoji = "🟢" if side.upper() == "BUY" else "🔴"
     dollar_value = size * price
-    return f"""{emoji} {side.upper()} FILLED
+    scoring_badge = " 💰" if is_scoring else ""
+    return f"""{emoji} {side.upper()} FILLED{scoring_badge}
 Shares: {size:.1f} @ ${price:.3f}
 Value: ${dollar_value:.2f}
 Token: {token_id[:16]}..."""

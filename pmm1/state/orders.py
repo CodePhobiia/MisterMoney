@@ -115,6 +115,8 @@ class TrackedOrder(BaseModel):
     # Strategy context
     strategy: str = ""  # mm, parity_arb, neg_risk_arb
     intent_tag: str = ""  # for matching intent → result
+    # Rewards tracking
+    is_scoring: bool = False  # Whether order is scoring for Polymarket rewards
 
     @property
     def price_float(self) -> float:

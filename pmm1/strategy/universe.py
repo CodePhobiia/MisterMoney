@@ -44,6 +44,7 @@ class MarketMetadata(BaseModel):
     reward_daily_rate: float = 0.0
     reward_min_size: float = 0.0
     reward_max_spread: float = 0.0
+    fees_enabled: bool = False
     # Computed during scoring
     toxicity_estimate: float = 0.0
     resolution_risk: float = 0.0

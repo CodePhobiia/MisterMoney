@@ -40,6 +40,8 @@ from pmm1.api.clob_public import ClobPublicClient
 from pmm1.api.data_api import DataApiClient
 from pmm1.api.gamma import GammaClient
 from pmm1.api.geoblock import GeoblockError, check_geoblock
+from pmm1.api.rewards import RewardsClient
+from pmm1.api.scoring import check_orders_scoring
 from pmm1.backtest.recorder import LiveRecorder
 from pmm1.execution.batcher import OrderBatcher
 from pmm1.execution.order_manager import OrderManager
@@ -257,21 +259,41 @@ async def run(settings: Settings | None = None) -> None:
                     reward_daily_rate=market.rewards_daily_rate,
                     reward_min_size=market.rewards_min_size,
                     reward_max_spread=market.rewards_max_spread,
+                    fees_enabled=market.fees_enabled,
                 )
+                # S0-4: Log fee-enabled markets
+                if market.fees_enabled:
+                    logger.info(
+                        "fee_market_found",
+                        event="fee_market_found",
+                        condition_id=market.condition_id,
+                        question=market.question[:50] if market.question else "?",
+                    )
                 all_markets.append(md)
 
-    # Fetch reward-eligible markets
+    # Fetch reward-eligible markets from new rewards API
+    rewards_client = RewardsClient(
+        base_url=settings.api.clob_url,
+        api_key=settings.api.api_key,
+        api_secret=settings.api.api_secret,
+    )
     try:
-        sampling = await clob_public.get_sampling_markets()
-        for sm in sampling:
-            state.reward_eligible.add(sm.condition_id)
+        sampling_markets = await rewards_client.fetch_sampling_markets()
+        logger.info("sampling_markets_fetched", count=len(sampling_markets))
+        
+        # Mark reward eligibility and update reward data
+        for m in all_markets:
+            reward_info = sampling_markets.get(m.condition_id)
+            if reward_info:
+                m.reward_eligible = True
+                m.reward_daily_rate = reward_info.daily_rate
+                m.reward_min_size = reward_info.min_size
+                m.reward_max_spread = reward_info.max_spread
+                state.reward_eligible.add(m.condition_id)
     except Exception as e:
         logger.warning("sampling_markets_fetch_failed", error=str(e))
-
-    # Mark reward eligibility
-    for m in all_markets:
-        if m.condition_id in state.reward_eligible:
-            m.reward_eligible = True
+    finally:
+        await rewards_client.close()
 
     # ── 5. Select universe ──
     selected = select_universe(
@@ -300,7 +322,14 @@ async def run(settings: Settings | None = None) -> None:
                 index=len(state.neg_risk_events[md.event_id]),
             ))
 
-    logger.info("universe_selected", count=len(state.active_markets))
+    # Count reward-eligible markets (S0-5)
+    reward_eligible_count = sum(1 for md in state.active_markets.values() if md.reward_eligible)
+    logger.info(
+        "universe_selected",
+        count=len(state.active_markets),
+        reward_eligible=reward_eligible_count,
+        total_markets=len(state.active_markets),
+    )
 
     # ── 6. Fetch tick sizes ──
     for md in state.active_markets.values():
@@ -512,10 +541,15 @@ async def run(settings: Settings | None = None) -> None:
                     pnl_text = f"\n{pnl_emoji} PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)"
             
             # Send ONE Telegram notification per fill
+            # Check if order was scoring for rewards (S0-5)
+            tracked_order = state.order_tracker.get(order_id)
+            is_scoring = tracked_order.is_scoring if tracked_order else False
+            scoring_badge = " 💰" if is_scoring else ""
+            
             emoji = "🟢" if side == "BUY" else "🔴"
             market_line = f"\n📊 {market_question[:50]}" if market_question else ""
             notification = (
-                f"{emoji} *{side or 'FILL'}*: {size:.1f} shares @ ${price:.3f}\n"
+                f"{emoji} *{side or 'FILL'}*{scoring_badge}: {size:.1f} shares @ ${price:.3f}\n"
                 f"💵 Value: ${dollar_value:.2f}"
                 f"{pnl_text}"
                 f"{market_line}"
@@ -581,6 +615,47 @@ async def run(settings: Settings | None = None) -> None:
     if reconciler:
         reconcile_task = reconciler.start()
     recorder_task = recorder.start()
+    
+    # ── Scoring check loop (S0-2) ──
+    async def scoring_check_loop() -> None:
+        """Background task to check order scoring status every 30 seconds."""
+        while not shutdown_event.is_set():
+            try:
+                await asyncio.sleep(30)
+                if paper_mode:
+                    continue
+                
+                # Get all live order IDs
+                live_orders = [
+                    order for order in state.order_tracker.get_live_orders()
+                    if order.order_id
+                ]
+                if not live_orders:
+                    continue
+                
+                order_ids = [order.order_id for order in live_orders]
+                
+                # Check scoring status
+                scoring_status = await check_orders_scoring(clob_private, order_ids)
+                
+                # Update tracked orders
+                scoring_count = 0
+                for order in live_orders:
+                    is_scoring = scoring_status.get(order.order_id, False)
+                    order.is_scoring = is_scoring
+                    if is_scoring:
+                        scoring_count += 1
+                
+                logger.info(
+                    "order_scoring_check",
+                    scoring_count=scoring_count,
+                    total_checked=len(order_ids),
+                )
+            except Exception as e:
+                logger.error("scoring_check_loop_error", error=str(e))
+    
+    if not paper_mode:
+        scoring_check_task = asyncio.create_task(scoring_check_loop())
 
     # Wait briefly for WS connections to establish
     warmup_s = 5.0 if paper_mode else 2.0
@@ -601,11 +676,34 @@ async def run(settings: Settings | None = None) -> None:
     # ── Main quote loop ──
     cycle_count = 0
     quote_interval = settings.bot.quote_cycle_ms / 1000.0
+    last_rebate_check = 0.0  # S0-3: track last rebate check time
 
     try:
         while not shutdown_event.is_set():
             cycle_start = time.time()
             cycle_count += 1
+            
+            # ── Rebate check (S0-3) — every hour ──
+            if not paper_mode and (time.time() - last_rebate_check) >= 3600:
+                try:
+                    rebate_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    rewards_client_rebate = RewardsClient(base_url=settings.api.clob_url)
+                    rebate_data = await rewards_client_rebate.fetch_rebates(
+                        maker_address=settings.wallet.address,
+                        date=rebate_date,
+                    )
+                    await rewards_client_rebate.close()
+                    logger.info(
+                        "rebate_check",
+                        event="rebate_check",
+                        maker_address=settings.wallet.address,
+                        date=rebate_date,
+                        data=rebate_data,
+                    )
+                    last_rebate_check = time.time()
+                except Exception as e:
+                    logger.error("rebate_check_error", error=str(e))
+                    last_rebate_check = time.time()  # Don't retry immediately on error
 
             # ── Kill switch check (skip in paper mode) ──
             if not paper_mode:
