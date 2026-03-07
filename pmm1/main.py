@@ -509,6 +509,42 @@ async def run(settings: Settings | None = None) -> None:
                 for fill in new_fills:
                     paper_logger.log_fill(fill.to_dict())
 
+            # ── Pre-fetch stale REST books in parallel ──
+            stale_threshold = 120.0 if paper_mode else 60.0
+            stale_tokens = []
+            for md in state.eligible_markets():
+                tid = md.token_id_yes
+                if not tid:
+                    continue
+                ws_book = state.book_manager.get(tid)
+                ws_ok = ws_book is not None and ws_book.age_seconds <= stale_threshold
+                if not ws_ok:
+                    cache_key = f"rest_book_{tid}"
+                    cache_ts = state.rest_book_cache_ts.get(cache_key, 0)
+                    if time.time() - cache_ts > 10.0:
+                        stale_tokens.append(tid)
+
+            if stale_tokens:
+                async def _fetch_rest_book(tid: str) -> None:
+                    try:
+                        rest_book = await clob_public.get_order_book(tid)
+                        if rest_book and rest_book.bids and rest_book.asks:
+                            from pmm1.state.books import OrderBook
+                            cb = OrderBook(tid, tick_size=state.tick_sizes.get(tid, Decimal("0.01")))
+                            for bid in rest_book.bids:
+                                cb.update_level("bid", Decimal(bid.price), Decimal(bid.size))
+                            for ask in rest_book.asks:
+                                cb.update_level("ask", Decimal(ask.price), Decimal(ask.size))
+                            ck = f"rest_book_{tid}"
+                            state.rest_book_cache[ck] = cb
+                            state.rest_book_cache_ts[ck] = time.time()
+                    except Exception:
+                        pass
+
+                # Fetch up to 5 books in parallel per cycle
+                batch = stale_tokens[:5]
+                await asyncio.gather(*[_fetch_rest_book(t) for t in batch])
+
             # ── Quote each market ──
             markets_quoted = 0
             orders_submitted = 0

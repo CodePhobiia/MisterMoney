@@ -83,7 +83,7 @@ _VALID_TRANSITIONS: dict[OrderState, set[OrderState]] = {
 }
 
 TERMINAL_STATES = {OrderState.FILLED, OrderState.CANCELED, OrderState.EXPIRED, OrderState.FAILED}
-ACTIVE_STATES = {OrderState.LIVE, OrderState.PARTIAL, OrderState.MATCHED, OrderState.DELAYED}
+ACTIVE_STATES = {OrderState.SUBMITTED, OrderState.LIVE, OrderState.PARTIAL, OrderState.MATCHED, OrderState.DELAYED}
 
 
 class TrackedOrder(BaseModel):
