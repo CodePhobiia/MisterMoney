@@ -88,9 +88,9 @@ class DossierRoute:
         try:
             gemini = await self.registry.get("gemini")
             
-            # Check if Gemini is healthy
-            if not gemini.is_healthy:
-                log.warning("gemini_unhealthy_fallback_to_sonnet", condition_id=condition_id)
+            # Check if Gemini is available (unavailable providers are removed during initialization)
+            if not gemini:
+                log.warning("gemini_unavailable_fallback_to_sonnet", condition_id=condition_id)
                 return await self._synthesis_fallback_sonnet(
                     condition_id, documents, evidence, rule_text, clarifications
                 )
@@ -130,10 +130,12 @@ class DossierRoute:
             )
             
             # Call Gemini
-            messages = [{"role": "user", "content": prompt}]
+            messages = [
+                {"role": "system", "content": DOSSIER_SYSTEM},
+                {"role": "user", "content": prompt},
+            ]
             response = await gemini.complete(
                 messages=messages,
-                system=DOSSIER_SYSTEM,
                 reasoning_effort="medium",
             )
             
@@ -146,19 +148,24 @@ class DossierRoute:
             # Parse JSON response
             synthesis_data = self._parse_json_response(response.text)
             
-            # Create BlindEstimate with extended metadata
+            # Create BlindEstimate
+            # Extended metadata (contradictions, source_quality, key_documents) is captured in reasoning_summary
+            reasoning_parts = [synthesis_data.get("reasoning_summary", "")]
+            
+            contradictions = synthesis_data.get("contradictions", [])
+            if contradictions:
+                reasoning_parts.append(f"Contradictions: {'; '.join(contradictions[:3])}")
+            
+            source_quality = synthesis_data.get("source_quality", 0.5)
+            reasoning_parts.append(f"Source quality: {source_quality:.2f}")
+            
             estimate = BlindEstimate(
                 p_hat=synthesis_data.get("p_hat", 0.5),
                 uncertainty=synthesis_data.get("uncertainty", 0.3),
                 evidence_ids=synthesis_data.get("evidence_ids", []),
                 model="gemini-3-pro-preview",
-                reasoning_summary=synthesis_data.get("reasoning_summary", ""),
+                reasoning_summary=" | ".join(reasoning_parts),
             )
-            
-            # Attach extended metadata (will be used in challenge phase)
-            estimate.contradictions = synthesis_data.get("contradictions", [])
-            estimate.source_quality = synthesis_data.get("source_quality", 0.5)
-            estimate.key_documents = synthesis_data.get("key_documents", [])
             
             return estimate
             
@@ -219,10 +226,12 @@ class DossierRoute:
             clarifications=clarifications,
         )
         
-        messages = [{"role": "user", "content": prompt}]
+        messages = [
+            {"role": "system", "content": DOSSIER_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
         response = await sonnet.complete(
             messages=messages,
-            system=DOSSIER_SYSTEM,
         )
         
         log.info("sonnet_fallback_complete",
@@ -231,17 +240,23 @@ class DossierRoute:
         
         synthesis_data = self._parse_json_response(response.text)
         
+        # Extended metadata captured in reasoning_summary
+        reasoning_parts = [synthesis_data.get("reasoning_summary", "")]
+        
+        contradictions = synthesis_data.get("contradictions", [])
+        if contradictions:
+            reasoning_parts.append(f"Contradictions: {'; '.join(contradictions[:3])}")
+        
+        source_quality = synthesis_data.get("source_quality", 0.5)
+        reasoning_parts.append(f"Source quality: {source_quality:.2f}")
+        
         estimate = BlindEstimate(
             p_hat=synthesis_data.get("p_hat", 0.5),
             uncertainty=synthesis_data.get("uncertainty", 0.3),
             evidence_ids=synthesis_data.get("evidence_ids", []),
             model="claude-sonnet-4.6-fallback",
-            reasoning_summary=synthesis_data.get("reasoning_summary", ""),
+            reasoning_summary=" | ".join(reasoning_parts),
         )
-        
-        estimate.contradictions = synthesis_data.get("contradictions", [])
-        estimate.source_quality = synthesis_data.get("source_quality", 0.5)
-        estimate.key_documents = synthesis_data.get("key_documents", [])
         
         return estimate
     
@@ -280,12 +295,35 @@ class DossierRoute:
         question = f"Condition {condition_id}"
         
         # Convert synthesis estimate to dict
+        # Extract contradictions and source_quality from reasoning_summary if present
+        reasoning = synthesis_estimate.reasoning_summary or ""
+        contradictions = []
+        source_quality = 0.5
+        
+        if "Contradictions:" in reasoning:
+            # Parse contradictions from reasoning summary
+            parts = reasoning.split(" | ")
+            for part in parts:
+                if part.startswith("Contradictions:"):
+                    contradictions_str = part.replace("Contradictions:", "").strip()
+                    contradictions = [c.strip() for c in contradictions_str.split(";")]
+        
+        if "Source quality:" in reasoning:
+            # Parse source quality
+            parts = reasoning.split(" | ")
+            for part in parts:
+                if part.startswith("Source quality:"):
+                    try:
+                        source_quality = float(part.replace("Source quality:", "").strip())
+                    except ValueError:
+                        pass
+        
         synthesis_dict = {
             "p_hat": synthesis_estimate.p_hat,
             "uncertainty": synthesis_estimate.uncertainty,
             "reasoning_summary": synthesis_estimate.reasoning_summary,
-            "contradictions": getattr(synthesis_estimate, "contradictions", []),
-            "source_quality": getattr(synthesis_estimate, "source_quality", 0.5),
+            "contradictions": contradictions,
+            "source_quality": source_quality,
         }
         
         # Convert evidence to dicts
@@ -307,10 +345,12 @@ class DossierRoute:
             clarifications=[],
         )
         
-        messages = [{"role": "user", "content": prompt}]
+        messages = [
+            {"role": "system", "content": DOSSIER_CHALLENGE_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
         response = await opus.complete(
             messages=messages,
-            system=DOSSIER_CHALLENGE_SYSTEM,
         )
         
         log.info("opus_challenge_complete",
@@ -320,18 +360,23 @@ class DossierRoute:
         # Parse JSON response
         challenge_data = self._parse_json_response(response.text)
         
-        # Create BlindEstimate
+        # Create BlindEstimate with challenge metadata in reasoning_summary
+        reasoning_parts = [challenge_data.get("reasoning_summary", "")]
+        
+        challenge_points = challenge_data.get("challenge_points", [])
+        if challenge_points:
+            reasoning_parts.append(f"Challenges: {'; '.join(challenge_points[:3])}")
+        
+        agreement_level = challenge_data.get("agreement_level", "medium")
+        reasoning_parts.append(f"Agreement: {agreement_level}")
+        
         challenge_estimate = BlindEstimate(
             p_hat=challenge_data.get("p_hat", 0.5),
             uncertainty=challenge_data.get("uncertainty", 0.3),
             evidence_ids=challenge_data.get("evidence_ids", []),
             model="claude-opus-4.6",
-            reasoning_summary=challenge_data.get("reasoning_summary", ""),
+            reasoning_summary=" | ".join(reasoning_parts),
         )
-        
-        # Attach challenge metadata
-        challenge_estimate.challenge_points = challenge_data.get("challenge_points", [])
-        challenge_estimate.agreement_level = challenge_data.get("agreement_level", "medium")
         
         return challenge_estimate
     
@@ -431,10 +476,12 @@ Your job:
 
 Output ONLY valid JSON."""
             
-            messages = [{"role": "user", "content": judge_prompt}]
+            messages = [
+                {"role": "system", "content": judge_system},
+                {"role": "user", "content": judge_prompt},
+            ]
             response = await gpt54.complete(
                 messages=messages,
-                system=judge_system,
             )
             
             log.info("gpt54_adjudication_complete",
