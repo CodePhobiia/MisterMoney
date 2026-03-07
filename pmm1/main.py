@@ -97,7 +97,11 @@ class BotState:
         # Strategy
         self.feature_engine = FeatureEngine()
         self.fair_value_model = FairValueModel(settings.pricing)
-        self.quote_engine = QuoteEngine(settings.pricing)
+        self.quote_engine = QuoteEngine(
+            settings.pricing,
+            target_dollar_size=settings.pricing.target_dollar_size,
+            max_dollar_size=settings.pricing.max_dollar_size,
+        )
         self.parity_detector = BinaryParityDetector()
         self.neg_risk_detector = NegRiskArbDetector()
         self.reward_estimator = RewardEstimator()

@@ -64,6 +64,9 @@ class PricingConfig(BaseModel):
     cluster_skew_eta: float = 0.02
     take_threshold_cents: float = 0.8
     reward_capture_weight: float = 0.7
+    # Dollar-based sizing
+    target_dollar_size: float = 8.0   # Target $ per market per side
+    max_dollar_size: float = 15.0     # Max $ per market per side
     # Fair-value model coefficients (logit-space)
     beta_0: float = 0.0
     beta_1: float = 1.0  # logit(midpoint) weight

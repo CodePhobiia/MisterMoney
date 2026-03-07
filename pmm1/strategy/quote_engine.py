@@ -65,11 +65,15 @@ class QuoteEngine:
         base_size: float = 5.0,
         max_size: float = 20.0,
         size_decay_k: float = 0.1,
+        target_dollar_size: float = 8.0,
+        max_dollar_size: float = 15.0,
     ) -> None:
         self.config = config
         self.base_size = base_size
         self.max_size = max_size
         self.size_decay_k = size_decay_k
+        self.target_dollar_size = target_dollar_size
+        self.max_dollar_size = max_dollar_size
 
     def compute_reservation_price(
         self,
@@ -165,19 +169,22 @@ class QuoteEngine:
         reward_boost: float = 1.0,
         volatility_regime: str = "normal",
         time_to_catalyst_hours: float = float("inf"),
+        fair_value: float = 0.5,
     ) -> float:
-        """Compute quote size from §7.
+        """Compute quote size in SHARES, targeting a dollar exposure.
 
-        size_t = min(s_max, (s_0 · conf_t · rewardBoost_t) / (1 + k|q_t|))
-
-        Smaller when: high volatility, high toxicity, imbalanced inventory,
-        short time to catalyst.
+        Dollar-based: target $8 per market → shares = $8 / price.
+        Adjusted for confidence, inventory, volatility, time-to-catalyst.
         """
-        s_0 = self.base_size
+        price = max(0.01, fair_value)  # avoid division by zero
         k = self.size_decay_k
 
-        # Base size adjusted for confidence and rewards
-        size = (s_0 * confidence * reward_boost) / (1.0 + k * abs(market_inventory))
+        # Dollar-based: convert target dollars to shares at current price
+        target_shares = self.target_dollar_size / price
+        max_shares = self.max_dollar_size / price
+
+        # Adjust for confidence, rewards, inventory
+        size = (target_shares * confidence * reward_boost) / (1.0 + k * abs(market_inventory))
 
         # Volatility discount
         vol_multiplier = {
@@ -196,7 +203,7 @@ class QuoteEngine:
         elif time_to_catalyst_hours < 24:
             size *= 0.8
 
-        return max(1.0, min(self.max_size, size))
+        return max(5.0, min(max_shares, size))
 
     def compute_quote(
         self,
@@ -266,7 +273,7 @@ class QuoteEngine:
                 (Decimal(str(mid + tick_size)) / tick).to_integral_value(rounding=ROUND_CEILING) * tick
             )
 
-        # 4. Size
+        # 4. Size (dollar-based)
         reward_boost = 1.0 + reward_ev * 5.0 if reward_ev > 0 else 1.0
         size = self.compute_size(
             confidence=confidence,
@@ -274,6 +281,7 @@ class QuoteEngine:
             reward_boost=reward_boost,
             volatility_regime=features.vol_regime,
             time_to_catalyst_hours=features.time_to_resolution_hours,
+            fair_value=fair_value,
         )
 
         # Asymmetric sizing: smaller on the side with more inventory

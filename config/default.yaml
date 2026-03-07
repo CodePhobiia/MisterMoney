@@ -33,6 +33,8 @@ pricing:
   cluster_skew_eta: 0.001
   take_threshold_cents: 0.8
   reward_capture_weight: 0.7
+  target_dollar_size: 8.0
+  max_dollar_size: 15.0
 
 risk:
   per_market_gross_nav: 0.08
