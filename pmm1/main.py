@@ -446,7 +446,6 @@ async def run(settings: Settings | None = None) -> None:
             # Log fill details
             logger.info(
                 "fill_detected",
-                event="fill_detected",
                 token_id=token_id[:16] if token_id else "?",
                 order_id=order_id[:16] if order_id else "?",
                 side=side,
@@ -1287,7 +1286,6 @@ async def run(settings: Settings | None = None) -> None:
                                 
                                 logger.info(
                                     "taker_bootstrap_submitting",
-                                    event="taker_bootstrap",
                                     token_id=token_id_taker[:16],
                                     price=taker_price,
                                     size=taker_size,

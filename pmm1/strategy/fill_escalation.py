@@ -70,7 +70,6 @@ class FillEscalator:
 
         logger.info(
             "fill_recorded_escalation_reset",
-            event="fill_escalation_reset",
             prev_no_fill_mins=f"{prev_elapsed / 60:.1f}",
         )
 
@@ -103,7 +102,6 @@ class FillEscalator:
         if current_level != self._last_escalation_level:
             logger.info(
                 "escalation_level_changed",
-                event="escalation_level_up",
                 from_level=self._last_escalation_level,
                 to_level=current_level,
                 improvement_ticks=improvement,
@@ -127,7 +125,6 @@ class FillEscalator:
         if elapsed >= self.config.taker_trigger_secs and not self._has_taken_this_cycle:
             logger.info(
                 "taker_bootstrap_triggered",
-                event="taker_bootstrap",
                 no_fill_mins=f"{elapsed / 60:.1f}",
             )
             self._has_taken_this_cycle = True
