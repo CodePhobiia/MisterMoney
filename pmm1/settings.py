@@ -215,6 +215,16 @@ class ExitConfig(BaseModel):
     fill_escalation: FillEscalationConfig = Field(default_factory=FillEscalationConfig)
 
 
+class V3Config(BaseModel):
+    """V3 canary configuration — gradual ramp of V3 fair value signals."""
+
+    enabled: bool = False  # Master kill switch
+    max_skew_cents: float = 1.0  # Max V3 can move fair value (in cents)
+    redis_url: str = "redis://localhost:6379"
+    min_confidence: float = 0.70  # Minimum confidence to use V3 signal
+    signal_max_age_seconds: float = 300.0  # Max age before falling back to midpoint
+
+
 class UniverseWeights(BaseModel):
     """Weights for universe scoring formula from §5."""
 
@@ -245,6 +255,7 @@ class Settings(BaseSettings):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     universe_weights: UniverseWeights = Field(default_factory=UniverseWeights)
     exit: ExitConfig = Field(default_factory=ExitConfig)
+    v3: V3Config = Field(default_factory=V3Config)
     raw_config: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     model_config = {"env_prefix": "PMM1_", "env_nested_delimiter": "__"}

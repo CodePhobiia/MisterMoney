@@ -127,3 +127,11 @@ pmm2:
   per_event_cap_nav: 0.06
   total_active_cap_nav: 0.30
   per_market_cap_floor: 8.0
+
+# V3 Canary Configuration — Gradual ramp of V3 fair value signals
+v3:
+  enabled: false                     # Master kill switch
+  max_skew_cents: 1.0                # Max V3 can move fair value (in cents)
+  redis_url: "redis://localhost:6379"
+  min_confidence: 0.70               # Minimum confidence to use V3 signal (1 - uncertainty)
+  signal_max_age_seconds: 300.0      # Max age before falling back to midpoint
