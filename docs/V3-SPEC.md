@@ -14,15 +14,18 @@ The system is **evidence-centric, not model-centric**. The question is not "whic
 
 ## Access Layer
 
-Official vendor APIs with server-side API keys. No consumer/OAuth subscription endpoints. No "$0 marginal token cost" assumptions.
+OAuth consumer endpoints via existing subscriptions. $0 marginal token cost — rate limits are the binding constraint, not dollars.
 
-- **Anthropic**: Native Claude API (prompt caching, citations, PDF handling, thinking)
-- **OpenAI**: Native Responses API (tool use, prompt caching, configurable reasoning)
-- **Google**: Official Google Gen AI SDK (thought-signature round-tripping, structured outputs, caching)
+- **Anthropic**: Claude Pro/Max subscription OAuth → native Claude API endpoints (prompt caching, citations, PDF handling, thinking)
+- **OpenAI**: ChatGPT Pro subscription OAuth → Responses API (tool use, prompt caching, configurable reasoning). Codex endpoint (`chatgpt.com/backend-api/codex/responses`) for GPT-5.4/5.4-pro.
+- **Google**: Google AI Ultra subscription OAuth → Cloud Code Assist endpoint (`cloudcode-pa.googleapis.com`). Gemini 3.1 Pro Preview via CCA.
 
-API keys stored in KMS. V3 is engineered around **latency budgets, rate budgets, and cost budgets** — not "free inference."
+OAuth tokens stored in `auth-profiles.json`, auto-refreshed on expiry. V3 is engineered around **latency budgets and rate budgets** — cost is $0 per token.
 
-No compatibility shims as primary path. Anthropic's OpenAI SDK compatibility layer is for testing, not production. Gemini's official SDKs handle thought signatures automatically, which matters for tool/function workflows.
+Native vendor APIs and SDKs where possible. Anthropic's OpenAI SDK compatibility layer is for testing, not production — use native Claude API for full prompt caching and thinking support. Gemini's official SDK handles thought signatures automatically for tool/function workflows.
+
+### Auth Flow
+Each provider adapter handles OAuth token refresh internally. Tokens are persisted to disk and refreshed before expiry. If a provider's OAuth is broken or rate-limited, the route publishes cached signal or neutral — no silent model substitution.
 
 ## Topology
 

@@ -6,7 +6,7 @@
 
 ## Sprint 0 — Access Layer (~3 days)
 
-**Goal**: Official vendor API integration with native SDKs. Remove all consumer/OAuth assumptions.
+**Goal**: OAuth consumer endpoint integration with native SDKs. Token refresh, rate-limit tracking, provider health.
 
 ### Tickets
 
@@ -15,14 +15,12 @@
 # v3/providers/base.py
 class ProviderConfig(BaseModel):
     provider: Literal["anthropic", "openai", "google"]
-    api_key_env: str          # env var name, fetched from KMS at boot
     model: str
     max_tokens_in: int
     max_tokens_out: int
     timeout_ms: int
-    rate_limit_rpm: int
-    cost_per_1k_input: float
-    cost_per_1k_output: float
+    rate_limit_rpm: int        # binding constraint (not cost)
+    auth_profile: str          # key in auth-profiles.json
 
 class ProviderResponse(BaseModel):
     text: str
@@ -38,15 +36,34 @@ class BaseProvider(ABC):
                        response_format: type[BaseModel] | None,
                        reasoning_effort: str | None) -> ProviderResponse: ...
     async def health_check(self) -> bool: ...
+    async def refresh_token(self) -> bool: ...
 ```
 
-#### S0-T2: Anthropic Native Adapter
-- `anthropic` Python SDK
+#### S0-T2: OAuth Token Manager
+```python
+# v3/providers/oauth.py
+class OAuthTokenManager:
+    """Manages OAuth tokens for all providers. Reads/writes auth-profiles.json."""
+    profiles_path: Path  # auth-profiles.json
+    
+    async def get_token(self, profile: str) -> str: ...
+    async def refresh_if_needed(self, profile: str) -> str: ...
+    async def save_token(self, profile: str, token_data: dict) -> None: ...
+    # Auto-refresh before expiry (5 min buffer)
+    # Persists to disk on every refresh
+    # Existing profiles:
+    #   - openai-codex (ChatGPT Pro, Codex endpoint)
+    #   - google-gemini-cli (Google AI Ultra, CCA endpoint)
+    #   - anthropic (Claude Pro/Max — TBD, need to discover OAuth flow)
+```
+
+#### S0-T3: Anthropic OAuth Adapter
+- Native `anthropic` Python SDK with OAuth bearer token
 - Prompt caching via `cache_control` blocks
 - Extended thinking with adaptive mode on Sonnet/Opus
 - Structured output via `response_format`
 - Tool use via native tool schema (not OpenAI shim)
-- Citations and PDF support wired but not required for V3
+- **Auth**: Claude Pro/Max subscription OAuth (need to discover endpoint + refresh flow — may need Anthropic web session cookies initially)
 
 ```python
 # v3/providers/anthropic_adapter.py
@@ -54,64 +71,66 @@ class AnthropicProvider(BaseProvider):
     # Supports: sonnet-4-6, opus-4-6
     # Prompt caching: system + evidence prefix marked cacheable
     # Thinking: adaptive (Sonnet triage), adaptive (Opus rule analysis)
-    # Output: structured via response_format={type: "json", schema: ...}
+    # Auth: OAuth token from OAuthTokenManager
 ```
 
-#### S0-T3: OpenAI Native Adapter
-- `openai` Python SDK, Responses API
+#### S0-T4: OpenAI OAuth Adapter
+- Codex endpoint: `chatgpt.com/backend-api/codex/responses` with SSE streaming
 - GPT-5.4: online, configurable `reasoning.effort` (low/medium/high)
-- GPT-5.4-pro: Responses API only, `reasoning.effort=high|xhigh`, background mode for long jobs
-- Prompt caching: automatic (stable prefix)
-- Tool use via native function calling
+- GPT-5.4-pro: `reasoning.effort=high|xhigh`, background mode for async jobs
+- **Auth**: ChatGPT Pro OAuth token (already have working flow from Chimera semantic proxy)
 
 ```python
 # v3/providers/openai_adapter.py
 class OpenAIProvider(BaseProvider):
     # GPT-5.4: default reasoning, online judge
     # GPT-5.4-pro: background=True for async, reasoning.effort=high
-    # Prompt caching: automatic if prefix stable
+    # Auth: Codex OAuth token → chatgpt.com/backend-api/codex/responses
+    # SSE streaming: stream=true, parse delta events
 ```
 
-#### S0-T4: Google Gen AI Native Adapter
-- `google-genai` Python SDK
-- Gemini 3.1 Pro Preview: 1M context, structured output, caching, thinking
-- Thought-signature round-tripping handled by SDK (opaque to us)
-- Function calling via SDK native schema
+#### S0-T5: Google OAuth Adapter
+- Cloud Code Assist endpoint: `cloudcode-pa.googleapis.com/v1internal:generateContent`
+- Gemini 3.1 Pro Preview: 1M context, structured output, thinking
+- **Auth**: Google AI Ultra OAuth (already have working flow from Chimera)
+- **Known rate limit**: CCA throttles after first call per burst with 403 — needs backoff/retry
 - **No** Interactions API (beta, unstable)
 - **No** hosted file search (AI Studio only)
 
 ```python
 # v3/providers/gemini_adapter.py
 class GeminiProvider(BaseProvider):
-    # Model: gemini-3.1-pro-preview
-    # Context caching via CachedContent API for dossier evidence bundles
-    # Structured output via response_schema
-    # Provider state: SDK handles thought signatures internally
+    # Model: gemini-3.1-pro-preview via CCA
+    # Auth: Google OAuth token from OAuthTokenManager
+    # Rate limit handling: exponential backoff on 403
+    # Structured output via response schema in request body
 ```
 
-#### S0-T5: Provider Registry + Health Monitor
+#### S0-T6: Provider Registry + Health Monitor
 ```python
 # v3/providers/registry.py
 class ProviderRegistry:
     providers: dict[str, BaseProvider]
-    async def get(self, role: str) -> BaseProvider: ...  # e.g. "sonnet", "opus", "gpt54", "gpt54pro", "gemini"
+    async def get(self, role: str) -> BaseProvider: ...
     async def is_available(self, role: str) -> bool: ...
-    def get_fallback(self, role: str) -> str | None: ...
-    # No silent downgrade: if critical provider down, return None (caller publishes cached/neutral)
+    # No silent downgrade: if provider OAuth broken/rate-limited,
+    # return None (caller publishes cached/neutral)
+    # No fallback chain between providers — each route specifies exact provider
 ```
 
-#### S0-T6: Cost + Rate Budget Tracker
+#### S0-T7: Rate Budget Tracker
 ```python
 # v3/providers/budgets.py
-class BudgetTracker:
-    async def check_cost_budget(self, route: str, estimated_tokens: int) -> bool: ...
+class RateBudgetTracker:
     async def check_rate_budget(self, provider: str) -> bool: ...
-    async def record_usage(self, provider: str, input_tokens: int, output_tokens: int, latency_ms: float): ...
-    # Per-route cost budgets, per-provider rate limits
-    # Stored in Redis for cross-worker visibility
+    async def record_usage(self, provider: str, input_tokens: int,
+                           output_tokens: int, latency_ms: float): ...
+    # Per-provider rate limits (RPM, TPM)
+    # Sliding window in Redis
+    # Cost tracking for observability only (all calls are $0 marginal)
 ```
 
-**Deliverables**: 4 provider adapters, registry, budget tracker, health checks. All compile + unit test.
+**Deliverables**: OAuth token manager, 3 provider adapters, registry, rate tracker. All compile + unit test. Verified with live OAuth tokens against each provider.
 
 ---
 
@@ -596,10 +615,15 @@ S2 and S3 can run in parallel after S1. S4 and S5 are sequential on S3.
 Before S0:
 - [ ] Postgres 16 + TimescaleDB + pgvector extension installed
 - [ ] Redis 7+ running
-- [ ] Anthropic API key (server-side, not consumer)
-- [ ] OpenAI API key (server-side, not consumer)
-- [ ] Google AI API key (server-side)
+- [ ] OpenAI Codex OAuth token (ChatGPT Pro — already have working flow)
+- [ ] Google CCA OAuth token (AI Ultra — already have working flow)
+- [ ] Anthropic OAuth token (Claude Pro/Max — need to discover auth flow)
 - [ ] Object storage path configured (local FS for now)
+
+### OAuth Token Sources (Existing)
+- **OpenAI**: `~/.codex/auth.json` — ChatGPT Pro, Codex endpoint, device-auth flow
+- **Google**: `auth-profiles.json` → `google-gemini-cli:*` profile — CCA endpoint, auto-refresh
+- **Anthropic**: TBD — need to reverse-engineer Claude web OAuth or use `claude.ai` session token
 
 ---
 
