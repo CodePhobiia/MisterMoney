@@ -368,7 +368,12 @@ async def run(settings: Settings | None = None) -> None:
             order_ttl_s=settings.execution.order_ttl_effective_s,
             post_only=settings.execution.post_only,
         )
-        order_manager.set_server_time_offset(server_time if server_time else int(time.time()))
+        # Re-sync server time after potentially long universe fetch
+        try:
+            fresh_server_time = await clob_public.get_server_time()
+            order_manager.set_server_time_offset(fresh_server_time)
+        except Exception:
+            order_manager.set_server_time_offset(int(time.time()))
 
         heartbeat = HeartbeatState(
             client=clob_private,
