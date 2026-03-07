@@ -259,14 +259,14 @@ class PositionTracker:
                     # so sell logic can manage it.
                     # Use token_id as condition_id (best guess);
                     # also register in token→condition map.
-                    self._positions[token_id] = Position(
+                    self._positions[token_id] = MarketPosition(
                         condition_id=token_id,
                         token_id_yes=token_id,
                         token_id_no="",
                         yes_size=exchange_size,
                         no_size=0.0,
-                        avg_entry_price_yes=0.0,
-                        avg_entry_price_no=0.0,
+                        yes_avg_price=0.0,  # unknown entry — handled by exit logic
+                        no_avg_price=0.0,
                     )
                     self._token_to_condition[token_id] = token_id
                     logger.info("position_auto_adopted",

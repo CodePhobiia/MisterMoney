@@ -76,24 +76,38 @@ class QuoteEngine:
         fair_value: float,
         market_inventory: float,
         cluster_inventory: float = 0.0,
+        position_age_hours: float = 0.0,
     ) -> float:
         """Compute reservation price with inventory skew from §7.
 
         r_t = clip(p̂_t − γ·q_t − η·q_t^cluster, ε, 1−ε)
 
+        Dynamic γ: starts at gamma_base and ramps towards gamma_max as
+        position ages, using exponential decay with configurable halflife.
+
         Args:
             fair_value: p̂_t from fair value model.
             market_inventory: q_t signed inventory (positive = long YES).
             cluster_inventory: q_t^cluster correlated exposure.
+            position_age_hours: How long the current position has been held.
 
         Returns:
             Reservation price clipped to (ε, 1-ε).
         """
-        gamma = self.config.inventory_skew_gamma
+        gamma_base = self.config.inventory_skew_gamma
+        gamma_max = self.config.gamma_max
+        halflife = self.config.age_halflife_hours
         eta = self.config.cluster_skew_eta
         epsilon = 0.005  # Price floor/ceiling
 
-        r_t = fair_value - gamma * market_inventory - eta * cluster_inventory
+        # Dynamic gamma: ramp from base to max as inventory ages
+        if position_age_hours > 0 and halflife > 0:
+            age_factor = 1.0 - math.exp(-0.693 * position_age_hours / halflife)
+            effective_gamma = gamma_base + (gamma_max - gamma_base) * age_factor
+        else:
+            effective_gamma = gamma_base
+
+        r_t = fair_value - effective_gamma * market_inventory - eta * cluster_inventory
         return max(epsilon, min(1.0 - epsilon, r_t))
 
     def compute_half_spread(
@@ -197,6 +211,7 @@ class QuoteEngine:
         reward_ev: float = 0.0,
         neg_risk: bool = False,
         condition_id: str = "",
+        position_age_hours: float = 0.0,
     ) -> QuoteIntent:
         """Compute full two-sided quote intent.
 
@@ -216,9 +231,9 @@ class QuoteEngine:
         Returns:
             QuoteIntent with bid/ask prices and sizes.
         """
-        # 1. Reservation price
+        # 1. Reservation price (with dynamic γ based on position age)
         r_t = self.compute_reservation_price(
-            fair_value, market_inventory, cluster_inventory
+            fair_value, market_inventory, cluster_inventory, position_age_hours
         )
 
         # 2. Half spread

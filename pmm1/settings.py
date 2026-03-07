@@ -59,6 +59,8 @@ class PricingConfig(BaseModel):
 
     base_half_spread_cents: float = 1.0
     inventory_skew_gamma: float = 0.015
+    gamma_max: float = 0.05
+    age_halflife_hours: float = 4.0
     cluster_skew_eta: float = 0.02
     take_threshold_cents: float = 0.8
     reward_capture_weight: float = 0.7
@@ -132,6 +134,68 @@ class StorageConfig(BaseModel):
     parquet_dir: str = "./data/parquet"
 
 
+class TakeProfitConfig(BaseModel):
+    """Take-profit exit settings."""
+
+    enabled: bool = True
+    threshold_pct: float = 0.15
+    partial_exit_pct: float = 0.50
+    full_exit_pct: float = 0.30
+    min_hold_minutes: int = 30
+    cooldown_minutes: int = 10
+
+
+class StopLossConfig(BaseModel):
+    """Stop-loss exit settings."""
+
+    enabled: bool = True
+    threshold_pct: float = 0.20
+    hard_stop_pct: float = 0.40
+    max_loss_per_trade_usd: float = 5.0
+
+
+class ResolutionExitConfig(BaseModel):
+    """Resolution time-based exit settings."""
+
+    enabled: bool = True
+    exit_start_hours: float = 6.0
+    exit_complete_hours: float = 2.0
+    aggressive_after_hours: float = 1.0
+    block_new_buys_hours: float = 8.0
+
+
+class FlattenConfig(BaseModel):
+    """Emergency flatten settings."""
+
+    config_flag_path: str = "/tmp/pmm1_flatten"
+    price_tolerance_pct: float = 0.05
+
+
+class OrphanConfig(BaseModel):
+    """Orphan position handling settings."""
+
+    check_interval_s: int = 60
+    min_size_to_unwind: float = 5.0
+
+
+class InventorySkewConfig(BaseModel):
+    """Dynamic inventory skew settings."""
+
+    gamma_max: float = 0.05
+    age_halflife_hours: float = 4.0
+
+
+class ExitConfig(BaseModel):
+    """Root exit / sell-logic configuration."""
+
+    take_profit: TakeProfitConfig = Field(default_factory=TakeProfitConfig)
+    stop_loss: StopLossConfig = Field(default_factory=StopLossConfig)
+    resolution: ResolutionExitConfig = Field(default_factory=ResolutionExitConfig)
+    flatten: FlattenConfig = Field(default_factory=FlattenConfig)
+    orphan: OrphanConfig = Field(default_factory=OrphanConfig)
+    inventory_skew: InventorySkewConfig = Field(default_factory=InventorySkewConfig)
+
+
 class UniverseWeights(BaseModel):
     """Weights for universe scoring formula from §5."""
 
@@ -161,6 +225,7 @@ class Settings(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     universe_weights: UniverseWeights = Field(default_factory=UniverseWeights)
+    exit: ExitConfig = Field(default_factory=ExitConfig)
 
     model_config = {"env_prefix": "PMM1_", "env_nested_delimiter": "__"}
 

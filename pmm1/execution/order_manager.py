@@ -344,6 +344,120 @@ class OrderManager:
             logger.error("market_cancel_failed", token_id=token_id[:16], error=str(e))
             return False
 
+    async def submit_exit(
+        self,
+        token_id: str,
+        condition_id: str,
+        price: float,
+        size: float,
+        tick_size: Decimal = Decimal("0.01"),
+        urgency: str = "high",
+        neg_risk: bool = False,
+    ) -> dict[str, Any]:
+        """Submit an exit (sell) order — cancel existing orders for the token first.
+
+        Used by ExitManager for stop-loss, take-profit, resolution, flatten, orphan exits.
+
+        Pricing by urgency:
+        - critical: best_bid - 2 ticks (must fill)
+        - high: best_bid (fill now)
+        - medium: best_bid (join queue)
+        - low: best_bid (passive)
+        """
+        result: dict[str, Any] = {"submitted": False, "canceled": 0, "error": None}
+
+        # 1. Cancel all existing orders for this token
+        try:
+            active = self._tracker.get_active_orders(token_id)
+            if active:
+                order_ids = [o.order_id for o in active if o.order_id]
+                if order_ids:
+                    await self._client.cancel_orders(order_ids)
+                    for oid in order_ids:
+                        self._tracker.update_state(oid, OrderState.CANCELED)
+                    result["canceled"] = len(order_ids)
+        except Exception as e:
+            logger.warning("exit_cancel_failed", token_id=token_id[:16], error=str(e))
+
+        # 2. Adjust price by urgency
+        tick_float = float(tick_size)
+        if urgency == "critical":
+            sell_price = price - 2 * tick_float
+        elif urgency == "high":
+            sell_price = price - tick_float
+        else:
+            sell_price = price
+
+        sell_price = max(tick_float, sell_price)  # Don't go below min tick
+
+        # Round to valid tick
+        sell_price_d = round_bid(sell_price, tick_size)
+        sell_size_d = round_size(size)
+        sell_price_str = price_to_string(sell_price_d)
+        sell_size_str = str(sell_size_d)
+
+        # 3. Submit sell order
+        try:
+            expiration = 0
+            order_type = OrderType.GTC
+            if self._use_gtd:
+                expiration = compute_gtd_expiration(
+                    self._order_ttl_s, self._get_server_time()
+                )
+                order_type = OrderType.GTD
+
+            req = CreateOrderRequest(
+                token_id=token_id,
+                price=sell_price_str,
+                size=sell_size_str,
+                side=OrderSide.SELL,
+                order_type=order_type,
+                expiration=expiration,
+                neg_risk=neg_risk,
+                post_only=False,  # Exit orders may cross — not post-only
+                tick_size=str(tick_size),
+            )
+
+            responses = await self._client.create_orders_batch([req])
+            for resp in responses:
+                tracked = TrackedOrder(
+                    order_id=resp.order_id or resp.id,
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    side="SELL",
+                    price=sell_price_str,
+                    original_size=sell_size_str,
+                    remaining_size=sell_size_str,
+                    state=OrderState.SUBMITTED,
+                    neg_risk=neg_risk,
+                    post_only=False,
+                    order_type=order_type.value,
+                    strategy="exit",
+                )
+                tracked.transition_to(OrderState.SUBMITTED)
+                self._tracker.track(tracked)
+                result["submitted"] = True
+
+            logger.info(
+                "exit_order_submitted",
+                token_id=token_id[:16],
+                price=sell_price_str,
+                size=sell_size_str,
+                urgency=urgency,
+            )
+
+        except (ClobRestartError, ClobPausedError) as e:
+            result["error"] = f"submit_error: {e}"
+        except ClobRateLimitError:
+            result["error"] = "submit_rate_limited"
+        except ClobAuthError as e:
+            result["error"] = f"submit_auth_error: {e}"
+        except Exception as e:
+            result["error"] = f"submit_unexpected: {e}"
+            logger.error("exit_order_submit_error", token_id=token_id[:16], error=str(e))
+
+        return result
+
     async def execute_arb(
         self,
         orders: list[CreateOrderRequest],

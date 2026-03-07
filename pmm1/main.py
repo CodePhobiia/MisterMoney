@@ -25,6 +25,7 @@ from typing import Any
 
 import structlog
 
+from pmm1.checks.ctf_approval import check_ctf_approvals
 from pmm1.api.clob_private import (
     ClobAuthError,
     ClobPausedError,
@@ -59,6 +60,7 @@ from pmm1.strategy.binary_parity import BinaryParityDetector
 from pmm1.strategy.fair_value import FairValueModel
 from pmm1.strategy.features import FeatureEngine
 from pmm1.strategy.neg_risk_arb import NegRiskArbDetector, NegRiskOutcome
+from pmm1.strategy.exit_manager import ExitManager
 from pmm1.strategy.quote_engine import QuoteEngine
 from pmm1.strategy.rewards import RewardEstimator
 from pmm1.strategy.universe import MarketMetadata, select_universe
@@ -145,6 +147,10 @@ async def run(settings: Settings | None = None) -> None:
     except GeoblockError as e:
         logger.critical("geoblock_failed", error=str(e))
         sys.exit(1)
+
+    # ── 1b. CTF approval check (non-blocking) ──
+    if settings.wallet.address and not settings.bot.paper_mode:
+        await check_ctf_approvals(settings.wallet.address)
 
     # ── 2. Initialize clients ──
     gamma = GammaClient(settings.api.gamma_url)
@@ -337,6 +343,15 @@ async def run(settings: Settings | None = None) -> None:
             reconcile_orders_s=settings.bot.reconcile_orders_s,
             reconcile_positions_s=settings.bot.reconcile_positions_s,
         )
+
+    # ── Initialize ExitManager ──
+    exit_manager = ExitManager(
+        config=settings.exit,
+        position_tracker=state.position_tracker,
+        book_manager=state.book_manager,
+        kill_switch=state.kill_switch,
+        clob_public=clob_public,
+    )
 
     recorder = LiveRecorder()
     parquet_writer = ParquetWriter(settings.storage.parquet_dir)
@@ -629,6 +644,19 @@ async def run(settings: Settings | None = None) -> None:
                     market_inv = pos.net_exposure if pos else 0.0
                     cluster_inv = state.position_tracker.get_event_net_exposure(md.event_id) if md.event_id else 0.0
 
+                    # Position age for dynamic γ
+                    position_age_hours = 0.0
+                    if pos and pos.last_update > 0 and pos.net_exposure != 0:
+                        position_age_hours = (time.time() - pos.last_update) / 3600.0
+
+                    # Resolution exit: check if we should block new buys
+                    block_new_buys = False
+                    res_action = exit_manager.get_resolution_action(
+                        md.condition_id, state.active_markets
+                    )
+                    if res_action and res_action.block_new_buys:
+                        block_new_buys = True
+
                     # Reward EV
                     reward_ev = state.reward_estimator.compute_reward_ev_for_universe(md.condition_id)
 
@@ -645,6 +673,7 @@ async def run(settings: Settings | None = None) -> None:
                         reward_ev=reward_ev,
                         neg_risk=md.neg_risk,
                         condition_id=md.condition_id,
+                        position_age_hours=position_age_hours,
                     )
 
                     # SELL logic: only post asks when we hold inventory
@@ -665,6 +694,11 @@ async def run(settings: Settings | None = None) -> None:
                                     # Can't meet minimum — skip sell
                                     quote_intent.ask_size = None
                                     quote_intent.ask_price = None
+
+                    # Block new buys during resolution exit window
+                    if block_new_buys:
+                        quote_intent.bid_size = None
+                        quote_intent.bid_price = None
 
                     # Apply drawdown adjustments
                     if dd_state.should_widen_quotes:
@@ -741,57 +775,48 @@ async def run(settings: Settings | None = None) -> None:
                             spread_cents = (quote_intent.ask_price - quote_intent.bid_price) * 100
                             state.metrics.record_quote(token_id, md.condition_id, spread_cents)
 
-            # ── Unwind orphan positions (held but not in universe) ──
+            # ── Exit Manager: evaluate all sell/exit signals ──
             if not paper_mode and order_manager:
-                for token_id_held, held_pos in list(state.position_tracker._positions.items()):
-                    if held_pos.net_exposure <= 0:
-                        continue
-                    # Skip if already managed by the main quote loop
-                    if token_id_held in state.active_markets:
-                        continue
-                    # Post a SELL order to unwind
-                    sell_size = held_pos.yes_size if held_pos.yes_size > 0 else held_pos.no_size
-                    if sell_size < 5.0:
-                        continue  # Can't meet Polymarket minimum
-                    # Get current book to price the sell
-                    book = state.book_manager.get(token_id_held)
-                    best_bid = None
-                    if book and book.best_bid and book.best_bid > 0:
-                        best_bid = book.best_bid
-                    else:
-                        # No WS book — fetch via REST
-                        try:
-                            rest_book = await clob_public.get_order_book(token_id_held)
-                            if rest_book and rest_book.bids:
-                                best_bid = float(rest_book.bids[0].price)
-                        except Exception:
-                            pass
-                    if best_bid and best_bid > 0:
-                        sell_price = best_bid
-                        from pmm1.strategy.quote_engine import QuoteIntent
-                        unwind_intent = QuoteIntent(
-                            condition_id=token_id_held,
-                            token_id=token_id_held,
-                            bid_price=None,
-                            bid_size=None,
-                            ask_price=sell_price,
-                            ask_size=sell_size,
-                            reservation_price=sell_price,
-                            half_spread=0.01,
+                try:
+                    exit_signals = await exit_manager.evaluate_all(state.active_markets)
+                    for signal in exit_signals:
+                        # Determine tick size for the token
+                        sig_tick = state.tick_sizes.get(
+                            signal.token_id, Decimal("0.01")
                         )
-                        try:
-                            result = await order_manager.diff_and_apply(
-                                unwind_intent, "0.01"
+                        # Look up neg_risk from market metadata
+                        sig_md = state.active_markets.get(signal.condition_id)
+                        sig_neg_risk = sig_md.neg_risk if sig_md else False
+
+                        if signal.price and signal.price > 0:
+                            result = await order_manager.submit_exit(
+                                token_id=signal.token_id,
+                                condition_id=signal.condition_id,
+                                price=signal.price,
+                                size=signal.size,
+                                tick_size=sig_tick,
+                                urgency=signal.urgency,
+                                neg_risk=sig_neg_risk,
                             )
-                            orders_submitted += result.get("submitted", 0)
-                            logger.info("unwind_orphan_position",
-                                        token_id=token_id_held[:16],
-                                        size=sell_size,
-                                        price=sell_price)
-                        except Exception as e:
-                            logger.warning("unwind_orphan_failed",
-                                           token_id=token_id_held[:16],
-                                           error=str(e))
+                            if result.get("submitted"):
+                                orders_submitted += 1
+                                logger.info(
+                                    "exit_order_submitted",
+                                    reason=signal.reason,
+                                    token_id=signal.token_id[:16],
+                                    size=signal.size,
+                                    price=signal.price,
+                                    urgency=signal.urgency,
+                                )
+                            elif result.get("error"):
+                                logger.warning(
+                                    "exit_order_failed",
+                                    reason=signal.reason,
+                                    token_id=signal.token_id[:16],
+                                    error=result["error"],
+                                )
+                except Exception as e:
+                    logger.error("exit_manager_error", error=str(e), exc_info=True)
 
             # ── Cycle metrics ──
             cycle_duration = (time.time() - cycle_start) * 1000
@@ -825,6 +850,11 @@ async def run(settings: Settings | None = None) -> None:
                         cycle_ms=f"{cycle_duration:.1f}",
                     )
                 else:
+                    # Count markets in resolution exit window
+                    resolution_markets = sum(
+                        1 for cid in state.active_markets
+                        if exit_manager.get_resolution_action(cid, state.active_markets) is not None
+                    )
                     logger.info(
                         "quote_cycle_summary",
                         cycle=cycle_count,
@@ -835,6 +865,7 @@ async def run(settings: Settings | None = None) -> None:
                         mode=state.mode,
                         nav=f"{nav:.2f}",
                         dd_tier=dd_state.tier.value,
+                        resolution_exits=resolution_markets,
                     )
 
             # ── Sleep until next cycle ──

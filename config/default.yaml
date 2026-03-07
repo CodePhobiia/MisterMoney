@@ -42,6 +42,35 @@ risk:
   daily_pause_drawdown_nav: 0.015
   daily_flatten_drawdown_nav: 0.04
 
+exit:
+  take_profit:
+    enabled: true
+    threshold_pct: 0.15
+    partial_exit_pct: 0.50
+    full_exit_pct: 0.30
+    min_hold_minutes: 30
+    cooldown_minutes: 10
+  stop_loss:
+    enabled: true
+    threshold_pct: 0.20
+    hard_stop_pct: 0.40
+    max_loss_per_trade_usd: 5.0
+  resolution:
+    enabled: true
+    exit_start_hours: 6
+    exit_complete_hours: 2
+    aggressive_after_hours: 1
+    block_new_buys_hours: 8
+  flatten:
+    config_flag_path: "/tmp/pmm1_flatten"
+    price_tolerance_pct: 0.05
+  orphan:
+    check_interval_s: 60
+    min_size_to_unwind: 5.0
+  inventory_skew:
+    gamma_max: 0.05
+    age_halflife_hours: 4.0
+
 execution:
   post_only: true
   order_ttl_effective_s: 30
