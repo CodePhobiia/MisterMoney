@@ -197,48 +197,47 @@ class RiskLimits:
 
         Returns a modified QuoteIntent with sizes reduced to comply with limits.
         """
-        # Compute dollar exposure (shares × price)
-        # Only BUY increases exposure; SELL reduces it — don't count asks
-        bid_dollar = (intent.bid_size or 0) * (intent.bid_price or 0)
+        # Risk limits only constrain BUY orders (asks reduce exposure)
+        # Save ask side — risk checks only touch bids
+        saved_ask_price = intent.ask_price
+        saved_ask_size = intent.ask_size
 
-        # Per-market check (in dollar terms, buys only)
-        market_check = self.check_per_market_gross(
-            intent.condition_id,
-            bid_dollar,
-        )
-        if not market_check.passed:
-            max_add = market_check.adjustments.get("max_additional", 0)
-            if max_add <= 0:
-                intent.bid_size = 0
-                intent.ask_size = 0
-                logger.warning("risk_zeroed_quote", condition_id=intent.condition_id[:16], reason="per_market_gross")
-                return intent
-            # Convert dollar max back to shares
-            if intent.bid_price and intent.bid_price > 0:
-                intent.bid_size = min(intent.bid_size or 0, max_add / intent.bid_price / 2)
-            if intent.ask_price and intent.ask_price > 0:
-                intent.ask_size = min(intent.ask_size or 0, max_add / intent.ask_price / 2)
+        if intent.bid_size and intent.bid_size > 0:
+            bid_dollar = (intent.bid_size or 0) * (intent.bid_price or 0)
 
-        # Recompute dollar exposure after per-market adjustment (buys only)
-        bid_dollar = (intent.bid_size or 0) * (intent.bid_price or 0)
-
-        # Event cluster check (in dollar terms, buys only)
-        if event_id:
-            cluster_check = self.check_per_event_cluster(
-                event_id,
+            # Per-market check (in dollar terms, buys only)
+            market_check = self.check_per_market_gross(
+                intent.condition_id,
                 bid_dollar,
             )
-            if not cluster_check.passed:
-                max_add = cluster_check.adjustments.get("max_additional", 0)
+            if not market_check.passed:
+                max_add = market_check.adjustments.get("max_additional", 0)
                 if max_add <= 0:
                     intent.bid_size = 0
-                    intent.ask_size = 0
-                    logger.warning("risk_zeroed_quote", condition_id=intent.condition_id[:16], reason="event_cluster")
-                    return intent
-                if intent.bid_price and intent.bid_price > 0:
-                    intent.bid_size = min(intent.bid_size or 0, max_add / intent.bid_price / 2)
-                if intent.ask_price and intent.ask_price > 0:
-                    intent.ask_size = min(intent.ask_size or 0, max_add / intent.ask_price / 2)
+                    intent.bid_price = None
+                    logger.warning("risk_zeroed_bid", condition_id=intent.condition_id[:16], reason="per_market_gross")
+                elif intent.bid_price and intent.bid_price > 0:
+                    intent.bid_size = min(intent.bid_size, max_add / intent.bid_price)
+
+            # Event cluster check (buys only)
+            if event_id and intent.bid_size and intent.bid_size > 0:
+                bid_dollar = (intent.bid_size or 0) * (intent.bid_price or 0)
+                cluster_check = self.check_per_event_cluster(
+                    event_id,
+                    bid_dollar,
+                )
+                if not cluster_check.passed:
+                    max_add = cluster_check.adjustments.get("max_additional", 0)
+                    if max_add <= 0:
+                        intent.bid_size = 0
+                        intent.bid_price = None
+                        logger.warning("risk_zeroed_bid", condition_id=intent.condition_id[:16], reason="event_cluster")
+                    elif intent.bid_price and intent.bid_price > 0:
+                        intent.bid_size = min(intent.bid_size, max_add / intent.bid_price)
+
+        # Restore ask side (never blocked by risk limits)
+        intent.ask_price = saved_ask_price
+        intent.ask_size = saved_ask_size
 
         # Total directional check
         net_add = (intent.bid_size or 0) - (intent.ask_size or 0)
