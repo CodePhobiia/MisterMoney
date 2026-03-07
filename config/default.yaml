@@ -1,8 +1,8 @@
 bot:
   name: PMM-1
   env: prod
-  max_markets: 20
-  quote_cycle_ms: 250
+  max_markets: 30
+  quote_cycle_ms: 1000
   reconcile_orders_s: 30
   reconcile_positions_s: 60
   paper_mode: false
@@ -15,7 +15,7 @@ wallet:
 market_filters:
   min_time_to_end_hours: 24
   min_volume_24h_usd: 1000
-  max_top_spread_cents: 10
+  max_top_spread_cents: 20
   min_depth_within_2c_shares: 0
   allow_sports: false
   allow_crypto_intraday: false
@@ -28,7 +28,7 @@ strategy:
   enable_directional_overlay: false
 
 pricing:
-  base_half_spread_cents: 1.0
+  base_half_spread_cents: 0.5
   inventory_skew_gamma: 0.002
   cluster_skew_eta: 0.001
   take_threshold_cents: 0.8
