@@ -70,6 +70,7 @@ from pmm1.analytics.metrics import MetricsCollector
 from pmm1.analytics.pnl import PnLTracker
 from pmm1.paper.engine import PaperEngine
 from pmm1.paper.logger import PaperLogger
+from pmm1.notifications import send_telegram, format_fill_notification, format_exit_notification
 
 logger: structlog.stdlib.BoundLogger = None  # type: ignore
 
@@ -383,6 +384,79 @@ async def run(settings: Settings | None = None) -> None:
             logger.info("post_reconnect_reconciliation")
             await reconciler.full_reconciliation()
 
+    async def on_fill(msg: dict[str, Any]) -> None:
+        """Callback when a fill/trade is received from UserWebSocket."""
+        try:
+            # Extract fill details
+            token_id = msg.get("asset_id") or msg.get("token_id", "")
+            order_id = msg.get("orderID") or msg.get("order_id") or msg.get("id", "")
+            side = msg.get("side", "").upper()
+            price_str = msg.get("price") or msg.get("matchPrice", "0")
+            size_str = msg.get("size") or msg.get("matchSize", "0")
+            
+            price = float(price_str) if price_str else 0.0
+            size = float(size_str) if size_str else 0.0
+            
+            # Log fill details
+            logger.info(
+                "fill_detected",
+                event="fill_detected",
+                token_id=token_id[:16] if token_id else "?",
+                order_id=order_id[:16] if order_id else "?",
+                side=side,
+                price=price,
+                size=size,
+            )
+            
+            # Update position tracker
+            # Find the condition_id for this token_id
+            condition_id = None
+            for md in state.active_markets.values():
+                if md.token_id_yes == token_id or md.token_id_no == token_id:
+                    condition_id = md.condition_id
+                    break
+            
+            if condition_id:
+                pos = state.position_tracker.get(condition_id)
+                if pos:
+                    # Convert side to BUY/SELL
+                    fill_side = "BUY" if side == "BUY" else "SELL"
+                    pos.apply_fill(token_id, fill_side, size, price, fee=0.0)
+                    logger.info(
+                        "position_updated_from_fill",
+                        condition_id=condition_id[:16],
+                        token_id=token_id[:16],
+                        new_yes_size=pos.yes_size,
+                        new_no_size=pos.no_size,
+                    )
+            
+            # Send Telegram notification
+            if token_id and order_id:
+                notification = format_fill_notification(
+                    side=side or "UNKNOWN",
+                    size=size,
+                    price=price,
+                    token_id=token_id,
+                    order_id=order_id,
+                )
+                asyncio.create_task(send_telegram(notification))
+        except Exception as e:
+            logger.error("on_fill_callback_error", error=str(e))
+
+    async def on_order_status(msg: dict[str, Any]) -> None:
+        """Callback when order status changes from UserWebSocket."""
+        try:
+            order_id = msg.get("orderID") or msg.get("order_id") or msg.get("id", "")
+            status = msg.get("status", "").upper()
+            
+            logger.info(
+                "order_status_change",
+                order_id=order_id[:16] if order_id else "?",
+                status=status,
+            )
+        except Exception as e:
+            logger.error("on_order_status_callback_error", error=str(e))
+
     market_ws = MarketWebSocket(
         ws_url=settings.api.ws_market_url,
         book_manager=state.book_manager,
@@ -400,6 +474,8 @@ async def run(settings: Settings | None = None) -> None:
             wallet_address=settings.wallet.address,
             order_tracker=state.order_tracker,
             on_reconnect=on_reconnect,
+            on_trade_update=on_fill,
+            on_order_update=on_order_status,
         )
 
     # ── 10. Start all background tasks ──
@@ -555,6 +631,7 @@ async def run(settings: Settings | None = None) -> None:
                 if not state.resolution_risk.should_quote(md.condition_id):
                     continue
 
+                # For arb detection, we'll use the YES token book (arb logic already handles both)
                 token_id = md.token_id_yes
                 if not token_id:
                     continue
@@ -692,13 +769,16 @@ async def run(settings: Settings | None = None) -> None:
                 if settings.strategy.enable_market_making:
                     # Fair value
                     fv_estimate = state.fair_value_model.compute_fair_value(features)
+                    base_fair_value = fv_estimate.fair_value
 
                     # Skip extreme prices where min order can't be met profitably
-                    if fv_estimate.fair_value < 0.05 or fv_estimate.fair_value > 0.95:
+                    if base_fair_value < 0.05 or base_fair_value > 0.95:
                         continue
 
-                    # Inventory
+                    # Inventory (YES position)
                     pos = state.position_tracker.get(md.condition_id)
+                    yes_inventory = pos.yes_size if pos else 0.0
+                    no_inventory = pos.no_size if pos else 0.0
                     market_inv = pos.net_exposure if pos else 0.0
                     cluster_inv = state.position_tracker.get_event_net_exposure(md.event_id) if md.event_id else 0.0
 
@@ -844,6 +924,185 @@ async def run(settings: Settings | None = None) -> None:
                             spread_cents = (quote_intent.ask_price - quote_intent.bid_price) * 100
                             state.metrics.record_quote(token_id, md.condition_id, spread_cents)
 
+                    # ── Market making for NO token ──
+                    # Quote the NO token if it exists, using inverted fair value
+                    if md.token_id_no and settings.strategy.enable_market_making:
+                        token_id_no = md.token_id_no
+                        book_no = state.book_manager.get(token_id_no)
+                        book_no_usable = book_no is not None and book_no.age_seconds <= stale_threshold
+
+                        # REST fallback for NO token book
+                        if not book_no_usable:
+                            rest_cache_key_no = f"rest_book_{token_id_no}"
+                            rest_cache_ts_no = state.rest_book_cache_ts.get(rest_cache_key_no, 0)
+                            if time.time() - rest_cache_ts_no > 10.0:
+                                try:
+                                    rest_book_no = await clob_public.get_order_book(token_id_no)
+                                    if rest_book_no and rest_book_no.bids and rest_book_no.asks:
+                                        from pmm1.state.books import OrderBook
+                                        cached_book_no = OrderBook(token_id_no, tick_size=state.tick_sizes.get(token_id_no, Decimal("0.01")))
+                                        for bid in rest_book_no.bids:
+                                            cached_book_no.update_level("bid", Decimal(bid.price), Decimal(bid.size))
+                                        for ask in rest_book_no.asks:
+                                            cached_book_no.update_level("ask", Decimal(ask.price), Decimal(ask.size))
+                                        state.rest_book_cache[rest_cache_key_no] = cached_book_no
+                                        state.rest_book_cache_ts[rest_cache_key_no] = time.time()
+                                except Exception:
+                                    pass
+                            book_no = state.rest_book_cache.get(rest_cache_key_no)
+
+                        if book_no and (book_no._bids or book_no._asks):
+                            tick_size_no = state.tick_sizes.get(token_id_no, Decimal("0.01"))
+
+                            # Compute features for NO token
+                            features_no = state.feature_engine.compute(
+                                token_id=token_id_no,
+                                book=book_no,
+                                condition_id=md.condition_id,
+                                end_date=md.end_date,
+                            )
+
+                            # Invert fair value for NO token: NO_fv = 1.0 - YES_fv
+                            no_fair_value = 1.0 - base_fair_value
+
+                            # Skip if inverted fair value is extreme
+                            if no_fair_value >= 0.05 and no_fair_value <= 0.95:
+                                # Inventory for NO side
+                                no_token_inventory = no_inventory
+                                
+                                # Position age (same as YES since it's the same market)
+                                position_age_hours_no = 0.0
+                                if pos and pos.last_update > 0 and pos.net_exposure != 0:
+                                    position_age_hours_no = (time.time() - pos.last_update) / 3600.0
+
+                                # Resolution exit check
+                                block_new_buys_no = False
+                                res_action_no = exit_manager.get_resolution_action(
+                                    md.condition_id, state.active_markets
+                                )
+                                if res_action_no and res_action_no.block_new_buys:
+                                    block_new_buys_no = True
+
+                                # Reward EV (same for both sides)
+                                reward_ev_no = state.reward_estimator.compute_reward_ev_for_universe(md.condition_id)
+
+                                # Quote NO token
+                                quote_intent_no = state.quote_engine.compute_quote(
+                                    token_id=token_id_no,
+                                    features=features_no,
+                                    fair_value=no_fair_value,
+                                    haircut=fv_estimate.haircut,  # Use same haircut
+                                    confidence=fv_estimate.confidence,  # Use same confidence
+                                    market_inventory=-market_inv,  # Invert inventory sign for NO
+                                    cluster_inventory=cluster_inv,
+                                    tick_size=float(tick_size_no),
+                                    reward_ev=reward_ev_no,
+                                    neg_risk=md.neg_risk,
+                                    condition_id=md.condition_id,
+                                    position_age_hours=position_age_hours_no,
+                                )
+
+                                # SELL logic for NO: only post asks when we hold NO inventory
+                                if not paper_mode:
+                                    if no_token_inventory <= 0:
+                                        quote_intent_no.ask_size = None
+                                        quote_intent_no.ask_price = None
+                                    else:
+                                        if quote_intent_no.ask_size and quote_intent_no.ask_size > no_token_inventory:
+                                            quote_intent_no.ask_size = no_token_inventory
+                                        if quote_intent_no.ask_size and quote_intent_no.ask_size < 5.0:
+                                            if no_token_inventory >= 5.0:
+                                                quote_intent_no.ask_size = 5.0
+                                            else:
+                                                quote_intent_no.ask_size = None
+                                                quote_intent_no.ask_price = None
+
+                                # Block new buys during resolution exit
+                                if block_new_buys_no:
+                                    quote_intent_no.bid_size = None
+                                    quote_intent_no.bid_price = None
+
+                                # Apply drawdown adjustments
+                                if dd_state.should_widen_quotes:
+                                    if quote_intent_no.bid_size:
+                                        quote_intent_no.bid_size *= dd_state.size_multiplier
+                                    if quote_intent_no.ask_size:
+                                        quote_intent_no.ask_size *= dd_state.size_multiplier
+
+                                # Apply risk limits
+                                quote_intent_no = state.risk_limits.apply_to_quote(
+                                    quote_intent_no, event_id=md.event_id
+                                )
+
+                                # Apply resolution risk size multiplier
+                                res_mult_no = state.resolution_risk.get_size_multiplier(md.condition_id)
+                                if res_mult_no < 1.0:
+                                    if quote_intent_no.bid_size:
+                                        quote_intent_no.bid_size *= res_mult_no
+                                    if quote_intent_no.ask_size:
+                                        quote_intent_no.ask_size *= res_mult_no
+
+                                # Crossing guard for NO token
+                                if book_no is not None:
+                                    bb_no = book_no.get_best_bid()
+                                    ba_no = book_no.get_best_ask()
+                                    if bb_no and quote_intent_no.ask_price and quote_intent_no.ask_price <= bb_no.price_float:
+                                        quote_intent_no.ask_price = bb_no.price_float + float(tick_size_no)
+                                    if ba_no and quote_intent_no.bid_price and quote_intent_no.bid_price >= ba_no.price_float:
+                                        quote_intent_no.bid_price = ba_no.price_float - float(tick_size_no)
+
+                                # Execute NO token quote
+                                if quote_intent_no.has_bid or quote_intent_no.has_ask:
+                                    if paper_mode and paper_engine and paper_logger:
+                                        paper_engine.cancel_all_orders(token_id_no)
+                                        paper_engine.submit_quote(
+                                            token_id=token_id_no,
+                                            condition_id=md.condition_id,
+                                            bid_price=quote_intent_no.bid_price,
+                                            bid_size=quote_intent_no.bid_size,
+                                            ask_price=quote_intent_no.ask_price,
+                                            ask_size=quote_intent_no.ask_size,
+                                            strategy="mm",
+                                            neg_risk=md.neg_risk,
+                                        )
+                                        paper_logger.log_quote(
+                                            token_id=token_id_no,
+                                            condition_id=md.condition_id,
+                                            bid_price=quote_intent_no.bid_price,
+                                            bid_size=quote_intent_no.bid_size,
+                                            ask_price=quote_intent_no.ask_price,
+                                            ask_size=quote_intent_no.ask_size,
+                                            reservation_price=quote_intent_no.reservation_price,
+                                            fair_value=no_fair_value,
+                                            half_spread=quote_intent_no.half_spread,
+                                            inventory=-market_inv,
+                                        )
+                                        orders_submitted += (1 if quote_intent_no.has_bid else 0) + (1 if quote_intent_no.has_ask else 0)
+                                    elif order_manager:
+                                        result_no = await order_manager.diff_and_apply(
+                                            quote_intent_no, tick_size_no
+                                        )
+                                        orders_submitted += result_no.get("submitted", 0)
+                                        orders_canceled += result_no.get("canceled", 0)
+
+                                    # Record NO token quote
+                                    recorder.record_quote_intent(
+                                        token_id=token_id_no,
+                                        bid_price=quote_intent_no.bid_price,
+                                        bid_size=quote_intent_no.bid_size,
+                                        ask_price=quote_intent_no.ask_price,
+                                        ask_size=quote_intent_no.ask_size,
+                                        reservation_price=quote_intent_no.reservation_price,
+                                        fair_value=no_fair_value,
+                                        half_spread=quote_intent_no.half_spread,
+                                        inventory=-market_inv,
+                                    )
+
+                                    # Record NO token spread metric
+                                    if quote_intent_no.bid_price and quote_intent_no.ask_price:
+                                        spread_cents_no = (quote_intent_no.ask_price - quote_intent_no.bid_price) * 100
+                                        state.metrics.record_quote(token_id_no, md.condition_id, spread_cents_no)
+
             # ── Exit Manager: evaluate all sell/exit signals ──
             if not paper_mode and order_manager:
                 try:
@@ -877,6 +1136,15 @@ async def run(settings: Settings | None = None) -> None:
                                     price=exit_sig.price,
                                     urgency=exit_sig.urgency,
                                 )
+                                
+                                # Send Telegram notification for exit signal
+                                notification = format_exit_notification(
+                                    exit_type=exit_sig.reason,
+                                    token_id=exit_sig.token_id,
+                                    price=exit_sig.price,
+                                    size=exit_sig.size,
+                                )
+                                asyncio.create_task(send_telegram(notification))
                             elif result.get("error"):
                                 logger.warning(
                                     "exit_order_failed",
