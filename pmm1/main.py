@@ -430,6 +430,9 @@ async def run(settings: Settings | None = None) -> None:
             logger.info("post_reconnect_reconciliation")
             await reconciler.full_reconciliation()
 
+    # Track notified fills to prevent duplicate notifications
+    _notified_fills: set[str] = set()
+
     async def on_fill(msg: dict[str, Any]) -> None:
         """Callback when a fill/trade is received from UserWebSocket."""
         try:
@@ -446,6 +449,25 @@ async def run(settings: Settings | None = None) -> None:
             if size <= 0 or price <= 0:
                 return
             
+            # ── GATE 1: Must be OUR order (tracked by order manager) ──
+            tracked = state.order_tracker.get(order_id)
+            if tracked is None:
+                # Not our order — ignore silently
+                return
+            
+            # Use tracked order's side if WS didn't provide it
+            if not side:
+                side = tracked.side
+            
+            # ── GATE 2: Deduplicate (WS replays the same fill multiple times) ──
+            fill_key = f"{order_id}:{size}:{price}"
+            if fill_key in _notified_fills:
+                return
+            _notified_fills.add(fill_key)
+            # Cap set size to prevent memory leak
+            if len(_notified_fills) > 500:
+                _notified_fills.clear()
+            
             # Find market info for this token
             market_question = ""
             condition_id = None
@@ -455,18 +477,11 @@ async def run(settings: Settings | None = None) -> None:
                     market_question = md.question
                     break
             
-            # Determine if side is missing (WS sometimes omits it)
-            if not side:
-                # Check the tracked order
-                tracked = state.order_tracker.get(order_id)
-                if tracked:
-                    side = tracked.side
-            
             dollar_value = size * price
             
             # Log fill details
             logger.info(
-                "fill_detected",
+                "fill_confirmed",
                 token_id=token_id[:16] if token_id else "?",
                 order_id=order_id[:16] if order_id else "?",
                 side=side,
@@ -489,15 +504,14 @@ async def run(settings: Settings | None = None) -> None:
                 pos = state.position_tracker.get(condition_id)
                 avg_entry = pos.yes_avg_price if pos and pos.yes_avg_price > 0 else 0
                 if not avg_entry and pos:
-                    avg_entry = pos.no_avg_price  # NO token sell
+                    avg_entry = pos.no_avg_price
                 if avg_entry > 0:
                     pnl = (price - avg_entry) * size
                     pnl_pct = ((price / avg_entry) - 1) * 100
                     pnl_emoji = "📈" if pnl >= 0 else "📉"
                     pnl_text = f"\n{pnl_emoji} PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)"
             
-            # Always send Telegram for fills from the user WS
-            # (user WS only sends OUR fills, not other users')
+            # Send ONE Telegram notification per fill
             emoji = "🟢" if side == "BUY" else "🔴"
             market_line = f"\n📊 {market_question[:50]}" if market_question else ""
             notification = (
