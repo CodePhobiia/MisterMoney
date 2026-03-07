@@ -182,6 +182,7 @@ class MarketEVScorer:
         market: EnrichedMarket,
         nav: float,
         reservation_price: float | None = None,
+        min_order_size: float = 5.0,
     ) -> list[QuoteBundle]:
         """Generate and score all bundles for a market.
 
@@ -198,7 +199,7 @@ class MarketEVScorer:
             reservation_price = market.mid
 
         # --- 1. Generate bundles ---
-        bundles = generate_bundles(market=market, nav=nav)
+        bundles = generate_bundles(market=market, nav=nav, min_order_size=min_order_size)
 
         if not bundles:
             logger.debug(
