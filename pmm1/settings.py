@@ -329,4 +329,6 @@ def load_settings(
         if val:
             yaml_data.setdefault(section, {})[key] = val
 
-    return Settings(**yaml_data)
+    settings = Settings(**yaml_data)
+    settings.raw_config = yaml_data  # Preserve raw YAML for PMM-2 config loading
+    return settings

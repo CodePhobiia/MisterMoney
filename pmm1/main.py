@@ -456,6 +456,13 @@ async def run(settings: Settings | None = None) -> None:
     fill_recorder = FillRecorder(db, state.book_manager)
     book_recorder = BookRecorder(db)
 
+    # ── Initialize PMM-2 runtime (Sprint 7) ──
+    from pmm2.runtime.integration import (
+        maybe_init_pmm2, pmm2_on_book_delta, pmm2_on_fill,
+        pmm2_on_order_live, pmm2_on_order_canceled,
+    )
+    pmm2_runtime = await maybe_init_pmm2(settings, db, state)
+
     # ── 8 & 9. Connect WebSockets ──
     all_token_ids = []
     for md in state.active_markets.values():
@@ -469,6 +476,8 @@ async def run(settings: Settings | None = None) -> None:
         book = state.book_manager.get(token_id)
         if book:
             recorder.record_book_snapshot(token_id, book)
+            # PMM-2: forward book deltas to queue estimator
+            # (simplified — full delta tracking would need old vs new per level)
 
     async def on_trade(token_id: str, price: float) -> None:
         """Callback when a trade occurs."""
@@ -610,6 +619,9 @@ async def run(settings: Settings | None = None) -> None:
             # Record fill for escalation ladder
             if hasattr(state, 'fill_escalator'):
                 state.fill_escalator.record_fill()
+            
+            # PMM-2: forward fill to queue estimator + persistence
+            pmm2_on_fill(pmm2_runtime, order_id, size, price)
         except Exception as e:
             logger.error("on_fill_callback_error", error=str(e))
 
@@ -624,6 +636,25 @@ async def run(settings: Settings | None = None) -> None:
                 order_id=order_id[:16] if order_id else "?",
                 status=status,
             )
+            
+            # PMM-2: forward order lifecycle events
+            if status == "LIVE":
+                token_id = msg.get("asset_id") or msg.get("token_id", "")
+                side = msg.get("side", "").upper()
+                price = float(msg.get("price", 0))
+                size = float(msg.get("original_size") or msg.get("size", 0))
+                # Estimate book depth at this price (rough)
+                book = state.book_manager.get(token_id) if token_id else None
+                book_depth = 0.0
+                if book:
+                    levels = book._bids if side == "BUY" else book._asks
+                    for lvl in levels.values():
+                        if abs(lvl.price_float - price) < 0.001:
+                            book_depth = lvl.size_float
+                            break
+                pmm2_on_order_live(pmm2_runtime, order_id, token_id, side, price, size, book_depth)
+            elif status in ("CANCELED", "CANCELLED"):
+                pmm2_on_order_canceled(pmm2_runtime, order_id)
         except Exception as e:
             logger.error("on_order_status_callback_error", error=str(e))
 
