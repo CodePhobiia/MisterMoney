@@ -35,10 +35,10 @@ async def check_orders_scoring(
     def _check_scoring():
         """Synchronous SDK call — run in thread."""
         try:
-            # SDK method: are_orders_scoring(order_ids: list[str]) -> dict
-            # Returns: {"12345": True, "67890": False}
-            result = sdk_client.are_orders_scoring(order_ids)
-            return result
+            from py_clob_client.clob_types import OrdersScoringParams
+            params = OrdersScoringParams(orderIds=order_ids)
+            result = sdk_client.are_orders_scoring(params)
+            return result if isinstance(result, dict) else {}
         except Exception as e:
             logger.error(
                 "sdk_scoring_check_failed",
