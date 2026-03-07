@@ -59,6 +59,7 @@ from pmm1.storage.parquet import ParquetWriter
 from pmm1.strategy.binary_parity import BinaryParityDetector
 from pmm1.strategy.fair_value import FairValueModel
 from pmm1.strategy.features import FeatureEngine
+from pmm1.strategy.fill_escalation import FillEscalator
 from pmm1.strategy.neg_risk_arb import NegRiskArbDetector, NegRiskOutcome
 from pmm1.strategy.exit_manager import ExitManager
 from pmm1.strategy.quote_engine import QuoteEngine
@@ -95,6 +96,7 @@ class BotState:
         self.parity_detector = BinaryParityDetector()
         self.neg_risk_detector = NegRiskArbDetector()
         self.reward_estimator = RewardEstimator()
+        self.fill_escalator = FillEscalator(settings.exit.fill_escalation)
 
         # Risk
         self.risk_limits = RiskLimits(
@@ -484,6 +486,9 @@ async def run(settings: Settings | None = None) -> None:
                     order_id=order_id,
                 )
                 asyncio.create_task(send_telegram(notification))
+            
+            # Record fill for escalation ladder
+            state.fill_escalator.record_fill()
         except Exception as e:
             logger.error("on_fill_callback_error", error=str(e))
 
@@ -858,6 +863,46 @@ async def run(settings: Settings | None = None) -> None:
                         position_age_hours=position_age_hours,
                     )
 
+                    # ── FILL-SPEED MODE: Escalation + Top-of-Book Clamp ──
+                    # Apply escalation ticks first (improves prices)
+                    escalation_ticks = state.fill_escalator.get_escalation_ticks()
+                    if escalation_ticks > 0 and book is not None:
+                        tick_float = float(tick_size)
+                        if quote_intent.bid_price:
+                            quote_intent.bid_price += escalation_ticks * tick_float
+                        if quote_intent.ask_price:
+                            quote_intent.ask_price -= escalation_ticks * tick_float
+                        
+                        # Clamp to valid price range
+                        if quote_intent.bid_price:
+                            quote_intent.bid_price = max(tick_float, min(1.0 - tick_float, quote_intent.bid_price))
+                        if quote_intent.ask_price:
+                            quote_intent.ask_price = max(tick_float, min(1.0 - tick_float, quote_intent.ask_price))
+
+                    # Top-of-book clamp: join the queue, don't sit 5¢ back
+                    if book is not None:
+                        bb = book.get_best_bid()
+                        ba = book.get_best_ask()
+                        tick_float = float(tick_size)
+                        
+                        # Clamp bid: if more than 1 tick below best bid, raise to best bid
+                        if bb and quote_intent.bid_price:
+                            best_bid_float = bb.price_float
+                            if quote_intent.bid_price < best_bid_float - tick_float:
+                                quote_intent.bid_price = best_bid_float
+                            # Never go above best bid (would cross)
+                            if quote_intent.bid_price > best_bid_float:
+                                quote_intent.bid_price = best_bid_float
+                        
+                        # Clamp ask: if more than 1 tick above best ask, lower to best ask
+                        if ba and quote_intent.ask_price:
+                            best_ask_float = ba.price_float
+                            if quote_intent.ask_price > best_ask_float + tick_float:
+                                quote_intent.ask_price = best_ask_float
+                            # Never go below best ask (would cross)
+                            if quote_intent.ask_price < best_ask_float:
+                                quote_intent.ask_price = best_ask_float
+
                     # SELL logic: only post asks when we hold inventory
                     if not paper_mode:
                         if market_inv <= 0:
@@ -1198,6 +1243,80 @@ async def run(settings: Settings | None = None) -> None:
                                 )
                 except Exception as e:
                     logger.error("exit_manager_error", error=str(e), exc_info=True)
+
+            # ── FILL-SPEED MODE: Taker Bootstrap ──
+            # After 20 min with no fills, take liquidity with one small order
+            if not paper_mode and order_manager and state.fill_escalator.should_take_liquidity():
+                try:
+                    # Pick highest-scored eligible market
+                    eligible = state.eligible_markets()
+                    if eligible:
+                        # Sort by volume (or use universe scoring if available)
+                        best_market = max(
+                            eligible,
+                            key=lambda m: m.volume_24h_usd if hasattr(m, 'volume_24h_usd') else 0.0
+                        )
+                        
+                        token_id_taker = best_market.token_id_yes
+                        book_taker = state.book_manager.get(token_id_taker)
+                        
+                        if book_taker:
+                            ba_taker = book_taker.get_best_ask()
+                            if ba_taker and ba_taker.price_float > 0:
+                                # Submit small FAK BUY at best ask
+                                taker_size = max(5.0, state.fill_escalator.config.taker_min_shares)
+                                taker_price = ba_taker.price_float
+                                
+                                # Ensure dollar value meets minimum
+                                MIN_DOLLAR = 1.5
+                                if taker_price * taker_size < MIN_DOLLAR:
+                                    taker_size = max(taker_size, MIN_DOLLAR / taker_price)
+                                
+                                tick_taker = state.tick_sizes.get(token_id_taker, Decimal("0.01"))
+                                
+                                taker_req = CreateOrderRequest(
+                                    token_id=token_id_taker,
+                                    price=str(taker_price),
+                                    size=str(taker_size),
+                                    side=OrderSide.BUY,
+                                    order_type=OrderType.FAK,
+                                    neg_risk=best_market.neg_risk,
+                                    post_only=False,
+                                    tick_size=str(tick_taker),
+                                )
+                                
+                                logger.info(
+                                    "taker_bootstrap_submitting",
+                                    event="taker_bootstrap",
+                                    token_id=token_id_taker[:16],
+                                    price=taker_price,
+                                    size=taker_size,
+                                    escalation_status=state.fill_escalator.get_status(),
+                                )
+                                
+                                # Submit via order manager (or direct client if needed)
+                                # For FAK orders, we may need to use clob_private directly
+                                # since order_manager expects GTC/GTD for diff_and_apply
+                                try:
+                                    resp = await clob_private.create_order(taker_req)
+                                    if resp and resp.success:
+                                        logger.info(
+                                            "taker_bootstrap_submitted",
+                                            order_id=resp.order_id[:16] if resp.order_id else "?",
+                                            token_id=token_id_taker[:16],
+                                        )
+                                        # Reset the taker cycle
+                                        state.fill_escalator.reset_taker_cycle()
+                                        orders_submitted += 1
+                                    else:
+                                        logger.warning(
+                                            "taker_bootstrap_failed",
+                                            error=resp.error_msg if resp else "no response",
+                                        )
+                                except Exception as taker_err:
+                                    logger.error("taker_bootstrap_error", error=str(taker_err))
+                except Exception as e:
+                    logger.error("taker_bootstrap_outer_error", error=str(e), exc_info=True)
 
             # ── Cycle metrics ──
             cycle_duration = (time.time() - cycle_start) * 1000

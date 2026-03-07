@@ -185,6 +185,21 @@ class InventorySkewConfig(BaseModel):
     age_halflife_hours: float = 4.0
 
 
+class FillEscalationConfig(BaseModel):
+    """Fill escalation ladder settings for Fill-Speed Mode."""
+
+    enabled: bool = True
+    level_1_secs: int = 15 * 60  # 15 min
+    level_1_ticks: int = 1
+    level_2_secs: int = 30 * 60  # 30 min
+    level_2_ticks: int = 2
+    level_3_secs: int = 45 * 60  # 45 min
+    level_3_ticks: int = 3
+    taker_enabled: bool = True
+    taker_trigger_secs: int = 20 * 60  # 20 min
+    taker_min_shares: float = 5.0
+
+
 class ExitConfig(BaseModel):
     """Root exit / sell-logic configuration."""
 
@@ -194,6 +209,7 @@ class ExitConfig(BaseModel):
     flatten: FlattenConfig = Field(default_factory=FlattenConfig)
     orphan: OrphanConfig = Field(default_factory=OrphanConfig)
     inventory_skew: InventorySkewConfig = Field(default_factory=InventorySkewConfig)
+    fill_escalation: FillEscalationConfig = Field(default_factory=FillEscalationConfig)
 
 
 class UniverseWeights(BaseModel):

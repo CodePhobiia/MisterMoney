@@ -1,7 +1,7 @@
 bot:
   name: PMM-1
   env: prod
-  max_markets: 30
+  max_markets: 8
   quote_cycle_ms: 1000
   reconcile_orders_s: 30
   reconcile_positions_s: 60
@@ -14,8 +14,8 @@ wallet:
 
 market_filters:
   min_time_to_end_hours: 24
-  min_volume_24h_usd: 50000
-  max_top_spread_cents: 5
+  min_volume_24h_usd: 250000
+  max_top_spread_cents: 2
   min_depth_within_2c_shares: 0
   allow_sports: false
   allow_crypto_intraday: false
@@ -70,6 +70,17 @@ exit:
   inventory_skew:
     gamma_max: 0.05
     age_halflife_hours: 4.0
+  fill_escalation:
+    enabled: true
+    level_1_secs: 900      # 15 min
+    level_1_ticks: 1
+    level_2_secs: 1800     # 30 min
+    level_2_ticks: 2
+    level_3_secs: 2700     # 45 min
+    level_3_ticks: 3
+    taker_enabled: true
+    taker_trigger_secs: 1200  # 20 min
+    taker_min_shares: 5.0
 
 execution:
   post_only: true
