@@ -180,10 +180,16 @@ class GammaClient:
         offset: int = 0,
         order_by: str = "",
         ascending: bool = False,
+        max_pages: int = 0,
     ) -> list[GammaMarket]:
-        """Fetch markets directly (not via events)."""
+        """Fetch markets directly (not via events).
+
+        Args:
+            max_pages: Maximum number of pages to fetch (0 = unlimited).
+        """
         all_markets: list[GammaMarket] = []
         current_offset = offset
+        pages_fetched = 0
 
         while True:
             params: dict[str, Any] = {
@@ -202,8 +208,11 @@ class GammaClient:
 
             batch = [GammaMarket.model_validate(m) for m in data]
             all_markets.extend(batch)
+            pages_fetched += 1
 
             if len(batch) < limit:
+                break
+            if max_pages > 0 and pages_fetched >= max_pages:
                 break
             current_offset += limit
 

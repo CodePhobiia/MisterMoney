@@ -191,6 +191,7 @@ async def run(settings: Settings | None = None) -> None:
     try:
         raw_markets = await gamma.get_markets(
             active=True, closed=False, order_by="volume24hr", limit=200,
+            max_pages=1,  # Just top 200 by volume, don't paginate all 34K
         )
         for market in raw_markets:
             token_ids = market.token_ids
