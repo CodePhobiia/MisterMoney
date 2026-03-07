@@ -225,7 +225,7 @@ async def main():
             structlog.processors.add_log_level,
             structlog.processors.JSONRenderer()
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(logging_level=20),  # INFO
+        wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(),
     )

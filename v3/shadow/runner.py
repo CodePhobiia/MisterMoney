@@ -174,9 +174,9 @@ class ShadowRunner:
                 event_type=change_event.event_type)
         
         # 3. Fetch evidence
-        evidence = await self.evidence_graph.retrieve_evidence(
+        evidence = await self.evidence_graph.get_evidence_bundle(
             condition_id=market.condition_id,
-            limit=50
+            max_items=50
         )
         
         # 4. Build route plan
@@ -184,7 +184,7 @@ class ShadowRunner:
             condition_id=market.condition_id,
             route=route,
             priority=0,
-            reasoning=f"Classified as {route} via source registry"
+            reason=f"Classified as {route} via source registry"
         )
         
         # 5. Execute route
