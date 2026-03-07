@@ -114,6 +114,8 @@ class BotState:
         self.active_markets: dict[str, MarketMetadata] = {}  # condition_id → metadata
         self.tick_sizes: dict[str, Decimal] = {}  # token_id → tick_size
         self.neg_risk_events: dict[str, list[NegRiskOutcome]] = {}  # event_id → outcomes
+        self.rest_book_cache: dict[str, Any] = {}  # REST book cache
+        self.rest_book_cache_ts: dict[str, float] = {}  # REST book cache timestamps
 
         # Sampling (reward-eligible) condition IDs
         self.reward_eligible: set[str] = set()
@@ -522,11 +524,31 @@ async def run(settings: Settings | None = None) -> None:
                     continue
 
                 book = state.book_manager.get(token_id)
-                if book is None:
-                    continue
-                # In paper mode, relax staleness to 120s (books still valid, just quiet markets)
-                stale_threshold = 120.0 if paper_mode else 2.0
-                if book.age_seconds > stale_threshold:
+                # Stale threshold: 60s live (WS books are fine within a minute), 120s paper
+                stale_threshold = 120.0 if paper_mode else 60.0
+                book_usable = book is not None and book.age_seconds <= stale_threshold
+
+                # REST fallback: if no usable WS book, fetch via REST (cached 10s)
+                if not book_usable:
+                    rest_cache_key = f"rest_book_{token_id}"
+                    rest_cache_ts = state.rest_book_cache_ts.get(rest_cache_key, 0)
+                    if time.time() - rest_cache_ts > 10.0:  # Refresh every 10s
+                        try:
+                            rest_book = await clob_public.get_order_book(token_id)
+                            if rest_book and rest_book.bids and rest_book.asks:
+                                from pmm1.state.books import OrderBook
+                                cached_book = OrderBook(token_id, tick_size=state.tick_sizes.get(token_id, Decimal("0.01")))
+                                for bid in rest_book.bids:
+                                    cached_book.update_level("bid", Decimal(bid.price), Decimal(bid.size))
+                                for ask in rest_book.asks:
+                                    cached_book.update_level("ask", Decimal(ask.price), Decimal(ask.size))
+                                state.rest_book_cache[rest_cache_key] = cached_book
+                                state.rest_book_cache_ts[rest_cache_key] = time.time()
+                        except Exception:
+                            pass
+                    book = state.rest_book_cache.get(rest_cache_key)
+
+                if book is None or (not book._bids and not book._asks):
                     continue
 
                 tick_size = state.tick_sizes.get(token_id, Decimal("0.01"))

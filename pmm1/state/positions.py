@@ -241,8 +241,39 @@ class PositionTracker:
     def reconcile_with_exchange(
         self, exchange_positions: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        """Reconcile local positions with exchange data."""
+        """Reconcile local positions with exchange data.
+        
+        Also zeros out local positions that no longer exist on the exchange.
+        """
         mismatches = []
+        
+        # Build set of tokens the exchange reports we hold
+        exchange_tokens: set[str] = set()
+        for ep in exchange_positions:
+            token_id = ep.get("asset", "")
+            exchange_size = float(ep.get("size", 0))
+            if exchange_size > 0 and token_id:
+                exchange_tokens.add(token_id)
+        
+        # Zero out local positions not on exchange
+        for cid, pos in list(self._positions.items()):
+            if pos.yes_size > 0 and pos.token_id_yes and pos.token_id_yes not in exchange_tokens:
+                logger.info("position_zeroed_by_exchange",
+                            condition_id=cid[:16],
+                            token_id=pos.token_id_yes[:16],
+                            old_size=pos.yes_size,
+                            side="YES")
+                pos.yes_size = 0.0
+                pos.yes_cost_basis = 0.0
+            if pos.no_size > 0 and pos.token_id_no and pos.token_id_no not in exchange_tokens:
+                logger.info("position_zeroed_by_exchange",
+                            condition_id=cid[:16],
+                            token_id=pos.token_id_no[:16],
+                            old_size=pos.no_size,
+                            side="NO")
+                pos.no_size = 0.0
+                pos.no_cost_basis = 0.0
+        
         for ep in exchange_positions:
             token_id = ep.get("asset", "")
             exchange_size = float(ep.get("size", 0))
