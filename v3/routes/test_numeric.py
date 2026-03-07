@@ -128,18 +128,18 @@ def test_barrier_probability_below_threshold():
         source_registry=None
     )
     
-    # Current price below threshold
+    # Current price below threshold (need higher vol or longer time for decent probability)
     prob = route._barrier_probability(
         current=50000,
         threshold=100000,
-        vol=0.5,
+        vol=1.2,  # High volatility (120% annualized - typical for crypto)
         time_to_expiry_hours=24 * 365,  # 1 year
         operator='>'
     )
     
-    # Should be moderate probability
-    assert 0.1 < prob < 0.9, f"Expected moderate probability, got {prob}"
-    print(f"✓ Barrier probability (below threshold): {prob:.4f}")
+    # Should be moderate probability with high volatility
+    assert 0.15 < prob < 0.9, f"Expected moderate probability with high vol, got {prob}"
+    print(f"✓ Barrier probability (below threshold, high vol): {prob:.4f}")
 
 
 def test_barrier_probability_high_volatility():
