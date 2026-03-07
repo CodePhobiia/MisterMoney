@@ -647,10 +647,24 @@ async def run(settings: Settings | None = None) -> None:
                         condition_id=md.condition_id,
                     )
 
-                    # Don't post SELL orders if we don't hold the token (check BEFORE risk limits)
-                    if not paper_mode and market_inv <= 0:
-                        quote_intent.ask_size = None
-                        quote_intent.ask_price = None
+                    # SELL logic: only post asks when we hold inventory
+                    if not paper_mode:
+                        if market_inv <= 0:
+                            # No inventory — don't post sells
+                            quote_intent.ask_size = None
+                            quote_intent.ask_price = None
+                        else:
+                            # Cap sell size to what we actually hold
+                            if quote_intent.ask_size and quote_intent.ask_size > market_inv:
+                                quote_intent.ask_size = market_inv
+                            # Ensure minimum 5 shares for Polymarket
+                            if quote_intent.ask_size and quote_intent.ask_size < 5.0:
+                                if market_inv >= 5.0:
+                                    quote_intent.ask_size = 5.0
+                                else:
+                                    # Can't meet minimum — skip sell
+                                    quote_intent.ask_size = None
+                                    quote_intent.ask_price = None
 
                     # Apply drawdown adjustments
                     if dd_state.should_widen_quotes:
@@ -726,6 +740,47 @@ async def run(settings: Settings | None = None) -> None:
                         if quote_intent.bid_price and quote_intent.ask_price:
                             spread_cents = (quote_intent.ask_price - quote_intent.bid_price) * 100
                             state.metrics.record_quote(token_id, md.condition_id, spread_cents)
+
+            # ── Unwind orphan positions (held but not in universe) ──
+            if not paper_mode and order_manager:
+                for token_id_held, held_pos in list(state.position_tracker._positions.items()):
+                    if held_pos.net_exposure <= 0:
+                        continue
+                    # Skip if already managed by the main quote loop
+                    if token_id_held in state.active_markets:
+                        continue
+                    # Post a SELL order to unwind
+                    sell_size = held_pos.yes_size if held_pos.yes_size > 0 else held_pos.no_size
+                    if sell_size < 5.0:
+                        continue  # Can't meet Polymarket minimum
+                    # Get current book to price the sell
+                    book = state.book_manager.get(token_id_held)
+                    if book and book.best_bid and book.best_bid > 0:
+                        sell_price = book.best_bid  # Sell at best bid (market sell)
+                        from pmm1.strategy.quote_engine import QuoteIntent
+                        unwind_intent = QuoteIntent(
+                            condition_id=token_id_held,
+                            token_id=token_id_held,
+                            bid_price=None,
+                            bid_size=None,
+                            ask_price=sell_price,
+                            ask_size=sell_size,
+                            reservation_price=sell_price,
+                            half_spread=0.01,
+                        )
+                        try:
+                            result = await order_manager.diff_and_apply(
+                                unwind_intent, "0.01"
+                            )
+                            orders_submitted += result.get("submitted", 0)
+                            logger.info("unwind_orphan_position",
+                                        token_id=token_id_held[:16],
+                                        size=sell_size,
+                                        price=sell_price)
+                        except Exception as e:
+                            logger.warning("unwind_orphan_failed",
+                                           token_id=token_id_held[:16],
+                                           error=str(e))
 
             # ── Cycle metrics ──
             cycle_duration = (time.time() - cycle_start) * 1000
