@@ -1071,8 +1071,8 @@ async def run(settings: Settings | None = None) -> None:
                     fv_estimate = state.fair_value_model.compute_fair_value(features)
                     base_fair_value = fv_estimate.fair_value
 
-                    # Skip extreme prices where min order can't be met profitably
-                    if base_fair_value < 0.05 or base_fair_value > 0.95:
+                    # Skip extreme prices — no counterparty flow below 15c or above 85c
+                    if base_fair_value < 0.15 or base_fair_value > 0.85:
                         continue
 
                     # Inventory (YES position)
@@ -1315,7 +1315,7 @@ async def run(settings: Settings | None = None) -> None:
                             no_fair_value = 1.0 - base_fair_value
 
                             # Skip if inverted fair value is extreme
-                            if no_fair_value >= 0.05 and no_fair_value <= 0.95:
+                            if no_fair_value >= 0.15 and no_fair_value <= 0.85:
                                 # Inventory for NO side
                                 no_token_inventory = no_inventory
                                 

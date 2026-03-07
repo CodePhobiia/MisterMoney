@@ -13,13 +13,13 @@ wallet:
   chain_id: 137
 
 market_filters:
-  min_time_to_end_hours: 24
+  min_time_to_end_hours: 6
   min_volume_24h_usd: 50000
   max_top_spread_cents: 5
   min_depth_within_2c_shares: 0
-  allow_sports: false
+  allow_sports: true
   allow_crypto_intraday: false
-  require_clear_rules: true
+  require_clear_rules: false
 
 strategy:
   enable_binary_parity: true

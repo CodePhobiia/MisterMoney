@@ -140,7 +140,7 @@ def check_eligibility(
     # Midpoint filter: skip extreme prices where MM can't profit
     # Markets at $0.01 or $0.99 have no spread to capture
     mid = (market.best_bid + market.best_ask) / 2 if market.best_bid > 0 and market.best_ask > 0 else 0
-    if mid > 0 and (mid < 0.05 or mid > 0.95):
+    if mid > 0 and (mid < 0.15 or mid > 0.85):
         reasons.append(f"extreme_price_mid={mid:.3f}")
 
     return EligibilityResult(
