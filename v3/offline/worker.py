@@ -1,3 +1,4 @@
+import os
 """
 Offline Worker — Async processor for escalated markets
 
@@ -33,7 +34,7 @@ class OfflineWorker:
     6. Notify via Telegram if significant change
     """
     
-    TELEGRAM_CHAT_ID = "7916400037"
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     
     def __init__(
         self,

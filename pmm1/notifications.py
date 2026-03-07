@@ -10,11 +10,8 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 # Get token from env or use default from openclaw config
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    "8548123005:AAGpxJFaxbJeRH6CtMw2oGvRVWakwW-lm8U"
-)
-TELEGRAM_CHAT_ID = "7916400037"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 
 async def send_telegram(message: str) -> None:

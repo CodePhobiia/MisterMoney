@@ -4,6 +4,7 @@
 import asyncio
 import json
 import os
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ import aiohttp
 from web3 import Web3
 
 # ── Config ──
-BOT_ADDRESS = "0x6eDA534fFcF2Cfa5991A328a7A58CE02daFE24A6"
+BOT_ADDRESS = os.getenv("BOT_ADDRESS", "0x6eDA534fFcF2Cfa5991A328a7A58CE02daFE24A6")
 USDC_E_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 USDC_CONTRACT = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
 RPC_URL = "https://polygon-bor-rpc.publicnode.com"

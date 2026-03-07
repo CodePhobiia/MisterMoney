@@ -1,3 +1,4 @@
+import os
 """Shadow dashboard — generates Telegram status reports.
 
 Produces human-readable summaries of shadow mode performance:
@@ -114,7 +115,7 @@ class ShadowDashboard:
 
         return "\n".join(lines)
 
-    async def send_daily_shadow_report(self, chat_id: str = "7916400037"):
+    async def send_daily_shadow_report(self, chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")):
         """Send daily shadow mode report via Telegram.
 
         Args:

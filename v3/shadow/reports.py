@@ -67,7 +67,7 @@ async def send_telegram(
 class DailyReporter:
     """Sends daily shadow mode summary to Telegram"""
     
-    TELEGRAM_CHAT_ID = "7916400037"
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     
     def __init__(
         self, 

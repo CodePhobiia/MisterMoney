@@ -1,10 +1,16 @@
 .env
+.env.*
 __pycache__/
 *.pyc
+*.egg-info/
 
 # runtime artifacts
-pmm1/**/__pycache__/
-data/recordings/
-data/*.db
-data/*.db-shm
-data/*.db-wal
+data/
+logs/
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.vscode/
+.idea/

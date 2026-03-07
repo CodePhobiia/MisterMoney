@@ -1,3 +1,4 @@
+import os
 """Daily PnL decomposition and reporting."""
 
 from __future__ import annotations
@@ -307,7 +308,7 @@ Costs:
         
         return summary
     
-    async def send_daily_report(self, date: str, chat_id: str = "7916400037"):
+    async def send_daily_report(self, date: str, chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")):
         """Generate and send daily report via Telegram.
         
         Args:

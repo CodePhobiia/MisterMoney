@@ -1,3 +1,4 @@
+import os
 """
 Weekly Evaluator — Analyze resolved markets and generate calibration labels
 
@@ -26,7 +27,7 @@ class WeeklyEvaluator:
     Generates calibration labels for retraining.
     """
     
-    TELEGRAM_CHAT_ID = "7916400037"
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     
     def __init__(self, db: Database, registry: ProviderRegistry):
         """
