@@ -29,8 +29,8 @@ strategy:
 
 pricing:
   base_half_spread_cents: 1.0
-  inventory_skew_gamma: 0.015
-  cluster_skew_eta: 0.02
+  inventory_skew_gamma: 0.002
+  cluster_skew_eta: 0.001
   take_threshold_cents: 0.8
   reward_capture_weight: 0.7
 
