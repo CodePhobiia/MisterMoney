@@ -475,8 +475,11 @@ async def run(settings: Settings | None = None) -> None:
                         new_no_size=pos.no_size,
                     )
             
-            # Send Telegram notification
-            if token_id and order_id:
+            # Only notify + record if this is OUR order (tracked by order manager)
+            is_our_order = order_id and state.order_tracker.get(order_id) is not None
+            
+            if is_our_order:
+                # Send Telegram notification
                 notification = format_fill_notification(
                     side=side or "UNKNOWN",
                     size=size,
@@ -485,9 +488,11 @@ async def run(settings: Settings | None = None) -> None:
                     order_id=order_id,
                 )
                 asyncio.create_task(send_telegram(notification))
-            
-            # Record fill for escalation ladder
-            state.fill_escalator.record_fill()
+                
+                # Record fill for escalation ladder
+                state.fill_escalator.record_fill()
+            else:
+                logger.debug("fill_not_our_order", order_id=order_id[:16] if order_id else "?")
         except Exception as e:
             logger.error("on_fill_callback_error", error=str(e))
 

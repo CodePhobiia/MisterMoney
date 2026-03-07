@@ -72,9 +72,11 @@ def format_fill_notification(
         Formatted message string
     """
     emoji = "🟢" if side.upper() == "BUY" else "🔴"
-    return f"""{emoji} {side.upper()} FILLED: {size:.1f} shares @ ${price:.2f}
-Market: {token_id[:16]}...
-Order: {order_id[:16]}..."""
+    dollar_value = size * price
+    return f"""{emoji} {side.upper()} FILLED
+Shares: {size:.1f} @ ${price:.3f}
+Value: ${dollar_value:.2f}
+Token: {token_id[:16]}..."""
 
 
 def format_exit_notification(
