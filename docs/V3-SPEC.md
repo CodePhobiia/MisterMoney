@@ -524,17 +524,57 @@ class FairValueSignal(BaseModel):
     freshness: float
     specialist_path: str          # "numeric", "rule_heavy", "dossier", "simple"
     models_called: list[str]      # ["sonnet_4.6"] or ["sonnet_4.6", "opus_4.6", "gpt_5.4"]
-    total_cost_usd: float         # actual API cost for this signal
+    total_requests: int           # API calls consumed for this signal
+    rate_budget_remaining: dict[str, int]  # provider → remaining quota
     timestamp: datetime
 ```
 
 ---
 
-## 6. Model Assignments
+## 6. Model Assignments & Access
+
+### 6.0 Access Strategy — OAuth Consumer Endpoints ($0 Marginal Cost)
+
+**All model access routes through existing subscription OAuth, NOT paid API keys.**
+
+We have three active subscriptions that provide unlimited (rate-limited) access:
+
+| Subscription | Models Available | OAuth Endpoint | Auth Method |
+|-------------|-----------------|----------------|-------------|
+| **Anthropic Pro** | Opus 4.6, Sonnet 4.6 | Claude consumer API | OAuth device flow → access token |
+| **Google AI Ultra** | Gemini 3.1 Pro, Flash-Lite | Cloud Code Assist (`cloudcode-pa.googleapis.com`) | Google OAuth → bearer token |
+| **ChatGPT Pro ($200/mo)** | GPT-5.4, GPT-5.4-pro | Codex API (`chatgpt.com/backend-api/codex/responses`) | OpenAI OAuth device flow → access token |
+
+**Proven infrastructure**: The Chimera semantic proxy already runs all three backends via OAuth with automatic token refresh. V3 reuses the same auth layer.
+
+**Token management**:
+```python
+class OAuthTokenManager:
+    """Manages OAuth tokens for all three providers.
+    
+    Reads from auth-profiles.json, auto-refreshes expired tokens,
+    handles rate limits with exponential backoff.
+    """
+    providers: dict[str, OAuthProfile]  # anthropic, google, openai
+    
+    async def get_token(self, provider: str) -> str:
+        """Returns valid bearer token, refreshing if expired."""
+    
+    async def call_model(self, provider: str, model: str, messages: list, **kwargs) -> dict:
+        """Unified interface across all three providers."""
+```
+
+**Rate limits** (the real constraint, not cost):
+- Anthropic Pro: ~45 messages/5 min for Opus, higher for Sonnet
+- Google AI Ultra / CCA: ~10 req/min (observed 403 after burst — needs backoff)
+- ChatGPT Pro / Codex: SSE streaming, rate limit TBD (~60 req/min observed)
+
+**Implication for architecture**: The escalation gate (`EV > Cost`) becomes a **rate-limit gate** (`remaining_quota > 0 ∧ priority > threshold`). Since marginal token cost = $0, we can be more aggressive with escalation — the binding constraint is requests/minute, not dollars/day.
 
 ### 6.1 Sonnet 4.6 — Hot-Path Triage & Extraction
 
 **Role**: First-pass classifier. Runs on every triggered market.
+**Access**: Anthropic Pro OAuth
 **Strengths**: Fast, cheap, web search/fetch, adaptive thinking.
 **Used for**:
 - News triage and entity extraction
@@ -543,11 +583,12 @@ class FairValueSignal(BaseModel):
 - Simple binary market probability (when no escalation needed)
 
 **Thinking mode**: Adaptive (let the model decide thinking depth).
-**Cost**: ~$3/MTok input, ~$15/MTok output. Cheap enough for hot path.
+**Rate budget**: Primary consumer of Anthropic quota. ~70% of Anthropic calls.
 
 ### 6.2 Opus 4.6 — Rule Lawyer & Adversarial Challenger
 
 **Role**: Deep rule analysis. Called conditionally.
+**Access**: Anthropic Pro OAuth
 **Strengths**: Highest reasoning, adversarial analysis, nuance detection.
 **Used for**:
 - Rule ambiguity analysis (Type 2 markets)
@@ -557,11 +598,12 @@ class FairValueSignal(BaseModel):
 
 **Thinking mode**: Adaptive (extended thinking when rules are complex).
 **When NOT to call**: Clear rules, no clarifications, simple binary, no change detected.
-**Cost**: ~$15/MTok input, ~$75/MTok output. Reserve for high-value decisions.
+**Rate budget**: ~30% of Anthropic calls. Reserve for high-value decisions.
 
 ### 6.3 Gemini 3.1 Pro — Long-Context Dossier Model
 
 **Model**: `gemini-3.1-pro-preview` (NOT gemini-3-pro-preview — deprecated March 9, 2026)
+**Access**: Google AI Ultra → Cloud Code Assist OAuth (`cloudcode-pa.googleapis.com/v1internal:generateContent`)
 **Role**: Document synthesis. Called for Type 3 markets.
 **Strengths**: 1M-token context, structured outputs, search grounding, function calling.
 **Used for**:
@@ -570,13 +612,13 @@ class FairValueSignal(BaseModel):
 - Large clarification bundles
 - Cross-document contradiction detection
 
-**Alternative for high-volume extraction**: Gemini 3.1 Flash-Lite (cheaper, faster, Google positions it for high-volume agentic tasks). Reserve Pro for hard cases.
-
-**Cost**: Token-based, pricing changes above 200K tokens. Simulate from traces.
+**Alternative for high-volume extraction**: Gemini 3.1 Flash-Lite via same OAuth (cheaper quota usage). Reserve Pro for hard long-context cases.
+**Rate budget**: ~10 req/min observed limit. Use for dossier markets only.
 
 ### 6.4 GPT-5.4 / GPT-5.4-pro — Orchestrator & Final Judge
 
 **Role**: Market-aware decision maker. Final call on action.
+**Access**: ChatGPT Pro OAuth → Codex API (`chatgpt.com/backend-api/codex/responses`, SSE streaming)
 **Strengths**: 1M-token context, web search, file search, tool use.
 **Used for**:
 - Pass B (market-aware decision) in all escalated paths
@@ -584,12 +626,21 @@ class FairValueSignal(BaseModel):
 - Orchestration when multiple specialists disagree
 
 **Escalate to GPT-5.4-pro when**:
-- EV is high (>$0.50 potential edge × our capital)
 - Model disagreement > 15%
 - Market is capital-intensive (>$50 our exposure)
 - Ambiguity is high enough that a bad read costs real money
 
-**Cost**: Token-based. Verify exact model IDs available in account before production wiring.
+**Rate budget**: Primary consumer of OpenAI quota. SSE streaming required (`stream: true`).
+
+### 6.5 Provider Failover
+
+If one provider hits rate limits or is down:
+```
+Sonnet (triage)  → fallback: Gemini Flash-Lite → GPT-5.4
+Opus (rules)     → fallback: GPT-5.4-pro → Gemini Pro
+Gemini (dossier) → fallback: GPT-5.4 (1M context) → Opus (slower but capable)
+GPT-5.4 (judge)  → fallback: Opus → Sonnet (degraded)
+```
 
 ---
 
@@ -668,34 +719,79 @@ This is the highest-alpha component of V3. When you can check the resolution sou
 
 ## 9. Cost Model
 
-### 9.1 Token-Based Estimation (Not Per-Call)
+### 9.1 OAuth = $0 Marginal Token Cost
 
-All API providers bill by tokens. Additional charges apply for tool use.
+All three providers are accessed via existing subscription OAuth:
 
-| Provider | Model | Input | Output | Notes |
-|----------|-------|-------|--------|-------|
-| Anthropic | Sonnet 4.6 | $3/MTok | $15/MTok | +$10/1K web searches |
-| Anthropic | Opus 4.6 | $15/MTok | $75/MTok | +$10/1K web searches |
-| Google | Gemini 3.1 Pro | Varies | Varies | Price changes >200K tokens |
-| OpenAI | GPT-5.4 | Varies | Varies | +charges for web/file search |
-| OpenAI | GPT-5.4-pro | Higher | Higher | Only for high-EV escalation |
+| Subscription | Monthly Cost | What We Get | Marginal Token Cost |
+|-------------|-------------|-------------|-------------------|
+| Anthropic Pro | ~$20/mo | Opus 4.6, Sonnet 4.6, web search | **$0** |
+| Google AI Ultra | ~$20/mo | Gemini 3.1 Pro, Flash-Lite, search grounding | **$0** |
+| ChatGPT Pro | $200/mo | GPT-5.4, GPT-5.4-pro, web/file search | **$0** |
+| **Total fixed** | **~$240/mo** | All four frontier models | **$0/token** |
 
-### 9.2 Cost Simulation
+This is already paid regardless of V3. The only NEW costs V3 introduces:
+- **Third-party data APIs** (NewsAPI, Polygon.io) — optional, only when AUM justifies
+- **Compute** (Python process running source checkers) — negligible on existing server
+- **Rate limit opportunity cost** — using Opus quota for V3 means less for other tasks
 
-Before production, run the full pipeline on 100 historical markets and measure:
-- Actual tokens consumed per market type
-- Tool usage charges
-- Escalation frequency
-- Total daily cost at various market counts
+### 9.2 The Real Constraint: Rate Limits, Not Dollars
 
-### 9.3 Expected Cost Reduction vs V3-v1
+Since tokens are free, the optimization problem changes:
 
-The event-driven + routing architecture should reduce API spend by 70-85% compared to fixed-cadence polling:
-- Most markets on most cycles: $0 (Tier 0 only, no trigger)
-- Triggered but not escalated: ~$0.003 (Sonnet triage only)
-- Fully escalated: ~$0.05-0.15 (specialist + judge)
+**Old (paid API)**: `escalate when EV_possible > Cost_API + Cost_latency + buffer`
+**New (OAuth)**: `escalate when priority > other_uses_of_quota ∧ rate_budget_remaining > 0`
 
-At 12 markets: estimated **$5-15/day** (down from ~$46/day in v1 spec).
+Rate limit budget allocation (per 5-minute window):
+
+| Provider | Total Quota (est.) | V3 Allocation | Other Uses |
+|----------|-------------------|---------------|------------|
+| Anthropic | ~45 Opus + ~100 Sonnet | 30 Sonnet + 10 Opus | 15 for Butters/other |
+| Google CCA | ~50 req | 30 req | 20 for other |
+| OpenAI Codex | ~300 req (SSE) | 50 req | 250 for other |
+
+### 9.3 Rate-Aware Escalation Gate
+
+Replace the cost gate with a rate-aware priority queue:
+
+```python
+class RateBudget:
+    """Manages rate limit allocation across V3 and other consumers."""
+    
+    def can_escalate(self, provider: str, priority: float) -> bool:
+        """Allow escalation if rate budget permits and priority warrants it."""
+        remaining = self.remaining_quota(provider)
+        if remaining <= self.reserve_for_other:
+            return False
+        if priority < self.min_escalation_priority:
+            return False
+        return True
+    
+    def priority_score(self, market: MarketMetadata, triage: TriageResult) -> float:
+        """Higher priority = more likely to escalate."""
+        return (
+            triage.estimated_specialist_value * our_capital_in_market
+            + urgency_bonus_if_near_resolution
+            + stale_market_bonus
+        )
+```
+
+### 9.4 Cost Simulation Still Needed
+
+Even though tokens are free, we should still measure:
+- Actual requests per market type per day (to verify rate limits aren't hit)
+- Latency per provider per call type (affects quote staleness)
+- Token consumption trends (subscriptions may change terms)
+- Whether the $200/mo ChatGPT Pro is justified by V3 alone vs. shared across all uses
+
+### 9.5 Break-Even Analysis
+
+V3 doesn't need to cover API costs (already paid). It needs to generate **incremental alpha** above V1+V2 alone:
+- If V3 improves Brier score by 0.01 across 12 markets → estimated +$2-5/day at current NAV
+- If V3 catches one stale market per day that V2 missed → estimated +$1-3 per event
+- At $104 NAV, even $3/day incremental = ~1,000% annualized improvement on V3 dev cost (labor only)
+
+The real ROI calculation is at scale: at $10K+ NAV with 30+ markets, V3 edge compounds.
 
 ---
 
