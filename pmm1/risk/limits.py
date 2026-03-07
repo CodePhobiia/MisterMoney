@@ -68,15 +68,19 @@ class RiskLimits:
     def check_per_market_gross(
         self,
         condition_id: str,
-        proposed_additional: float = 0.0,
+        proposed_additional_dollars: float = 0.0,
     ) -> LimitCheckResult:
-        """Check per-market gross exposure limit (default: 2% NAV)."""
+        """Check per-market gross exposure limit (default: 2% NAV).
+
+        Both current_gross and proposed_additional should be in dollar terms.
+        """
         if self._nav <= 0:
             return LimitCheckResult(passed=True)
 
+        # current_gross in dollars (approximate: shares * avg_entry or just use NAV fraction)
         pos = self.positions.get(condition_id)
-        current_gross = pos.gross_exposure if pos else 0.0
-        new_gross = current_gross + proposed_additional
+        current_gross = pos.total_cost_basis if pos else 0.0
+        new_gross = current_gross + proposed_additional_dollars
         limit = self._effective_limit(self.config.per_market_gross_nav) * self._nav
 
         if new_gross > limit:
@@ -194,13 +198,13 @@ class RiskLimits:
         Returns a modified QuoteIntent with sizes reduced to comply with limits.
         """
         # Compute dollar exposure (shares × price)
+        # Only BUY increases exposure; SELL reduces it — don't count asks
         bid_dollar = (intent.bid_size or 0) * (intent.bid_price or 0)
-        ask_dollar = (intent.ask_size or 0) * (intent.ask_price or 0)
 
-        # Per-market check (in dollar terms)
+        # Per-market check (in dollar terms, buys only)
         market_check = self.check_per_market_gross(
             intent.condition_id,
-            bid_dollar + ask_dollar,
+            bid_dollar,
         )
         if not market_check.passed:
             max_add = market_check.adjustments.get("max_additional", 0)
@@ -215,15 +219,14 @@ class RiskLimits:
             if intent.ask_price and intent.ask_price > 0:
                 intent.ask_size = min(intent.ask_size or 0, max_add / intent.ask_price / 2)
 
-        # Recompute dollar exposure after per-market adjustment
+        # Recompute dollar exposure after per-market adjustment (buys only)
         bid_dollar = (intent.bid_size or 0) * (intent.bid_price or 0)
-        ask_dollar = (intent.ask_size or 0) * (intent.ask_price or 0)
 
-        # Event cluster check (in dollar terms)
+        # Event cluster check (in dollar terms, buys only)
         if event_id:
             cluster_check = self.check_per_event_cluster(
                 event_id,
-                bid_dollar + ask_dollar,
+                bid_dollar,
             )
             if not cluster_check.passed:
                 max_add = cluster_check.adjustments.get("max_additional", 0)
