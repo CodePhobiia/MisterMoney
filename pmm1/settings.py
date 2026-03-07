@@ -242,6 +242,7 @@ class Settings(BaseSettings):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     universe_weights: UniverseWeights = Field(default_factory=UniverseWeights)
     exit: ExitConfig = Field(default_factory=ExitConfig)
+    raw_config: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     model_config = {"env_prefix": "PMM1_", "env_nested_delimiter": "__"}
 
@@ -329,6 +330,14 @@ def load_settings(
         if val:
             yaml_data.setdefault(section, {})[key] = val
 
-    settings = Settings(**yaml_data)
-    settings.raw_config = yaml_data  # Preserve raw YAML for PMM-2 config loading
-    return settings
+    # Preserve raw YAML for PMM-2 config loading (before stripping unknown keys)
+    raw_config = dict(yaml_data)
+    
+    # Strip keys not in Settings model (e.g. pmm2) to avoid pydantic extra_forbidden
+    known_sections = set(Settings.model_fields.keys())
+    for k in list(yaml_data.keys()):
+        if k not in known_sections and k != "raw_config":
+            del yaml_data[k]
+    
+    yaml_data["raw_config"] = raw_config
+    return Settings(**yaml_data)
