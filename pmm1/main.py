@@ -74,6 +74,9 @@ from pmm1.analytics.pnl import PnLTracker
 from pmm1.paper.engine import PaperEngine
 from pmm1.paper.logger import PaperLogger
 from pmm1.notifications import send_telegram, format_fill_notification, format_exit_notification
+from pmm1.storage.database import Database
+from pmm1.recorder.fill_recorder import FillRecorder
+from pmm1.recorder.book_recorder import BookRecorder
 
 logger: structlog.stdlib.BoundLogger = None  # type: ignore
 
@@ -447,6 +450,12 @@ async def run(settings: Settings | None = None) -> None:
     recorder = LiveRecorder()
     parquet_writer = ParquetWriter(settings.storage.parquet_dir)
 
+    # ── Initialize PMM-2 data collection (Sprint 1) ──
+    db = Database("data/pmm1.db")
+    await db.init()
+    fill_recorder = FillRecorder(db, state.book_manager)
+    book_recorder = BookRecorder(db)
+
     # ── 8 & 9. Connect WebSockets ──
     all_token_ids = []
     for md in state.active_markets.values():
@@ -539,6 +548,35 @@ async def run(settings: Settings | None = None) -> None:
                 if pos:
                     fill_side = "BUY" if side == "BUY" else "SELL"
                     pos.apply_fill(token_id, fill_side, size, price, fee=0.0)
+            
+            # ── PMM-2: Record fill with markout tracking (S1-2) ──
+            if condition_id and token_id:
+                tracked_order = state.order_tracker.get(order_id)
+                is_scoring = tracked_order.is_scoring if tracked_order else False
+                
+                # Check if market is reward-eligible
+                market_md = state.active_markets.get(condition_id)
+                reward_eligible = market_md.reward_eligible if market_md else False
+                
+                # Get book midpoint at fill time
+                book = state.book_manager.get(token_id)
+                mid_at_fill = book.get_midpoint() if book else None
+                
+                asyncio.create_task(
+                    fill_recorder.record_fill(
+                        ts=datetime.now(timezone.utc),
+                        condition_id=condition_id,
+                        token_id=token_id,
+                        order_id=order_id,
+                        side=side,
+                        price=price,
+                        size=size,
+                        fee=0.0,
+                        mid_at_fill=mid_at_fill,
+                        is_scoring=is_scoring,
+                        reward_eligible=reward_eligible,
+                    )
+                )
             
             # Compute PnL for SELL fills
             pnl_text = ""
@@ -664,11 +702,47 @@ async def run(settings: Settings | None = None) -> None:
                     scoring_count=scoring_count,
                     total_checked=len(order_ids),
                 )
+                
+                # ── PMM-2: Persist scoring history (S1-4) ──
+                ts = datetime.now(timezone.utc).isoformat()
+                scoring_records = []
+                for order in live_orders:
+                    # Find condition_id for this order
+                    condition_id = order.condition_id or "UNKNOWN"
+                    scoring_records.append((
+                        ts,
+                        order.order_id,
+                        condition_id,
+                        1 if order.is_scoring else 0,
+                    ))
+                
+                if scoring_records:
+                    sql = """
+                        INSERT OR REPLACE INTO scoring_history (ts, order_id, condition_id, is_scoring)
+                        VALUES (?, ?, ?, ?)
+                    """
+                    await db.execute_many(sql, scoring_records)
             except Exception as e:
                 logger.error("scoring_check_loop_error", error=str(e))
     
     if not paper_mode:
         scoring_check_task = asyncio.create_task(scoring_check_loop())
+
+    # ── Book snapshot loop (S1-3) ──
+    async def book_snapshot_loop() -> None:
+        """Background task to snapshot books every 10 seconds."""
+        while not shutdown_event.is_set():
+            try:
+                await asyncio.sleep(10)
+                if state.mode not in ("QUOTING", "PAUSED"):
+                    continue
+                
+                # Snapshot all active market books
+                await book_recorder.snapshot_books(state.active_markets, state.book_manager)
+            except Exception as e:
+                logger.error("book_snapshot_loop_error", error=str(e))
+    
+    book_snapshot_task = asyncio.create_task(book_snapshot_loop())
 
     # Wait briefly for WS connections to establish
     warmup_s = 5.0 if paper_mode else 2.0
