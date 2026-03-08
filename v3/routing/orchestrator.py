@@ -204,11 +204,7 @@ class RouteOrchestrator:
             Last FairValueSignal or None if not found
         """
         try:
-            signals = await self.evidence_graph.get_signals(
-                condition_id=condition_id,
-                limit=1
-            )
-            return signals[0] if signals else None
+            return await self.evidence_graph.get_latest_signal(condition_id)
         except Exception as e:
             log.error("get_cached_signal_failed", 
                      condition_id=condition_id, 

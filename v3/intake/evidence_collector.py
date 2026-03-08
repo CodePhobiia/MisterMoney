@@ -235,8 +235,8 @@ class EvidenceCollector:
             }
             
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers=headers) as response:
-                    if response.status == 200:
+                async with session.get(url, headers=headers, allow_redirects=True) as response:
+                    if response.status in (200, 202):
                         content = await response.text()
                         log.debug("url_fetched",
                                 url=url,
@@ -446,7 +446,7 @@ class EvidenceCollector:
         """
         Search the web for recent news about the market question
         
-        Uses DuckDuckGo HTML search (free, no API key needed)
+        Uses duckduckgo-search library (avoids CAPTCHA on HTML endpoint)
         
         Args:
             query: Search query
@@ -460,50 +460,26 @@ class EvidenceCollector:
         log.info("web_search_start", query=query[:80])
         
         try:
-            # DuckDuckGo HTML search
-            search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+            import asyncio
+            from duckduckgo_search import DDGS
             
-            html = await self._fetch_url(search_url)
-            if not html:
-                log.warning("search_fetch_failed", query=query)
-                return []
+            # Run sync DDG search in thread to avoid blocking
+            def _search():
+                with DDGS() as d:
+                    return list(d.text(query, max_results=num_results))
             
-            # Parse results
-            soup = BeautifulSoup(html, 'html.parser')
+            raw_results = await asyncio.get_event_loop().run_in_executor(
+                None, _search
+            )
+            
             results = []
-            
-            # DuckDuckGo HTML structure: results in divs with class "result"
-            for result_div in soup.find_all('div', class_='result')[:num_results]:
-                try:
-                    # Extract title and URL
-                    title_link = result_div.find('a', class_='result__a')
-                    if not title_link:
-                        continue
-                    
-                    title = title_link.get_text(strip=True)
-                    url = title_link.get('href', '')
-                    
-                    # Extract snippet
-                    snippet_div = result_div.find('a', class_='result__snippet')
-                    snippet = snippet_div.get_text(strip=True) if snippet_div else ''
-                    
-                    # Clean URL (DuckDuckGo wraps in redirect)
-                    # Format: /l/?uddg=<encoded_url>
-                    if url.startswith('/l/?'):
-                        # For simplicity, skip redirect parsing for now
-                        # Try to find URL in the snippet or skip
-                        continue
-                    
-                    if url and title:
-                        results.append({
-                            'title': title,
-                            'url': url,
-                            'snippet': snippet or title
-                        })
-                        
-                except Exception as e:
-                    log.warning("search_result_parse_failed", error=str(e))
-                    continue
+            for r in raw_results:
+                if r.get('href') and r.get('title'):
+                    results.append({
+                        'title': r['title'],
+                        'url': r['href'],
+                        'snippet': r.get('body', r['title'])
+                    })
             
             log.info("web_search_complete",
                     query=query[:80],
