@@ -411,30 +411,35 @@ class ClobPrivateClient:
     async def create_orders_batch(
         self, orders: list[CreateOrderRequest]
     ) -> list[OrderResponse]:
-        """Submit a batch of orders using the SDK.
+        """Submit orders concurrently with semaphore for rate limiting.
 
         Creates and posts each order individually through the SDK since
         the SDK doesn't have a native batch method that handles signing.
-        Orders are created concurrently for speed.
+        Uses asyncio.gather for concurrent submission with semaphore(10).
         """
-        responses = []
-        for order in orders:
-            try:
-                resp = await self.create_order(order)
-                responses.append(resp)
-            except Exception as e:
-                logger.error(
-                    "batch_order_failed",
-                    token_id=order.token_id,
-                    error=str(e),
-                )
-                responses.append(OrderResponse(
-                    success=False,
-                    error_msg=str(e),
-                ))
+        if not orders:
+            return []
 
+        sem = asyncio.Semaphore(10)  # Max 10 concurrent submissions
+
+        async def submit_one(order: CreateOrderRequest) -> OrderResponse:
+            async with sem:
+                try:
+                    return await self.create_order(order)
+                except Exception as e:
+                    logger.error(
+                        "batch_order_failed",
+                        token_id=order.token_id,
+                        error=str(e),
+                    )
+                    return OrderResponse(
+                        success=False,
+                        error_msg=str(e),
+                    )
+
+        responses = await asyncio.gather(*[submit_one(o) for o in orders])
         logger.info("orders_batch_created", count=len(orders), success=sum(1 for r in responses if r.success))
-        return responses
+        return list(responses)
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         """Cancel a single order by ID.

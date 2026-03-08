@@ -88,11 +88,10 @@ class V1Bridge:
             "details": [],
         }
 
-        if not self.shadow_mode:
-            raise NotImplementedError(
-                "V1 bridge live execution not implemented. "
-                "PMM-2 must run in shadow_mode=True until bridge methods are wired to V1 order manager. "
-                "Set pmm2.shadow_mode=true in config."
+        if not self.shadow_mode and not self.order_manager:
+            raise RuntimeError(
+                "V1 bridge live mode requires order_manager. "
+                "Set shadow_mode=True or provide order_manager."
             )
 
         if not mutations:
@@ -181,6 +180,8 @@ class V1Bridge:
     async def _execute_add(self, mutation: OrderMutation) -> bool:
         """Execute an 'add' mutation via V1 order manager.
 
+        Creates a signed order through V1's CLOB private client.
+
         Args:
             mutation: OrderMutation with action="add"
 
@@ -192,26 +193,34 @@ class V1Bridge:
             return False
 
         try:
-            # V1 order manager should have a method like:
-            # await self.order_manager.place_order(
-            #     token_id=mutation.token_id,
-            #     side=mutation.side,
-            #     price=mutation.price,
-            #     size=mutation.size,
-            # )
-            #
-            # For now, we'll log that we would call it
+            from pmm1.api.clob_private import CreateOrderRequest, OrderType
+
+            req = CreateOrderRequest(
+                token_id=mutation.token_id,
+                price=str(mutation.price),
+                size=str(mutation.size),
+                side=mutation.side,
+                order_type=OrderType.GTC,
+                neg_risk=False,
+            )
+            # Use V1 order manager's _clob client for submission
+            clob = getattr(self.order_manager, "_clob", None)
+            if not clob:
+                logger.error("order_manager_missing_clob_client")
+                return False
+
+            resp = await clob.create_order(req)
+            success = resp.success if resp else False
+
             logger.info(
                 "v1_order_add",
                 token_id=mutation.token_id,
                 side=mutation.side,
                 price=mutation.price,
                 size=mutation.size,
+                success=success,
             )
-
-            # TODO: Integrate with actual V1 order manager when available
-            # This is a placeholder for the integration point
-            return True
+            return success
 
         except Exception as e:
             logger.error("v1_order_add_failed", error=str(e))
@@ -219,6 +228,8 @@ class V1Bridge:
 
     async def _execute_cancel(self, mutation: OrderMutation) -> bool:
         """Execute a 'cancel' mutation via V1 order manager.
+
+        Cancels an order through V1's CLOB private client.
 
         Args:
             mutation: OrderMutation with action="cancel"
@@ -231,12 +242,20 @@ class V1Bridge:
             return False
 
         try:
-            # V1 order manager should have a method like:
-            # await self.order_manager.cancel_order(order_id=mutation.order_id)
-            logger.info("v1_order_cancel", order_id=mutation.order_id)
+            clob = getattr(self.order_manager, "_clob", None)
+            if not clob:
+                logger.error("order_manager_missing_clob_client")
+                return False
 
-            # TODO: Integrate with actual V1 order manager
-            return True
+            result = await clob.cancel_order(mutation.order_id)
+            success = bool(result)
+
+            logger.info(
+                "v1_order_cancel",
+                order_id=mutation.order_id,
+                success=success,
+            )
+            return success
 
         except Exception as e:
             logger.error("v1_order_cancel_failed", error=str(e))
@@ -244,6 +263,8 @@ class V1Bridge:
 
     async def _execute_amend(self, mutation: OrderMutation) -> bool:
         """Execute an 'amend' mutation via V1 order manager.
+
+        Polymarket CLOB doesn't support amend — cancel + re-add.
 
         Args:
             mutation: OrderMutation with action="amend"
@@ -256,21 +277,46 @@ class V1Bridge:
             return False
 
         try:
-            # V1 order manager may support amend, or we might need to cancel+add
-            # await self.order_manager.amend_order(
-            #     order_id=mutation.order_id,
-            #     new_price=mutation.price,
-            #     new_size=mutation.size,
-            # )
+            clob = getattr(self.order_manager, "_clob", None)
+            if not clob:
+                logger.error("order_manager_missing_clob_client")
+                return False
+
+            # Step 1: Cancel existing order
+            if mutation.order_id:
+                try:
+                    await clob.cancel_order(mutation.order_id)
+                except Exception as cancel_err:
+                    logger.warning(
+                        "v1_amend_cancel_failed",
+                        order_id=mutation.order_id,
+                        error=str(cancel_err),
+                    )
+                    # Continue to place new order even if cancel fails
+                    # (order may have already been filled/canceled)
+
+            # Step 2: Place new order at amended price/size
+            from pmm1.api.clob_private import CreateOrderRequest, OrderType
+
+            req = CreateOrderRequest(
+                token_id=mutation.token_id,
+                price=str(mutation.price),
+                size=str(mutation.size),
+                side=mutation.side,
+                order_type=OrderType.GTC,
+                neg_risk=False,
+            )
+            resp = await clob.create_order(req)
+            success = resp.success if resp else False
+
             logger.info(
                 "v1_order_amend",
                 order_id=mutation.order_id,
                 new_price=mutation.price,
                 new_size=mutation.size,
+                success=success,
             )
-
-            # TODO: Integrate with actual V1 order manager
-            return True
+            return success
 
         except Exception as e:
             logger.error("v1_order_amend_failed", error=str(e))

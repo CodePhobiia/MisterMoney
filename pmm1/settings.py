@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import signal
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import structlog
 import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+
+_settings_logger = structlog.get_logger(__name__)
 
 
 class BotConfig(BaseModel):
@@ -355,3 +359,60 @@ def load_settings(
     
     yaml_data["raw_config"] = raw_config
     return Settings(**yaml_data)
+
+
+class SettingsManager:
+    """Manages settings with hot-reload support via SIGHUP."""
+
+    _instance: Settings | None = None
+    _config_path: str = ""
+    _on_reload_callbacks: list[Callable] = []
+
+    @classmethod
+    def load(cls, config_path: str) -> Settings:
+        """Load settings from path and register SIGHUP handler."""
+        cls._config_path = config_path
+        cls._instance = load_settings(config_path)
+        cls._setup_signal_handler()
+        return cls._instance
+
+    @classmethod
+    def _setup_signal_handler(cls) -> None:
+        """Register SIGHUP handler for config hot-reload."""
+        try:
+            def handle_sighup(signum, frame):
+                cls.reload()
+            signal.signal(signal.SIGHUP, handle_sighup)
+        except (OSError, ValueError):
+            # SIGHUP not available on this platform (e.g. Windows)
+            pass
+
+    @classmethod
+    def reload(cls) -> Settings | None:
+        """Reload settings from disk. Called on SIGHUP or manually."""
+        if not cls._config_path:
+            return None
+        try:
+            new_settings = load_settings(cls._config_path)
+            old = cls._instance
+            cls._instance = new_settings
+            _settings_logger.info("config_reloaded", path=cls._config_path)
+            for cb in cls._on_reload_callbacks:
+                try:
+                    cb(old, new_settings)
+                except Exception as e:
+                    _settings_logger.error("config_reload_callback_error", error=str(e))
+            return new_settings
+        except Exception as e:
+            _settings_logger.error("config_reload_failed", error=str(e))
+            return None
+
+    @classmethod
+    def on_reload(cls, callback: Callable) -> None:
+        """Register a callback for config reloads. Signature: (old, new) -> None."""
+        cls._on_reload_callbacks.append(callback)
+
+    @classmethod
+    def current(cls) -> Settings | None:
+        """Get current settings instance."""
+        return cls._instance

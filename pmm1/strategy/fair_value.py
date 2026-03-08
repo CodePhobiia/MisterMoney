@@ -70,14 +70,58 @@ class FairValueModel:
         self._prediction_errors: list[float] = []
         self._max_error_history = 100
 
+    @staticmethod
+    def compute_microprice(
+        best_bid: float, best_ask: float, bid_size: float, ask_size: float
+    ) -> float:
+        """Volume-weighted midpoint — strictly better than simple midpoint for binary markets."""
+        total = bid_size + ask_size
+        if total <= 0:
+            return (best_bid + best_ask) / 2
+        return (best_bid * ask_size + best_ask * bid_size) / total
+
     def compute_fair_value(self, features: FeatureVector) -> FairValueEstimate:
         """Compute fair value from features using logit-space model.
 
         x_t = β_0 + β_1·logit(m_t) + β_2·logit(μ_t) + β_3·I_t
               + β_4·F_t + β_5·R_t + β_6·E_t
         p̂_t = σ(x_t)
+
+        If the model is uncalibrated (default betas), use a microprice blend
+        instead of the identity function (which just returns midpoint).
         """
         cfg = self.config
+
+        # If model is uncalibrated (default betas), use microprice directly
+        if abs(cfg.beta_2) < 1e-6 and abs(cfg.beta_3) < 1e-6:
+            # Uncalibrated model — microprice is strictly better than identity
+            if (
+                features.microprice > 0
+                and features.microprice != features.midpoint
+                and features.midpoint > 0
+            ):
+                # Blend: 70% microprice + 30% midpoint for stability
+                p_hat = 0.7 * features.microprice + 0.3 * features.midpoint
+                p_hat = max(0.001, min(0.999, p_hat))
+
+                haircut = self.compute_haircut(features)
+                confidence = max(0.0, min(1.0, 1.0 - haircut))
+
+                logger.debug(
+                    "fair_value_microprice_blend",
+                    token_id=features.token_id[:16],
+                    fair_value=f"{p_hat:.4f}",
+                    midpoint=f"{features.midpoint:.4f}",
+                    microprice=f"{features.microprice:.4f}",
+                )
+
+                return FairValueEstimate(
+                    fair_value=p_hat,
+                    logit_value=logit(p_hat),
+                    haircut=haircut,
+                    confidence=confidence,
+                    components={"microprice_blend": p_hat},
+                )
 
         # Compute logit-space features
         logit_mid = features.logit_midpoint

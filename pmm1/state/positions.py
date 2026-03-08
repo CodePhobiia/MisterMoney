@@ -27,6 +27,7 @@ class MarketPosition(BaseModel):
     neg_risk: bool = False
     event_id: str = ""
     last_update: float = Field(default_factory=time.time)
+    price_estimated: bool = False  # True if avg_price was estimated (not from fill)
 
     @property
     def net_exposure(self) -> float:
@@ -239,7 +240,9 @@ class PositionTracker:
         return [p for p in self._positions.values() if not p.is_flat]
 
     def reconcile_with_exchange(
-        self, exchange_positions: list[dict[str, Any]]
+        self,
+        exchange_positions: list[dict[str, Any]],
+        price_oracle: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         """Reconcile local positions with exchange data.
         
@@ -290,14 +293,19 @@ class PositionTracker:
                     # so sell logic can manage it.
                     # Use token_id as condition_id (best guess);
                     # also register in token→condition map.
+                    # Use price_oracle (midpoint) if available, else 0.5 (binary default)
+                    estimated_price = (
+                        price_oracle.get(token_id, 0.5) if price_oracle else 0.5
+                    )
                     self._positions[token_id] = MarketPosition(
                         condition_id=token_id,
                         token_id_yes=token_id,
                         token_id_no="",
                         yes_size=exchange_size,
                         no_size=0.0,
-                        yes_avg_price=0.0,  # unknown entry — handled by exit logic
+                        yes_avg_price=estimated_price,
                         no_avg_price=0.0,
+                        price_estimated=True,
                     )
                     self._token_to_condition[token_id] = token_id
                     logger.info("position_auto_adopted",

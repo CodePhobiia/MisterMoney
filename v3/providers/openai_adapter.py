@@ -1,6 +1,7 @@
-"""OpenAI provider adapter (GPT-5.4, GPT-5.4-pro) via Codex OAuth"""
+"""OpenAI provider adapter (GPT-5.4, GPT-5.4-pro) via Codex OAuth + official API fallback"""
 
 import json
+import os
 import time
 from typing import Any
 import aiohttp
@@ -14,18 +15,22 @@ logger = structlog.get_logger(__name__)
 class OpenAIProvider(BaseProvider):
     """
     OpenAI provider using ChatGPT Pro OAuth token (Codex Responses API).
+    Falls back to official OpenAI API (api.openai.com/v1) if available.
     
     Supports:
     - GPT-5.4 (online judge, reasoning: low/medium/high)
     - GPT-5.4-pro (async adjudicator, reasoning: high/xhigh)
     - SSE streaming response parsing
+    - Official API fallback when Codex endpoint fails
     """
     
     API_BASE = "https://chatgpt.com/backend-api/codex"
+    OFFICIAL_API_BASE = "https://api.openai.com/v1"
     
     def __init__(self, config: ProviderConfig, auth_token: str):
         self.config = config
         self.auth_token = auth_token
+        self.official_api_key = os.getenv("OPENAI_API_KEY", "")
         self.session: aiohttp.ClientSession | None = None
         
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -191,20 +196,99 @@ class OpenAIProvider(BaseProvider):
                     provider_state_ref=resp_obj.get("id"),
                 )
                 
-        except aiohttp.ClientResponseError as e:
-            logger.error(
-                "openai_api_error",
-                status=e.status,
-                message=str(e),
-                model=self.config.model,
-            )
-            raise
-        except Exception as e:
-            logger.error(
-                "openai_error",
+        except (aiohttp.ClientResponseError, Exception) as e:
+            logger.warning(
+                "openai_codex_failed_trying_official",
                 error=str(e),
                 model=self.config.model,
+                has_official_key=bool(self.official_api_key),
             )
+            # Fallback to official OpenAI API if key is available
+            if self.official_api_key:
+                return await self._complete_official(
+                    messages, tools, response_format, reasoning_effort, max_tokens
+                )
+            raise
+
+    async def _complete_official(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        response_format: dict | None = None,
+        reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
+    ) -> ProviderResponse:
+        """Fallback completion via official OpenAI API (api.openai.com/v1)."""
+        start_time = time.time()
+        session = await self._get_session()
+
+        body: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+        }
+        if max_tokens:
+            body["max_tokens"] = max_tokens
+        if response_format:
+            body["response_format"] = response_format
+        if tools:
+            body["tools"] = tools
+
+        headers = {
+            "Authorization": f"Bearer {self.official_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        timeout_seconds = self.config.timeout_ms / 1000
+        if "pro" in self.config.model.lower():
+            timeout_seconds = max(timeout_seconds, 120)
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+
+        try:
+            async with session.post(
+                f"{self.OFFICIAL_API_BASE}/chat/completions",
+                headers=headers,
+                json=body,
+                timeout=timeout,
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+                text = ""
+                choices = data.get("choices", [])
+                if choices:
+                    text = choices[0].get("message", {}).get("content", "")
+
+                structured = None
+                if response_format and text:
+                    try:
+                        structured = json.loads(text)
+                    except json.JSONDecodeError:
+                        pass
+
+                usage = data.get("usage", {})
+                input_tokens = usage.get("prompt_tokens", 0)
+                output_tokens = usage.get("completion_tokens", 0)
+                latency_ms = (time.time() - start_time) * 1000
+
+                logger.info(
+                    "openai_official_complete",
+                    model=self.config.model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    latency_ms=latency_ms,
+                )
+
+                return ProviderResponse(
+                    text=text,
+                    structured=structured,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    latency_ms=latency_ms,
+                    cache_hit=False,
+                    model=self.config.model,
+                )
+        except Exception as e:
+            logger.error("openai_official_api_error", error=str(e))
             raise
     
     async def health_check(self) -> bool:

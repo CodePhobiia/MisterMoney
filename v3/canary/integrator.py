@@ -122,36 +122,22 @@ class V3Integrator:
             log.warning("v3_integrator_not_connected", condition_id=condition_id)
             return book_midpoint, metadata
             
-        # Fetch V3 signal from Redis
+        # Fetch V3 signal from Redis (publisher uses redis.set with JSON)
         try:
-            signal_dict = await self._redis.hgetall(f"v3:signal:{condition_id}")
+            signal_json = await self._redis.get(f"v3:signal:{condition_id}")
         except Exception as e:
             metadata["miss_reason"] = "redis_error"
             log.error("v3_redis_fetch_error", condition_id=condition_id, error=str(e))
             return book_midpoint, metadata
             
-        if not signal_dict:
+        if not signal_json:
             metadata["miss_reason"] = "not_available"
             return book_midpoint, metadata
             
-        # Parse signal
+        # Parse signal from JSON (matches publisher's SET format)
         try:
-            signal = FairValueSignal(
-                condition_id=signal_dict["condition_id"],
-                p_calibrated=float(signal_dict["p_calibrated"]),
-                p_low=float(signal_dict["p_low"]),
-                p_high=float(signal_dict["p_high"]),
-                uncertainty=float(signal_dict["uncertainty"]),
-                skew_cents=float(signal_dict["skew_cents"]),
-                hurdle_cents=float(signal_dict["hurdle_cents"]),
-                hurdle_met=signal_dict["hurdle_met"] == "true",
-                route=signal_dict["route"],
-                evidence_ids=signal_dict.get("evidence_ids", "").split(",") if signal_dict.get("evidence_ids") else [],
-                counterevidence_ids=signal_dict.get("counterevidence_ids", "").split(",") if signal_dict.get("counterevidence_ids") else [],
-                models_used=signal_dict.get("models_used", "").split(",") if signal_dict.get("models_used") else [],
-                generated_at=datetime.fromisoformat(signal_dict["generated_at"]),
-            )
-        except (KeyError, ValueError) as e:
+            signal = FairValueSignal.model_validate_json(signal_json)
+        except Exception as e:
             metadata["miss_reason"] = "parse_error"
             log.error("v3_signal_parse_error", condition_id=condition_id, error=str(e))
             return book_midpoint, metadata

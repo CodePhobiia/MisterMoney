@@ -484,9 +484,11 @@ async def run(settings: Settings | None = None) -> None:
             balances = await clob_private.get_balances()
             raw_balance = float(balances.get("balance", 0))
             raw_allowance = float(balances.get("allowance", 0))
-            # CLOB returns raw USDC units (6 decimals) — convert to dollars
-            balance = raw_balance / 1e6 if raw_balance > 1000 else raw_balance
-            allowance = raw_allowance / 1e6 if raw_allowance > 1000 else raw_allowance
+            # USDC has 6 decimals on Polygon.
+            # If raw_balance looks like wei (> 1_000_000), convert to dollars.
+            # Threshold 1M avoids misclassifying $1500 as $0.0015.
+            balance = raw_balance / 1e6 if raw_balance > 1_000_000 else raw_balance
+            allowance = raw_allowance / 1e6 if raw_allowance > 1_000_000 else raw_allowance
             state.inventory_manager.update_balances(balance, allowance)
             logger.info("balances_loaded", balance=f"${balance:.2f}", allowance=f"${allowance:.2f}", raw=raw_balance)
         except Exception as e:
@@ -558,6 +560,24 @@ async def run(settings: Settings | None = None) -> None:
         pmm2_on_order_live, pmm2_on_order_canceled,
     )
     pmm2_runtime = await maybe_init_pmm2(settings, db, state)
+
+    # ── V3 fair value integration (if enabled) ──
+    v3_integrator = None
+    if settings.v3.enabled:
+        try:
+            from v3.canary.integrator import V3Integrator
+            v3_integrator = V3Integrator(
+                redis_url=settings.v3.redis_url,
+                max_skew_cents=settings.v3.max_skew_cents,
+                min_confidence=settings.v3.min_confidence,
+                max_age_seconds=settings.v3.signal_max_age_seconds,
+                enabled=True,
+            )
+            await v3_integrator.connect()
+            logger.info("v3_integrator_initialized")
+        except Exception as e:
+            logger.warning("v3_integrator_init_failed", error=str(e))
+            v3_integrator = None
 
     # ── 8 & 9. Connect WebSockets ──
     all_token_ids = []
@@ -1219,6 +1239,18 @@ async def run(settings: Settings | None = None) -> None:
                     # Fair value
                     fv_estimate = state.fair_value_model.compute_fair_value(features)
                     base_fair_value = fv_estimate.fair_value
+
+                    # V3 fair value integration (if enabled)
+                    if v3_integrator and v3_integrator.enabled:
+                        try:
+                            blended_fv, v3_meta = await v3_integrator.get_blended_fair_value(
+                                md.condition_id, base_fair_value
+                            )
+                            if v3_meta.get("v3_used"):
+                                fv_estimate.fair_value = blended_fv
+                                base_fair_value = blended_fv
+                        except Exception as v3_err:
+                            logger.debug("v3_blend_error", error=str(v3_err))
 
                     # Skip extreme prices — no counterparty flow below 15c or above 85c
                     if base_fair_value < 0.15 or base_fair_value > 0.85:
