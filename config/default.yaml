@@ -13,17 +13,17 @@ wallet:
   chain_id: 137
 
 market_filters:
-  min_time_to_end_hours: 6
+  min_time_to_end_hours: 12
   min_volume_24h_usd: 50000
   max_top_spread_cents: 5
   min_depth_within_2c_shares: 0
   allow_sports: true
   allow_crypto_intraday: false
-  require_clear_rules: false
+  require_clear_rules: true
 
 strategy:
   enable_binary_parity: true
-  enable_neg_risk_arb: true
+  enable_neg_risk_arb: false
   enable_market_making: true
   enable_directional_overlay: false
 
@@ -39,9 +39,10 @@ pricing:
 risk:
   per_market_gross_nav: 0.08
   per_event_cluster_nav: 0.15
-  total_directional_nav: 0.60
-  total_arb_gross_nav: 0.40
+  total_directional_nav: 0.30
+  total_arb_gross_nav: 0.25
   daily_pause_drawdown_nav: 0.015
+  daily_wider_drawdown_nav: 0.025
   daily_flatten_drawdown_nav: 0.04
 
 exit:

@@ -88,6 +88,13 @@ class V1Bridge:
             "details": [],
         }
 
+        if not self.shadow_mode:
+            raise NotImplementedError(
+                "V1 bridge live execution not implemented. "
+                "PMM-2 must run in shadow_mode=True until bridge methods are wired to V1 order manager. "
+                "Set pmm2.shadow_mode=true in config."
+            )
+
         if not mutations:
             logger.debug("execute_mutations_empty")
             return result

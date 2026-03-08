@@ -265,6 +265,7 @@ class OrderManager:
             except Exception as e:
                 results["errors"].append(f"cancel_unexpected: {e}")
                 logger.error("order_cancel_error", error=str(e))
+                return results  # Don't submit if we can't cancel
 
         # 2. Submit new orders
         if diff.to_submit:

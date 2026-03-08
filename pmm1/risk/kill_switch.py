@@ -112,7 +112,7 @@ class KillSwitch:
             self._trigger(
                 KillSwitchReason.STALE_MARKET_FEED,
                 f"No market data for {seconds_since_last_message:.1f}s > {self._ws_stale_kill_s}s",
-                auto_clear_s=30.0,  # Auto-clear after 30s if feed resumes
+                auto_clear_s=120.0,  # Auto-clear after 120s — exchange restarts take ~90s
             )
             return True
         # Clear if feed is back

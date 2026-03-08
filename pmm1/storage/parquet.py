@@ -36,6 +36,7 @@ class ParquetWriter:
     def __init__(self, base_dir: str = "./data/parquet") -> None:
         self._base_dir = Path(base_dir)
         self._buffers: dict[str, list[dict[str, Any]]] = {}
+        self._flush_pending: set[str] = set()
         self._buffer_limits: dict[str, int] = {
             "book_snapshots": 1000,
             "trades": 500,
@@ -68,7 +69,7 @@ class ParquetWriter:
 
         limit = self._buffer_limits.get(data_type, 500)
         if len(self._buffers[data_type]) >= limit:
-            self.flush(data_type)
+            self._flush_pending.add(data_type)  # Mark for async flush
 
     def flush(self, data_type: str | None = None) -> int:
         """Flush buffered records to Parquet files.
@@ -234,6 +235,22 @@ class ParquetWriter:
             "size": size,
             "fee": fee,
         })
+
+    async def flush_async(self, data_type: str | None = None) -> int:
+        """Async wrapper — runs disk I/O in thread pool."""
+        import asyncio
+        return await asyncio.to_thread(self.flush, data_type)
+
+    async def flush_pending(self) -> int:
+        """Flush any pending buffers asynchronously."""
+        if not self._flush_pending:
+            return 0
+        pending = list(self._flush_pending)
+        self._flush_pending.clear()
+        total = 0
+        for dt in pending:
+            total += await self.flush_async(dt)
+        return total
 
     def get_stats(self) -> dict[str, Any]:
         return {

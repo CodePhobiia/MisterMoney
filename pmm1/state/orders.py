@@ -157,9 +157,20 @@ class TrackedOrder(BaseModel):
 
         Logs warnings for invalid transitions but does NOT raise —
         we want to be resilient to out-of-order WS messages.
+        Hard-rejects transitions from terminal states to prevent ghost orders.
         """
         if new_state == self.state:
             return True  # No-op, already in state
+
+        # Hard-reject transitions from terminal states
+        if self.state in TERMINAL_STATES:
+            logger.warning(
+                "rejected_terminal_transition",
+                order_id=self.order_id,
+                from_state=self.state.value,
+                to_state=new_state.value,
+            )
+            return False
 
         valid_next = _VALID_TRANSITIONS.get(self.state, set())
         if new_state not in valid_next:

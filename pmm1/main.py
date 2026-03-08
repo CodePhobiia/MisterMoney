@@ -77,8 +77,41 @@ from pmm1.notifications import send_telegram, format_fill_notification, format_e
 from pmm1.storage.database import Database
 from pmm1.recorder.fill_recorder import FillRecorder
 from pmm1.recorder.book_recorder import BookRecorder
+from collections import OrderedDict
 
 logger: structlog.stdlib.BoundLogger = None  # type: ignore
+
+
+def _task_done_callback(task: asyncio.Task) -> None:
+    """Log exceptions from fire-and-forget tasks."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        structlog.get_logger(__name__).error(
+            "background_task_failed",
+            task_name=task.get_name(),
+            error=str(exc),
+            exc_info=exc,
+        )
+
+
+class _LRUDedup:
+    """LRU-based deduplication to replace clear-all-at-500 set."""
+
+    def __init__(self, maxsize: int = 2000):
+        self._seen: OrderedDict[str, bool] = OrderedDict()
+        self._maxsize = maxsize
+
+    def check_and_add(self, key: str) -> bool:
+        """Returns True if duplicate (already seen)."""
+        if key in self._seen:
+            self._seen.move_to_end(key)
+            return True
+        self._seen[key] = True
+        while len(self._seen) > self._maxsize:
+            self._seen.popitem(last=False)
+        return False
 
 
 class BotState:
@@ -154,6 +187,17 @@ async def run(settings: Settings | None = None) -> None:
     )
     logger = get_logger("pmm1.main")
     logger.info("pmm1_starting", name=settings.bot.name, env=settings.bot.env)
+
+    # ── Risk overcommit validation ──
+    max_possible = settings.bot.max_markets * settings.risk.per_market_gross_nav
+    if max_possible > 0.80:
+        logger.warning(
+            "risk_overcommit_warning",
+            max_markets=settings.bot.max_markets,
+            per_market_pct=settings.risk.per_market_gross_nav,
+            combined_pct=f"{max_possible:.0%}",
+            message="Combined market limits exceed 80% of NAV — reduce max_markets or per_market_gross_nav",
+        )
 
     # ── 1. Geoblock check ──
     try:
@@ -350,6 +394,46 @@ async def run(settings: Settings | None = None) -> None:
                 index=len(state.neg_risk_events[md.event_id]),
             ))
 
+    # ── Enrich event_ids from individual market data ──
+    enriched_event_ids = 0
+    for md in list(state.active_markets.values()):
+        if not md.event_id:
+            try:
+                # Gamma /markets?conditionId=X returns market with nested events array
+                session = await gamma._get_session()
+                url = f"{gamma.base_url}/markets"
+                params = {"conditionId": md.condition_id}
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data and isinstance(data, list) and len(data) > 0:
+                            events = data[0].get("events", [])
+                            if events and isinstance(events, list) and len(events) > 0:
+                                event_id = str(events[0].get("id", ""))
+                                if event_id:
+                                    md.event_id = event_id
+                                    enriched_event_ids += 1
+                                    logger.debug("event_id_enriched", condition_id=md.condition_id[:16], event_id=event_id)
+            except Exception as e:
+                logger.warning("event_id_enrichment_failed", condition_id=md.condition_id[:16], error=str(e))
+
+    # Re-register event groupings for any newly enriched event_ids
+    for md in state.active_markets.values():
+        if md.neg_risk and md.event_id and md.event_id not in state.neg_risk_events:
+            state.neg_risk_events[md.event_id] = []
+            # Find all markets with this event_id
+            for other_md in state.active_markets.values():
+                if other_md.event_id == md.event_id and other_md.neg_risk:
+                    state.neg_risk_events[md.event_id].append(NegRiskOutcome(
+                        condition_id=other_md.condition_id,
+                        token_id_yes=other_md.token_id_yes,
+                        token_id_no=other_md.token_id_no,
+                        index=len(state.neg_risk_events[md.event_id]),
+                    ))
+
+    if enriched_event_ids:
+        logger.info("event_ids_enriched", count=enriched_event_ids)
+
     # Count reward-eligible markets (S0-5)
     reward_eligible_count = sum(1 for md in state.active_markets.values() if md.reward_eligible)
     logger.info(
@@ -502,8 +586,8 @@ async def run(settings: Settings | None = None) -> None:
             logger.info("post_reconnect_reconciliation")
             await reconciler.full_reconciliation()
 
-    # Track notified fills to prevent duplicate notifications
-    _notified_fills: set[str] = set()
+    # Track notified fills to prevent duplicate notifications (LRU dedup)
+    _fill_dedup = _LRUDedup(maxsize=2000)
 
     async def on_fill(msg: dict[str, Any]) -> None:
         """Callback when a fill/trade is received from UserWebSocket."""
@@ -533,12 +617,8 @@ async def run(settings: Settings | None = None) -> None:
             
             # ── GATE 2: Deduplicate (WS replays the same fill multiple times) ──
             fill_key = f"{order_id}:{size}:{price}"
-            if fill_key in _notified_fills:
+            if _fill_dedup.check_and_add(fill_key):
                 return
-            _notified_fills.add(fill_key)
-            # Cap set size to prevent memory leak
-            if len(_notified_fills) > 500:
-                _notified_fills.clear()
             
             # Find market info for this token
             market_question = ""
@@ -583,7 +663,7 @@ async def run(settings: Settings | None = None) -> None:
                 book = state.book_manager.get(token_id)
                 mid_at_fill = book.get_midpoint() if book else None
                 
-                asyncio.create_task(
+                _t = asyncio.create_task(
                     fill_recorder.record_fill(
                         ts=datetime.now(timezone.utc),
                         condition_id=condition_id,
@@ -598,6 +678,7 @@ async def run(settings: Settings | None = None) -> None:
                         reward_eligible=reward_eligible,
                     )
                 )
+                _t.add_done_callback(_task_done_callback)
             
             # Compute PnL for SELL fills
             pnl_text = ""
@@ -626,7 +707,8 @@ async def run(settings: Settings | None = None) -> None:
                 f"{pnl_text}"
                 f"{market_line}"
             )
-            asyncio.create_task(send_telegram(notification))
+            _t = asyncio.create_task(send_telegram(notification))
+            _t.add_done_callback(_task_done_callback)
             
             # Record fill for escalation ladder
             if hasattr(state, 'fill_escalator'):
@@ -770,6 +852,7 @@ async def run(settings: Settings | None = None) -> None:
     
     if not paper_mode:
         scoring_check_task = asyncio.create_task(scoring_check_loop())
+        scoring_check_task.add_done_callback(_task_done_callback)
 
     # ── Book snapshot loop (S1-3) ──
     async def book_snapshot_loop() -> None:
@@ -786,17 +869,37 @@ async def run(settings: Settings | None = None) -> None:
                 logger.error("book_snapshot_loop_error", error=str(e))
     
     book_snapshot_task = asyncio.create_task(book_snapshot_loop())
+    book_snapshot_task.add_done_callback(_task_done_callback)
+
+    def _build_price_oracle() -> dict[str, float]:
+        """Build price oracle from current book midpoints for MTM NAV."""
+        oracle = {}
+        for md in state.active_markets.values():
+            for tid in [md.token_id_yes, md.token_id_no]:
+                if not tid:
+                    continue
+                book = state.book_manager.get(tid)
+                if book:
+                    bb = book.get_best_bid()
+                    ba = book.get_best_ask()
+                    if bb and ba:
+                        oracle[tid] = (bb.price_float + ba.price_float) / 2
+                    elif bb:
+                        oracle[tid] = bb.price_float
+                    elif ba:
+                        oracle[tid] = ba.price_float
+        return oracle
 
     # Wait briefly for WS connections to establish
     warmup_s = 5.0 if paper_mode else 2.0
     logger.info("warmup_wait", seconds=warmup_s, paper_mode=paper_mode)
     await asyncio.sleep(warmup_s)
 
-    # Initialize drawdown with current NAV
+    # Initialize drawdown with current NAV (mark-to-market)
     if paper_mode and paper_engine:
         nav = paper_engine.get_nav(state.book_manager)
     else:
-        nav = state.inventory_manager.get_total_nav_estimate()
+        nav = state.inventory_manager.get_total_nav_estimate(price_oracle=_build_price_oracle())
     state.drawdown.initialize(nav)
     state.risk_limits.update_nav(nav)
 
@@ -863,13 +966,13 @@ async def run(settings: Settings | None = None) -> None:
                 if paper_mode and paper_engine:
                     nav = paper_engine.get_nav(state.book_manager)
                 else:
-                    nav = state.inventory_manager.get_total_nav_estimate()
+                    nav = state.inventory_manager.get_total_nav_estimate(price_oracle=_build_price_oracle())
                 state.drawdown.reset_daily(nav)
 
             if paper_mode and paper_engine:
                 nav = paper_engine.get_nav(state.book_manager)
             else:
-                nav = state.inventory_manager.get_total_nav_estimate()
+                nav = state.inventory_manager.get_total_nav_estimate(price_oracle=_build_price_oracle())
             dd_state = state.drawdown.update(nav)
             state.risk_limits.update_nav(nav)
 
@@ -1142,27 +1245,23 @@ async def run(settings: Settings | None = None) -> None:
                         if quote_intent.ask_price:
                             quote_intent.ask_price = max(tick_float, min(1.0 - tick_float, quote_intent.ask_price))
 
-                    # Top-of-book clamp: join the queue, don't sit 5¢ back
+                    # Top-of-book guard: prevent crossing, but respect inventory skew
                     if book is not None:
                         bb = book.get_best_bid()
                         ba = book.get_best_ask()
                         tick_float = float(tick_size)
-                        
-                        # Clamp bid: if more than 1 tick below best bid, raise to best bid
+
+                        # Bid: never go above best bid (would cross/improve)
+                        # But DO allow bid below best bid (inventory skew pushing us back)
                         if bb and quote_intent.bid_price:
                             best_bid_float = bb.price_float
-                            if quote_intent.bid_price < best_bid_float - tick_float:
-                                quote_intent.bid_price = best_bid_float
-                            # Never go above best bid (would cross)
                             if quote_intent.bid_price > best_bid_float:
                                 quote_intent.bid_price = best_bid_float
-                        
-                        # Clamp ask: if more than 1 tick above best ask, lower to best ask
+
+                        # Ask: never go below best ask (would cross/improve)
+                        # But DO allow ask above best ask (inventory skew pushing us back)
                         if ba and quote_intent.ask_price:
                             best_ask_float = ba.price_float
-                            if quote_intent.ask_price > best_ask_float + tick_float:
-                                quote_intent.ask_price = best_ask_float
-                            # Never go below best ask (would cross)
                             if quote_intent.ask_price < best_ask_float:
                                 quote_intent.ask_price = best_ask_float
 
@@ -1513,7 +1612,8 @@ async def run(settings: Settings | None = None) -> None:
                                     price=exit_sig.price,
                                     size=exit_sig.size,
                                 )
-                                asyncio.create_task(send_telegram(notification))
+                                _t = asyncio.create_task(send_telegram(notification))
+                                _t.add_done_callback(_task_done_callback)
                             elif result.get("error"):
                                 logger.warning(
                                     "exit_order_failed",
@@ -1527,75 +1627,96 @@ async def run(settings: Settings | None = None) -> None:
             # ── FILL-SPEED MODE: Taker Bootstrap ──
             # After 20 min with no fills, take liquidity with one small order
             if not paper_mode and order_manager and state.fill_escalator.should_take_liquidity():
-                try:
-                    # Pick highest-scored eligible market
-                    eligible = state.eligible_markets()
-                    if eligible:
-                        # Sort by volume (or use universe scoring if available)
-                        best_market = max(
-                            eligible,
-                            key=lambda m: m.volume_24h_usd if hasattr(m, 'volume_24h_usd') else 0.0
-                        )
-                        
-                        token_id_taker = best_market.token_id_yes
-                        book_taker = state.book_manager.get(token_id_taker)
-                        
-                        if book_taker:
-                            ba_taker = book_taker.get_best_ask()
-                            if ba_taker and ba_taker.price_float > 0:
-                                # Submit small FAK BUY at best ask
-                                taker_size = max(5.0, state.fill_escalator.config.taker_min_shares)
-                                taker_price = ba_taker.price_float
-                                
-                                # Ensure dollar value meets minimum
-                                MIN_DOLLAR = 1.5
-                                if taker_price * taker_size < MIN_DOLLAR:
-                                    taker_size = max(taker_size, MIN_DOLLAR / taker_price)
-                                
-                                tick_taker = state.tick_sizes.get(token_id_taker, Decimal("0.01"))
-                                
-                                taker_req = CreateOrderRequest(
-                                    token_id=token_id_taker,
-                                    price=str(taker_price),
-                                    size=str(taker_size),
-                                    side=OrderSide.BUY,
-                                    order_type=OrderType.FAK,
-                                    neg_risk=best_market.neg_risk,
-                                    post_only=False,
-                                    tick_size=str(tick_taker),
-                                )
-                                
-                                logger.info(
-                                    "taker_bootstrap_submitting",
-                                    token_id=token_id_taker[:16],
-                                    price=taker_price,
-                                    size=taker_size,
-                                    escalation_status=state.fill_escalator.get_status(),
-                                )
-                                
-                                # Submit via order manager (or direct client if needed)
-                                # For FAK orders, we may need to use clob_private directly
-                                # since order_manager expects GTC/GTD for diff_and_apply
-                                try:
-                                    resp = await clob_private.create_order(taker_req)
-                                    if resp and resp.success:
+                taker_blocked = False
+                # Risk checks before taker bootstrap
+                if state.kill_switch.is_triggered:
+                    logger.info("taker_bootstrap_blocked_kill_switch")
+                    taker_blocked = True
+                elif dd_state.should_pause_taker:
+                    logger.info("taker_bootstrap_blocked_drawdown")
+                    taker_blocked = True
+
+                if not taker_blocked:
+                    try:
+                        # Pick highest-scored eligible market
+                        eligible = state.eligible_markets()
+                        if eligible:
+                            # Sort by volume (or use universe scoring if available)
+                            best_market = max(
+                                eligible,
+                                key=lambda m: m.volume_24h_usd if hasattr(m, 'volume_24h_usd') else 0.0
+                            )
+
+                            token_id_taker = best_market.token_id_yes
+                            book_taker = state.book_manager.get(token_id_taker)
+
+                            if book_taker:
+                                ba_taker = book_taker.get_best_ask()
+                                if ba_taker and ba_taker.price_float > 0:
+                                    # Submit small FAK BUY at best ask
+                                    taker_size = max(5.0, state.fill_escalator.config.taker_min_shares)
+                                    taker_price = ba_taker.price_float
+
+                                    # Ensure dollar value meets minimum
+                                    MIN_DOLLAR = 1.5
+                                    if taker_price * taker_size < MIN_DOLLAR:
+                                        taker_size = max(taker_size, MIN_DOLLAR / taker_price)
+
+                                    # Per-market risk check
+                                    market_cost = taker_price * taker_size
+                                    market_exposure = 0.0
+                                    pos = state.position_tracker.get(best_market.condition_id)
+                                    if pos:
+                                        market_exposure = pos.gross_exposure if hasattr(pos, 'gross_exposure') else (pos.yes_size * pos.yes_avg_price + pos.no_size * pos.no_avg_price)
+                                    taker_nav = state.inventory_manager.get_total_nav_estimate(price_oracle=_build_price_oracle())
+                                    if taker_nav > 0 and (market_exposure + market_cost) / taker_nav > settings.risk.per_market_gross_nav:
+                                        logger.info("taker_bootstrap_blocked_risk_limit",
+                                                    market_exposure=f"{market_exposure:.2f}",
+                                                    market_cost=f"{market_cost:.2f}",
+                                                    nav=f"{taker_nav:.2f}")
+                                        taker_blocked = True
+
+                                    if not taker_blocked:
+                                        tick_taker = state.tick_sizes.get(token_id_taker, Decimal("0.01"))
+
+                                        taker_req = CreateOrderRequest(
+                                            token_id=token_id_taker,
+                                            price=str(taker_price),
+                                            size=str(taker_size),
+                                            side=OrderSide.BUY,
+                                            order_type=OrderType.FAK,
+                                            neg_risk=best_market.neg_risk,
+                                            post_only=False,
+                                            tick_size=str(tick_taker),
+                                        )
+
                                         logger.info(
-                                            "taker_bootstrap_submitted",
-                                            order_id=resp.order_id[:16] if resp.order_id else "?",
+                                            "taker_bootstrap_submitting",
                                             token_id=token_id_taker[:16],
+                                            price=taker_price,
+                                            size=taker_size,
+                                            escalation_status=state.fill_escalator.get_status(),
                                         )
-                                        # Reset the taker cycle
-                                        state.fill_escalator.reset_taker_cycle()
-                                        orders_submitted += 1
-                                    else:
-                                        logger.warning(
-                                            "taker_bootstrap_failed",
-                                            error=resp.error_msg if resp else "no response",
-                                        )
-                                except Exception as taker_err:
-                                    logger.error("taker_bootstrap_error", error=str(taker_err))
-                except Exception as e:
-                    logger.error("taker_bootstrap_outer_error", error=str(e), exc_info=True)
+
+                                        try:
+                                            resp = await clob_private.create_order(taker_req)
+                                            if resp and resp.success:
+                                                logger.info(
+                                                    "taker_bootstrap_submitted",
+                                                    order_id=resp.order_id[:16] if resp.order_id else "?",
+                                                    token_id=token_id_taker[:16],
+                                                )
+                                                state.fill_escalator.reset_taker_cycle()
+                                                orders_submitted += 1
+                                            else:
+                                                logger.warning(
+                                                    "taker_bootstrap_failed",
+                                                    error=resp.error_msg if resp else "no response",
+                                                )
+                                        except Exception as taker_err:
+                                            logger.error("taker_bootstrap_error", error=str(taker_err))
+                    except Exception as e:
+                        logger.error("taker_bootstrap_outer_error", error=str(e), exc_info=True)
 
             # ── Cycle metrics ──
             cycle_duration = (time.time() - cycle_start) * 1000

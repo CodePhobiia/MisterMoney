@@ -89,58 +89,54 @@ class ExitManager:
         flatten_active = self._is_flatten_active()
 
         for pos in self.positions.get_active_positions():
-            # Determine which token has inventory
-            if pos.yes_size > 0:
-                token_id = pos.token_id_yes
-                inv_size = pos.yes_size
-                avg_price = pos.yes_avg_price
-            elif pos.no_size > 0:
-                token_id = pos.token_id_no
-                inv_size = pos.no_size
-                avg_price = pos.no_avg_price
-            else:
+            # Process both YES and NO sides independently
+            sides_to_check = []
+            if pos.yes_size >= 5.0:
+                sides_to_check.append((pos.token_id_yes, pos.yes_size, pos.yes_avg_price))
+            if pos.no_size >= 5.0:
+                sides_to_check.append((pos.token_id_no, pos.no_size, pos.no_avg_price))
+
+            if not sides_to_check:
                 continue
 
-            if inv_size < 5.0:
-                continue  # Below Polymarket minimum
+            for token_id, inv_size, avg_price in sides_to_check:
+                current_price = self._get_best_bid(token_id)
+                md = active_markets.get(pos.condition_id)
+                is_orphan = pos.condition_id not in active_markets
 
-            current_price = self._get_best_bid(token_id)
-            md = active_markets.get(pos.condition_id)
-            is_orphan = pos.condition_id not in active_markets
+                # 1. FLATTEN (highest priority)
+                if flatten_active:
+                    sig = self._build_flatten_signal(pos, token_id, inv_size, current_price)
+                    if sig:
+                        signals.append(sig)
+                        continue  # Don't stack signals for this side
 
-            # 1. FLATTEN (highest priority)
-            if flatten_active:
-                sig = self._build_flatten_signal(pos, token_id, inv_size, current_price)
-                if sig:
-                    signals.append(sig)
-                    continue  # Don't stack signals
+                # 2. STOP-LOSS
+                if self.config.stop_loss.enabled and avg_price > 0 and current_price is not None:
+                    sig = self._check_stop_loss(pos, token_id, inv_size, avg_price, current_price)
+                    if sig:
+                        signals.append(sig)
+                        continue
 
-            # 2. STOP-LOSS
-            if self.config.stop_loss.enabled and avg_price > 0 and current_price is not None:
-                sig = self._check_stop_loss(pos, token_id, inv_size, avg_price, current_price)
-                if sig:
-                    signals.append(sig)
-                    continue
+                # 3. RESOLUTION
+                if self.config.resolution.enabled and md and md.end_date:
+                    sig = self._check_resolution(pos, token_id, inv_size, md, current_price)
+                    if sig:
+                        signals.append(sig)
+                        continue
 
-            # 3. RESOLUTION
-            if self.config.resolution.enabled and md and md.end_date:
-                sig = self._check_resolution(pos, token_id, inv_size, md, current_price)
-                if sig:
-                    signals.append(sig)
-                    continue
+                # 4. TAKE-PROFIT
+                if self.config.take_profit.enabled and avg_price > 0 and current_price is not None:
+                    sig = self._check_take_profit(pos, token_id, inv_size, avg_price, current_price, now)
+                    if sig:
+                        signals.append(sig)
+                        continue
 
-            # 4. TAKE-PROFIT
-            if self.config.take_profit.enabled and avg_price > 0 and current_price is not None:
-                sig = self._check_take_profit(pos, token_id, inv_size, avg_price, current_price, now)
-                if sig:
-                    signals.append(sig)
-                    continue
-
-            # 5. ORPHAN (only check periodically)
-            if is_orphan and now - self._last_orphan_check >= self.config.orphan.check_interval_s:
-                sig = await self._check_orphan(pos, token_id, inv_size, current_price)
-                if sig:
-                    signals.append(sig)
+                # 5. ORPHAN (only check periodically)
+                if is_orphan and now - self._last_orphan_check >= self.config.orphan.check_interval_s:
+                    sig = await self._check_orphan(pos, token_id, inv_size, current_price)
+                    if sig:
+                        signals.append(sig)
 
         # Update orphan check timestamp
         if now - self._last_orphan_check >= self.config.orphan.check_interval_s:

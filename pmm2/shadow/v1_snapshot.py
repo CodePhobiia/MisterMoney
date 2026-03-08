@@ -61,9 +61,9 @@ class V1StateSnapshot:
             nav = V1StateSnapshot._get_nav(bot_state)
             snapshot["nav"] = nav
 
-            # Get active orders
+            # Get active orders (list() creates immediate copy for atomic snapshot)
             if hasattr(bot_state, "order_tracker"):
-                active_orders = bot_state.order_tracker.get_active_orders(token_id=None)
+                active_orders = list(bot_state.order_tracker.get_active_orders(token_id=None))
 
                 for order in active_orders:
                     # Extract order details
@@ -97,9 +97,9 @@ class V1StateSnapshot:
                     else:  # SELL
                         snapshot["total_capital_deployed"] += size * (1 - price)
 
-            # Get positions
+            # Get positions (list() creates immediate copy for atomic snapshot)
             if hasattr(bot_state, "position_tracker"):
-                positions = bot_state.position_tracker.get_active_positions()
+                positions = list(bot_state.position_tracker.get_active_positions())
 
                 for pos in positions:
                     pos_dict = {

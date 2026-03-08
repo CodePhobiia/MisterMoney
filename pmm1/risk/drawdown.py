@@ -140,10 +140,10 @@ class DrawdownGovernor:
         # Daily PnL
         self._state.daily_pnl = current_nav - self._state.day_start_nav
 
-        # Drawdown from day start (as percentage of starting NAV)
-        if self._state.day_start_nav > 0:
+        # Drawdown from high-water mark (as percentage of peak NAV)
+        if self._state.daily_high_watermark > 0:
             self._state.drawdown_pct = (
-                (self._state.day_start_nav - current_nav) / self._state.day_start_nav
+                (self._state.daily_high_watermark - current_nav) / self._state.daily_high_watermark
             )
         else:
             self._state.drawdown_pct = 0.0
