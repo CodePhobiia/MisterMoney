@@ -141,8 +141,11 @@ class BotState:
         self.fill_escalator = FillEscalator(settings.exit.fill_escalation)
 
         # Risk
+        from pmm1.risk.correlation import ThematicCorrelation
+        self.correlation = ThematicCorrelation(per_theme_nav=0.15)
         self.risk_limits = RiskLimits(
-            settings.risk, self.position_tracker, self.inventory_manager
+            settings.risk, self.position_tracker, self.inventory_manager,
+            correlation=self.correlation,
         )
         self.kill_switch = KillSwitch(
             ws_stale_kill_s=settings.execution.ws_stale_kill_s,
@@ -535,6 +538,7 @@ async def run(settings: Settings | None = None) -> None:
             reconcile_orders_s=settings.bot.reconcile_orders_s,
             reconcile_positions_s=settings.bot.reconcile_positions_s,
         )
+        reconciler.set_kill_switch(state.kill_switch)
 
     # ── Initialize ExitManager ──
     exit_manager = ExitManager(
@@ -547,6 +551,18 @@ async def run(settings: Settings | None = None) -> None:
 
     recorder = LiveRecorder()
     parquet_writer = ParquetWriter(settings.storage.parquet_dir)
+
+    # ── Wire alert callbacks (T1-12 wiring) ──
+    from pmm1.notifications import send_critical_alert, send_warning_alert
+
+    async def _on_kill_switch(reason: str, message: str) -> None:
+        await send_critical_alert("KILL SWITCH", f"{reason}: {message}")
+
+    async def _on_drawdown_tier(old_tier, new_tier, dd_pct: float) -> None:
+        await send_warning_alert("DRAWDOWN", f"{old_tier}→{new_tier}, DD: {dd_pct:.1f}%")
+
+    state.kill_switch.set_on_trigger(_on_kill_switch)
+    state.drawdown.set_on_tier_change(_on_drawdown_tier)
 
     # ── Initialize PMM-2 data collection (Sprint 1) ──
     db = Database("data/pmm1.db")
@@ -663,9 +679,7 @@ async def run(settings: Settings | None = None) -> None:
                 market=market_question[:40] if market_question else "?",
             )
             
-            # Compute actual fee from fee_rate
-            fee_rate = settings.pricing.base_half_spread_cents  # Not the right field
-            # Use the market's fee_rate if available, otherwise default 0.2%
+            # Compute actual fee from market's fee_rate, default 0.2%
             market_md = state.active_markets.get(condition_id) if condition_id else None
             if market_md and hasattr(market_md, 'fee_rate') and market_md.fee_rate > 0:
                 fee = price * size * market_md.fee_rate

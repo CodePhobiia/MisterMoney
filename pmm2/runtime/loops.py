@@ -304,9 +304,17 @@ class PMM2Runtime:
                 # 0. Capture V1 state snapshot (for shadow mode comparison)
                 v1_snapshot = V1StateSnapshot.capture(bot_state)
                 
-                # 1. Score all markets in universe
+                # 1. Enrich depth from V1 book snapshots, then score
                 all_bundles = []
                 for market in self.enriched_universe:
+                    # Populate depth_at_best from V1 book (T1-01 wiring)
+                    if hasattr(bot_state, 'book_manager'):
+                        book = bot_state.book_manager.get(market.token_id_yes)
+                        if book:
+                            bb = book.get_best_bid()
+                            ba = book.get_best_ask()
+                            market.depth_at_best_bid = bb.size if bb else 0.0
+                            market.depth_at_best_ask = ba.size if ba else 0.0
                     bundles = await self.scorer.score_market(market, self.nav)
                     all_bundles.extend(bundles)
 
