@@ -1,4 +1,3 @@
-import os
 """Shadow dashboard — generates Telegram status reports.
 
 Produces human-readable summaries of shadow mode performance:
@@ -11,6 +10,8 @@ Produces human-readable summaries of shadow mode performance:
 """
 
 from __future__ import annotations
+
+import os
 
 import structlog
 

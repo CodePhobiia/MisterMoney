@@ -79,6 +79,18 @@ Value: ${dollar_value:.2f}
 Token: {token_id[:16]}..."""
 
 
+async def send_critical_alert(event_type: str, details: str) -> None:
+    """Send a critical alert via Telegram."""
+    message = f"🚨 *CRITICAL: {event_type}*\n{details}"
+    await send_telegram(message)
+
+
+async def send_warning_alert(event_type: str, details: str) -> None:
+    """Send a warning alert via Telegram."""
+    message = f"⚠️ *WARNING: {event_type}*\n{details}"
+    await send_telegram(message)
+
+
 def format_exit_notification(
     exit_type: str,
     token_id: str,

@@ -18,6 +18,7 @@ from __future__ import annotations
 import structlog
 from pydantic import BaseModel
 
+from pmm1.risk.correlation import ThematicCorrelation
 from pmm1.settings import RiskConfig
 from pmm1.state.inventory import InventoryManager
 from pmm1.state.positions import PositionTracker
@@ -42,10 +43,12 @@ class RiskLimits:
         config: RiskConfig,
         position_tracker: PositionTracker,
         inventory_manager: InventoryManager,
+        correlation: ThematicCorrelation | None = None,
     ) -> None:
         self.config = config
         self.positions = position_tracker
         self.inventory = inventory_manager
+        self.correlation = correlation
         self._nav: float = 0.0
         # Dynamic multiplier (1.0 = normal, <1.0 = tighter)
         self._dynamic_multiplier: float = 1.0
@@ -218,6 +221,20 @@ class RiskLimits:
                     logger.warning("risk_zeroed_bid", condition_id=intent.condition_id[:16], reason="per_market_gross")
                 elif intent.bid_price and intent.bid_price > 0:
                     intent.bid_size = min(intent.bid_size, max_add / intent.bid_price)
+
+            # Theme correlation check (buys only)
+            if self.correlation and intent.bid_size and intent.bid_size > 0:
+                bid_dollar = (intent.bid_size or 0) * (intent.bid_price or 0)
+                theme_passed, theme_max = self.correlation.check_theme_limit(
+                    intent.condition_id, bid_dollar, self._nav, self.positions,
+                )
+                if not theme_passed:
+                    if theme_max <= 0:
+                        intent.bid_size = 0
+                        intent.bid_price = None
+                        logger.warning("risk_zeroed_bid", condition_id=intent.condition_id[:16], reason="theme_correlation")
+                    elif intent.bid_price and intent.bid_price > 0:
+                        intent.bid_size = min(intent.bid_size, theme_max / intent.bid_price)
 
             # Event cluster check (buys only)
             if event_id and intent.bid_size and intent.bid_size > 0:

@@ -67,6 +67,11 @@ class Reconciler:
         self._task: asyncio.Task | None = None
         self._reconcile_count: int = 0
         self._mismatch_count: int = 0
+        self._kill_switch = None  # Set via set_kill_switch()
+
+    def set_kill_switch(self, kill_switch) -> None:
+        """Set the kill switch for escalation on persistent mismatches."""
+        self._kill_switch = kill_switch
 
     async def reconcile_orders(self) -> ReconciliationResult:
         """Reconcile local order state with exchange open orders."""
@@ -102,6 +107,11 @@ class Reconciler:
                     missing_count=len(missing),
                     total_mismatches=self._mismatch_count,
                 )
+                # Escalate to kill switch after 3+ consecutive mismatches
+                if self._mismatch_count >= 3 and self._kill_switch:
+                    self._kill_switch.report_reconciliation_mismatch(
+                        f"orders: {len(unknown)} unknown, {len(missing)} missing"
+                    )
             else:
                 logger.debug(
                     "order_reconciliation_clean",

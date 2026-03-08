@@ -391,8 +391,12 @@ class OrderManager:
 
         sell_price = max(tick_float, sell_price)  # Don't go below min tick
 
-        # Round to valid tick
-        sell_price_d = round_bid(sell_price, tick_size)
+        # Round to valid tick — for normal/medium urgency round UP (better proceeds),
+        # for critical/high urgency round DOWN (fill speed priority)
+        if urgency in ("critical", "high"):
+            sell_price_d = round_bid(sell_price, tick_size)
+        else:
+            sell_price_d = round_ask(sell_price, tick_size)
         sell_size_d = round_size(size)
         sell_price_str = price_to_string(sell_price_d)
         sell_size_str = str(sell_size_d)

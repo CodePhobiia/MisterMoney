@@ -60,6 +60,7 @@ class MarketWebSocket:
         self._ws: WebSocketClientProtocol | None = None
         self._subscribed_assets: set[str] = set()
         self._is_running = False
+        self._reconnecting = False
         self._task: asyncio.Task | None = None
         self._last_message_ts: float = 0.0
         self._message_count: int = 0
@@ -81,6 +82,11 @@ class MarketWebSocket:
     @property
     def is_connected(self) -> bool:
         return self._ws_is_open()
+
+    @property
+    def is_reconnecting(self) -> bool:
+        """True while reconnect + resubscribe is in progress."""
+        return self._reconnecting
 
     @property
     def seconds_since_last_message(self) -> float:
@@ -281,15 +287,25 @@ class MarketWebSocket:
 
         while self._is_running:
             try:
+                self._reconnecting = True
                 await self.connect()
                 delay = self._reconnect_delay  # Reset on successful connect
 
                 # Resubscribe to all assets
+                # Don't clear before success — if subscribe fails, we retain
+                # the list for the next reconnect attempt.
                 if self._subscribed_assets:
                     assets = list(self._subscribed_assets)
-                    self._subscribed_assets.clear()  # Will be re-added by subscribe()
-                    await self.subscribe(assets)
+                    try:
+                        self._subscribed_assets.clear()
+                        await self.subscribe(assets)
+                    except Exception as e:
+                        # Restore subscription set on failure
+                        self._subscribed_assets.update(assets)
+                        logger.error("resubscribe_failed", error=str(e))
+                        raise
 
+                self._reconnecting = False
                 await self._listen_loop()
 
             except Exception as e:

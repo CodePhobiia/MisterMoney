@@ -83,4 +83,7 @@ async def compute_toxicity(
         weighted=weighted_markout,
     )
 
-    return weighted_markout
+    # Floor at zero — negative toxicity (favorable selection) should not
+    # inflate EV; it's an unreliable signal that turns structural cost
+    # into phantom revenue.
+    return max(0.0, weighted_markout)

@@ -53,13 +53,15 @@ class V1StateSnapshot:
             "scoring_count": 0,
             "reward_eligible_count": 0,
             "total_capital_deployed": 0.0,
-            "nav": 100.0,  # Default fallback
+            "nav": 0.0,  # No synthetic fallback
+            "nav_valid": False,
         }
 
         try:
             # Get NAV (net asset value)
             nav = V1StateSnapshot._get_nav(bot_state)
             snapshot["nav"] = nav
+            snapshot["nav_valid"] = nav > 0
 
             # Get active orders (list() creates immediate copy for atomic snapshot)
             if hasattr(bot_state, "order_tracker"):
@@ -159,9 +161,9 @@ class V1StateSnapshot:
         if hasattr(bot_state, "total_equity"):
             return float(bot_state.total_equity)
 
-        # Fallback to a default
-        logger.warning("nav_not_available_using_default")
-        return 100.0
+        # No fallback — return 0.0 and let callers mark the cycle invalid
+        logger.warning("nav_not_available_returning_zero")
+        return 0.0
 
     @staticmethod
     def summarize(snapshot: dict[str, Any]) -> str:

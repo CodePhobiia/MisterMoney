@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import time
 import base64
 from typing import Any
@@ -26,13 +27,19 @@ class GoogleProvider(BaseProvider):
     API_BASE = "https://cloudcode-pa.googleapis.com"
     TOKEN_URL = "https://oauth2.googleapis.com/token"
     
-    # OAuth credentials from @mariozechner/pi-ai package
-    CLIENT_ID = base64.b64decode(
-        "NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t"
-    ).decode()
-    CLIENT_SECRET = base64.b64decode(
-        "R09DU1BYLTR1SGdNUG0tMW83U2stZ2VWNkN1NWNsWEZzeGw="
-    ).decode()
+    # OAuth credentials — read from env vars, with encoded defaults as fallback
+    CLIENT_ID = os.getenv(
+        "GOOGLE_CCA_CLIENT_ID",
+        base64.b64decode(
+            "NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t"
+        ).decode(),
+    )
+    CLIENT_SECRET = os.getenv(
+        "GOOGLE_CCA_CLIENT_SECRET",
+        base64.b64decode(
+            "R09DU1BYLTR1SGdNUG0tMW83U2stZ2VWNkN1NWNsWEZzeGw="
+        ).decode(),
+    )
     
     def __init__(
         self,

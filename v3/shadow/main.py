@@ -9,6 +9,7 @@ Signals are logged but never affect V1 execution.
 """
 
 import asyncio
+import os
 import signal
 import sys
 from datetime import datetime, time, timedelta
@@ -30,7 +31,7 @@ log = structlog.get_logger()
 
 # Shadow mode configuration
 CONFIG = {
-    "db_dsn": "postgresql://mmbot:mmbot_v3_2026@localhost/mistermoney_v3",
+    "db_dsn": os.getenv("V3_DB_DSN", "postgresql://mmbot:mmbot_v3_2026@localhost/mistermoney_v3"),
     "market_limit": 50,  # Top N markets to evaluate per cycle
     "cycle_interval_seconds": 300,  # 5 minutes
     "log_dir": "data/v3/shadow",

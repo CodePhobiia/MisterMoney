@@ -94,6 +94,14 @@ class DrawdownGovernor:
         self.config = config
         self._state = DrawdownState()
         self._day_boundary_hour = 0  # UTC midnight
+        self._on_tier_change = None  # Optional async callback
+
+    def set_on_tier_change(self, callback) -> None:
+        """Set an optional callback invoked when drawdown tier changes.
+
+        Callback signature: async def cb(old_tier: str, new_tier: str, dd_pct: float) -> None
+        """
+        self._on_tier_change = callback
 
     @property
     def state(self) -> DrawdownState:
@@ -173,6 +181,16 @@ class DrawdownGovernor:
                 daily_pnl=f"{self._state.daily_pnl:.2f}",
                 nav=f"{current_nav:.2f}",
             )
+
+            # Fire optional notification callback
+            if self._on_tier_change:
+                import asyncio
+                try:
+                    coro = self._on_tier_change(old_tier.value, self._state.tier.value, dd * 100)
+                    if asyncio.iscoroutine(coro):
+                        asyncio.ensure_future(coro)
+                except Exception:
+                    pass  # Don't let notification failures affect drawdown governor
 
         return self._state
 

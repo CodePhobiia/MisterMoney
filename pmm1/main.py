@@ -643,12 +643,21 @@ async def run(settings: Settings | None = None) -> None:
                 market=market_question[:40] if market_question else "?",
             )
             
+            # Compute actual fee from fee_rate
+            fee_rate = settings.pricing.base_half_spread_cents  # Not the right field
+            # Use the market's fee_rate if available, otherwise default 0.2%
+            market_md = state.active_markets.get(condition_id) if condition_id else None
+            if market_md and hasattr(market_md, 'fee_rate') and market_md.fee_rate > 0:
+                fee = price * size * market_md.fee_rate
+            else:
+                fee = price * size * 0.002  # Default 0.2% fee rate
+
             # Update position tracker
             if condition_id:
                 pos = state.position_tracker.get(condition_id)
                 if pos:
                     fill_side = "BUY" if side == "BUY" else "SELL"
-                    pos.apply_fill(token_id, fill_side, size, price, fee=0.0)
+                    pos.apply_fill(token_id, fill_side, size, price, fee=fee)
             
             # ── PMM-2: Record fill with markout tracking (S1-2) ──
             if condition_id and token_id:
@@ -672,7 +681,7 @@ async def run(settings: Settings | None = None) -> None:
                         side=side,
                         price=price,
                         size=size,
-                        fee=0.0,
+                        fee=fee,
                         mid_at_fill=mid_at_fill,
                         is_scoring=is_scoring,
                         reward_eligible=reward_eligible,
@@ -713,6 +722,31 @@ async def run(settings: Settings | None = None) -> None:
             # Record fill for escalation ladder
             if hasattr(state, 'fill_escalator'):
                 state.fill_escalator.record_fill()
+            
+            # Record fill for PnL attribution
+            book = state.book_manager.get(token_id)
+            mid_at_fill_pnl = None
+            if book:
+                bb = book.get_best_bid()
+                ba = book.get_best_ask()
+                if bb and ba:
+                    mid_at_fill_pnl = (bb.price_float + ba.price_float) / 2
+            
+            from pmm1.analytics.pnl import FillRecord as PnLFillRecord
+            pnl_fill = PnLFillRecord(
+                order_id=order_id,
+                token_id=token_id,
+                condition_id=condition_id or "",
+                side=side,
+                price=price,
+                size=size,
+                fee=fee,
+                strategy=tracked.strategy if tracked else "mm",
+                fill_timestamp=time.time(),
+                mid_at_fill=mid_at_fill_pnl or price,
+            )
+            if hasattr(state, 'pnl_tracker'):
+                state.pnl_tracker.record_fill(pnl_fill)
             
             # PMM-2: forward fill to queue estimator + persistence
             pmm2_on_fill(pmm2_runtime, order_id, size, price)

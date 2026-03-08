@@ -44,6 +44,10 @@ class EnrichedMarket(BaseModel):
     volume_24h: float = 0.0
     liquidity: float = 0.0
 
+    # Book depth at best price levels (for queue estimation)
+    depth_at_best_bid: float = 0.0
+    depth_at_best_ask: float = 0.0
+
     # Reward info
     reward_eligible: bool = False
     reward_daily_rate: float = 0.0

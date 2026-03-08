@@ -142,10 +142,26 @@ class FillCalibrator:
                 actual_rate = stats["rate"]
                 placed = stats["placed"]
                 
-                # Estimate predicted probability (simplified - assume 30s horizon)
-                # In practice, we'd need to fetch queue_state snapshots for accurate P^fill
-                # For now, use a heuristic based on price bucket
-                predicted_rate = 0.5  # Placeholder - should compute from fill_hazard
+                # Compute predicted fill probability from hazard model
+                # for this price level using a 30s horizon baseline
+                if fill_hazard and hasattr(fill_hazard, 'fill_probability'):
+                    # Use condition_id to look up depletion rate if available
+                    _dr = fill_hazard.default_depletion_rate
+                    if hasattr(fill_hazard, 'depletion_rates') and fill_hazard.depletion_rates:
+                        # Try to find a depletion rate for any token in this market
+                        for _tid, _rate in fill_hazard.depletion_rates.items():
+                            if _rate > 0:
+                                _dr = _rate
+                                break
+                    predicted_rate = fill_hazard.fill_probability(
+                        queue_ahead=0.0,  # Assume front of queue for baseline
+                        order_size=1.0,
+                        horizon_sec=30.0,
+                        depletion_rate=_dr,
+                    )
+                    predicted_rate = max(predicted_rate, 0.001)  # Avoid division by zero
+                else:
+                    predicted_rate = 0.5  # True fallback only if no hazard model
                 
                 total_samples += placed
                 sum_actual += actual_rate * placed

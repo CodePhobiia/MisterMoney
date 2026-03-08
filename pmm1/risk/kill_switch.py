@@ -64,6 +64,14 @@ class KillSwitch:
         self._trigger_history: list[KillSwitchEvent] = []
         self._auth_failure_count = 0
         self._reconciliation_mismatch_count = 0
+        self._on_trigger = None  # Optional async callback on trigger
+
+    def set_on_trigger(self, callback) -> None:
+        """Set an optional callback invoked on every trigger event.
+
+        Callback signature: async def cb(reason: str, message: str) -> None
+        """
+        self._on_trigger = callback
 
     @property
     def is_triggered(self) -> bool:
@@ -93,6 +101,16 @@ class KillSwitch:
             message=message,
             active_reasons=[r.value for r in self._active_reasons],
         )
+
+        # Fire optional notification callback
+        if self._on_trigger:
+            import asyncio
+            try:
+                coro = self._on_trigger(reason.value, message)
+                if asyncio.iscoroutine(coro):
+                    asyncio.ensure_future(coro)
+            except Exception:
+                pass  # Don't let notification failures affect kill switch
 
     def _check_auto_clear(self) -> None:
         """Clear expired auto-clear events."""

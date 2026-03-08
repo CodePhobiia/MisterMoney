@@ -75,11 +75,10 @@ class MarketEVScorer:
         depletion_bid = self.fill_hazard.get_depletion_rate(market.token_id_yes)
         depletion_ask = self.fill_hazard.get_depletion_rate(market.token_id_no)
 
-        # Estimate queue ahead (rough proxy: visible depth at price level)
-        # For now, assume we're at the front (queue_ahead = 0)
-        # In practice, this would come from QueueEstimator
-        queue_ahead_bid = 0.0
-        queue_ahead_ask = 0.0
+        # Estimate queue ahead from visible book depth at our price level.
+        # For a new order, all visible depth at or better than our price is "ahead".
+        queue_ahead_bid = max(market.depth_at_best_bid - bundle.bid_size, 0.0)
+        queue_ahead_ask = max(market.depth_at_best_ask - bundle.ask_size, 0.0)
 
         fill_prob_bid = self.fill_hazard.fill_probability(
             queue_ahead=queue_ahead_bid,
