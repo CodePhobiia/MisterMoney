@@ -55,7 +55,7 @@ from pmm1.settings import Settings, load_settings
 from pmm1.state.books import BookManager
 from pmm1.state.heartbeats import HeartbeatState
 from pmm1.state.inventory import InventoryManager
-from pmm1.state.orders import OrderTracker
+from pmm1.state.orders import OrderTracker, zero_lifecycle_counts
 from pmm1.state.positions import PositionTracker
 from pmm1.storage.parquet import ParquetWriter
 from pmm1.strategy.binary_parity import BinaryParityDetector
@@ -985,6 +985,7 @@ async def run(settings: Settings | None = None) -> None:
     cycle_count = 0
     quote_interval = settings.bot.quote_cycle_ms / 1000.0
     last_rebate_check = 0.0  # S0-3: track last rebate check time
+    summary_lifecycle_counts = zero_lifecycle_counts()
 
     try:
         while not shutdown_event.is_set():
@@ -1115,6 +1116,11 @@ async def run(settings: Settings | None = None) -> None:
             markets_quoted = 0
             orders_submitted = 0
             orders_canceled = 0
+            cycle_lifecycle_baseline = (
+                state.order_tracker.snapshot_lifecycle_counts()
+                if not paper_mode
+                else None
+            )
 
             for md in state.eligible_markets():
                 # Skip if resolution risk says stop
@@ -1446,11 +1452,9 @@ async def run(settings: Settings | None = None) -> None:
                             orders_submitted += (1 if quote_intent.has_bid else 0) + (1 if quote_intent.has_ask else 0)
                             markets_quoted += 1
                         elif order_manager:
-                            result = await order_manager.diff_and_apply(
+                            await order_manager.diff_and_apply(
                                 quote_intent, tick_size
                             )
-                            orders_submitted += result.get("submitted", 0)
-                            orders_canceled += result.get("canceled", 0)
                             markets_quoted += 1
 
                         # Record for backtest
@@ -1634,11 +1638,9 @@ async def run(settings: Settings | None = None) -> None:
                                         )
                                         orders_submitted += (1 if quote_intent_no.has_bid else 0) + (1 if quote_intent_no.has_ask else 0)
                                     elif order_manager:
-                                        result_no = await order_manager.diff_and_apply(
+                                        await order_manager.diff_and_apply(
                                             quote_intent_no, tick_size_no
                                         )
-                                        orders_submitted += result_no.get("submitted", 0)
-                                        orders_canceled += result_no.get("canceled", 0)
 
                                     # Record NO token quote
                                     recorder.record_quote_intent(
@@ -1682,7 +1684,6 @@ async def run(settings: Settings | None = None) -> None:
                                 neg_risk=sig_neg_risk,
                             )
                             if result.get("submitted"):
-                                orders_submitted += 1
                                 logger.info(
                                     "exit_order_submitted",
                                     reason=exit_sig.reason,
@@ -1786,24 +1787,41 @@ async def run(settings: Settings | None = None) -> None:
                                         )
 
                                         try:
-                                            resp = await clob_private.create_order(taker_req)
-                                            if resp and resp.success:
+                                            submit_result = await order_manager.submit_order(
+                                                taker_req,
+                                                condition_id=best_market.condition_id,
+                                                strategy="taker_bootstrap",
+                                            )
+                                            if submit_result.get("success"):
                                                 logger.info(
                                                     "taker_bootstrap_submitted",
-                                                    order_id=resp.order_id[:16] if resp.order_id else "?",
+                                                    order_id=submit_result["order_id"][:16] if submit_result["order_id"] else "?",
                                                     token_id=token_id_taker[:16],
                                                 )
                                                 state.fill_escalator.reset_taker_cycle()
-                                                orders_submitted += 1
                                             else:
                                                 logger.warning(
                                                     "taker_bootstrap_failed",
-                                                    error=resp.error_msg if resp else "no response",
+                                                    error=submit_result.get("error") or "no response",
                                                 )
                                         except Exception as taker_err:
                                             logger.error("taker_bootstrap_error", error=str(taker_err))
                     except Exception as e:
                         logger.error("taker_bootstrap_outer_error", error=str(e), exc_info=True)
+
+            if paper_mode:
+                cycle_lifecycle_counts = zero_lifecycle_counts()
+                cycle_lifecycle_counts["submitted"] = orders_submitted
+                cycle_lifecycle_counts["canceled"] = orders_canceled
+            else:
+                cycle_lifecycle_counts = state.order_tracker.diff_lifecycle_counts(
+                    cycle_lifecycle_baseline
+                )
+                orders_submitted = cycle_lifecycle_counts["submitted"]
+                orders_canceled = cycle_lifecycle_counts["canceled"]
+
+            for key, value in cycle_lifecycle_counts.items():
+                summary_lifecycle_counts[key] += value
 
             # ── Cycle metrics ──
             cycle_duration = (time.time() - cycle_start) * 1000
@@ -1823,7 +1841,7 @@ async def run(settings: Settings | None = None) -> None:
                         "paper_cycle_summary",
                         cycle=cycle_count,
                         markets_quoted=markets_quoted,
-                        submitted=orders_submitted,
+                        submitted=summary_lifecycle_counts["submitted"],
                         nav=f"${snap.nav:.2f}",
                         pnl=f"${snap.pnl:.4f}",
                         pnl_pct=f"{snap.pnl_pct:.2f}%",
@@ -1846,14 +1864,18 @@ async def run(settings: Settings | None = None) -> None:
                         "quote_cycle_summary",
                         cycle=cycle_count,
                         markets_quoted=markets_quoted,
-                        submitted=orders_submitted,
-                        canceled=orders_canceled,
+                        submitted=summary_lifecycle_counts["submitted"],
+                        canceled=summary_lifecycle_counts["canceled"],
+                        filled=summary_lifecycle_counts["filled"],
+                        failed=summary_lifecycle_counts["failed"],
                         cycle_ms=f"{cycle_duration:.1f}",
+                        summary_window_cycles=100,
                         mode=state.mode,
                         nav=f"{nav:.2f}",
                         dd_tier=dd_state.tier.value,
                         resolution_exits=resolution_markets,
                     )
+                summary_lifecycle_counts = zero_lifecycle_counts()
 
             # ── Sleep until next cycle ──
             elapsed = time.time() - cycle_start

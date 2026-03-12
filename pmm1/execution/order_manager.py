@@ -51,6 +51,14 @@ class OrderDiff(BaseModel):
     unchanged: list[str] = Field(default_factory=list)  # order_ids left alone
 
 
+class OrderSubmission(BaseModel):
+    """Submission request plus tracking metadata."""
+
+    request: CreateOrderRequest
+    condition_id: str = ""
+    strategy: str = ""
+
+
 class OrderManager:
     """Manages the full order lifecycle: diff, cancel stale, submit new.
 
@@ -225,6 +233,95 @@ class OrderManager:
 
         return diff
 
+    def _process_submission_response(
+        self,
+        submission: OrderSubmission,
+        response: Any,
+    ) -> dict[str, Any]:
+        """Normalize one submission response and update canonical tracking."""
+        req = submission.request
+        order_id = getattr(response, "order_id", "") or getattr(response, "id", "")
+        success = bool(getattr(response, "success", False))
+        error_msg = getattr(response, "error_msg", "") or ""
+
+        if not success or not order_id:
+            logger.warning(
+                "order_submission_rejected",
+                token_id=req.token_id[:16],
+                side=req.side.value,
+                price=req.price,
+                size=req.size,
+                strategy=submission.strategy or "?",
+                status=getattr(response, "status", ""),
+                error=error_msg or "missing_order_id",
+            )
+            return {
+                "order_id": order_id,
+                "success": False,
+                "error": error_msg or "missing_order_id",
+            }
+
+        tracked = TrackedOrder(
+            order_id=order_id,
+            token_id=req.token_id,
+            condition_id=submission.condition_id,
+            side=req.side.value,
+            price=req.price,
+            original_size=req.size,
+            remaining_size=req.size,
+            state=OrderState.SUBMITTED,
+            neg_risk=req.neg_risk,
+            post_only=req.post_only,
+            order_type=req.order_type.value,
+            strategy=submission.strategy,
+            transaction_hashes=list(getattr(response, "transaction_hashes", [])),
+        )
+        self._tracker.track_submitted(tracked, source=submission.strategy or "submit")
+        return {"order_id": order_id, "success": True, "error": ""}
+
+    async def _submit_orders(
+        self,
+        submissions: list[OrderSubmission],
+    ) -> list[dict[str, Any]]:
+        """Submit orders and update canonical tracking for successful responses."""
+        if not submissions:
+            return []
+
+        results: list[dict[str, Any]] = []
+        for batch in self._batcher.batch(submissions):
+            requests = [submission.request for submission in batch]
+            responses = await self._client.create_orders_batch(requests)
+            if len(responses) != len(batch):
+                logger.error(
+                    "order_submission_batch_mismatch",
+                    requested=len(batch),
+                    received=len(responses),
+                )
+
+            for submission, response in zip(batch, responses):
+                results.append(self._process_submission_response(submission, response))
+
+        return results
+
+    async def submit_order(
+        self,
+        request: CreateOrderRequest,
+        *,
+        condition_id: str = "",
+        strategy: str = "manual",
+    ) -> dict[str, Any]:
+        """Submit one order and track it if the exchange accepted it."""
+        results = await self._submit_orders([
+            OrderSubmission(
+                request=request,
+                condition_id=condition_id,
+                strategy=strategy,
+            )
+        ])
+        if results:
+            return results[0]
+        return {"order_id": "", "success": False, "error": "no_response"}
+
     async def diff_and_apply(
         self,
         intent: QuoteIntent,
@@ -239,6 +336,7 @@ class OrderManager:
         results: dict[str, Any] = {
             "canceled": 0,
             "submitted": 0,
+            "rejected": 0,
             "unchanged": len(diff.unchanged),
             "errors": [],
         }
@@ -250,7 +348,7 @@ class OrderManager:
                 to_cancel = list(set(diff.to_cancel))
                 await self._client.cancel_orders(to_cancel)
                 for oid in to_cancel:
-                    self._tracker.update_state(oid, OrderState.CANCELED)
+                    self._tracker.update_state(oid, OrderState.CANCELED, source="diff_cancel")
                 results["canceled"] = len(to_cancel)
             except (ClobRestartError, ClobPausedError) as e:
                 results["errors"].append(f"cancel_error: {e}")
@@ -270,28 +368,16 @@ class OrderManager:
         # 2. Submit new orders
         if diff.to_submit:
             try:
-                batches = self._batcher.batch(diff.to_submit)
-                for batch in batches:
-                    responses = await self._client.create_orders_batch(batch)
-                    for req, resp in zip(batch, responses):
-                        tracked = TrackedOrder(
-                            order_id=resp.order_id or resp.id,
-                            token_id=req.token_id,
-                            condition_id=intent.condition_id,
-                            side=req.side.value,
-                            price=req.price,
-                            original_size=req.size,
-                            remaining_size=req.size,
-                            state=OrderState.SUBMITTED,
-                            neg_risk=req.neg_risk,
-                            post_only=req.post_only,
-                            order_type=req.order_type.value,
-                            strategy=intent.strategy,
-                        )
-                        tracked.transition_to(OrderState.SUBMITTED)
-                        self._tracker.track(tracked)
-                        results["submitted"] += 1
-
+                submit_results = await self._submit_orders([
+                    OrderSubmission(
+                        request=req,
+                        condition_id=intent.condition_id,
+                        strategy=intent.strategy,
+                    )
+                    for req in diff.to_submit
+                ])
+                results["submitted"] = sum(1 for result in submit_results if result["success"])
+                results["rejected"] = sum(1 for result in submit_results if not result["success"])
             except (ClobRestartError, ClobPausedError) as e:
                 results["errors"].append(f"submit_error: {e}")
             except ClobRateLimitError:
@@ -302,7 +388,7 @@ class OrderManager:
                 results["errors"].append(f"submit_unexpected: {e}")
                 logger.error("order_submit_error", error=str(e))
 
-        if results["errors"]:
+        if results["errors"] or results["rejected"]:
             logger.warning("order_cycle_errors", **results)
         else:
             logger.debug(
@@ -319,7 +405,7 @@ class OrderManager:
             await self._client.cancel_all()
             # Mark all tracked active orders as canceled
             for order in self._tracker.get_active_orders():
-                order.transition_to(OrderState.CANCELED)
+                self._tracker.update_state(order.order_id, OrderState.CANCELED, source="cancel_all")
             logger.critical("emergency_cancel_all_executed")
             return True
         except Exception as e:
@@ -337,7 +423,7 @@ class OrderManager:
             if order_ids:
                 await self._client.cancel_orders(order_ids)
                 for oid in order_ids:
-                    self._tracker.update_state(oid, OrderState.CANCELED)
+                    self._tracker.update_state(oid, OrderState.CANCELED, source="cancel_market")
 
             logger.info("market_orders_canceled", token_id=token_id[:16], count=len(order_ids))
             return True
@@ -375,7 +461,7 @@ class OrderManager:
                 if order_ids:
                     await self._client.cancel_orders(order_ids)
                     for oid in order_ids:
-                        self._tracker.update_state(oid, OrderState.CANCELED)
+                        self._tracker.update_state(oid, OrderState.CANCELED, source="exit_cancel")
                     result["canceled"] = len(order_ids)
         except Exception as e:
             logger.warning("exit_cancel_failed", token_id=token_id[:16], error=str(e))
@@ -423,33 +509,22 @@ class OrderManager:
                 tick_size=str(tick_size),
             )
 
-            responses = await self._client.create_orders_batch([req])
-            for resp in responses:
-                tracked = TrackedOrder(
-                    order_id=resp.order_id or resp.id,
-                    token_id=token_id,
-                    condition_id=condition_id,
-                    side="SELL",
-                    price=sell_price_str,
-                    original_size=sell_size_str,
-                    remaining_size=sell_size_str,
-                    state=OrderState.SUBMITTED,
-                    neg_risk=neg_risk,
-                    post_only=False,
-                    order_type=order_type.value,
-                    strategy="exit",
-                )
-                tracked.transition_to(OrderState.SUBMITTED)
-                self._tracker.track(tracked)
-                result["submitted"] = True
-
-            logger.info(
-                "exit_order_submitted",
-                token_id=token_id[:16],
-                price=sell_price_str,
-                size=sell_size_str,
-                urgency=urgency,
+            submit_result = await self.submit_order(
+                req,
+                condition_id=condition_id,
+                strategy="exit",
             )
+            result["submitted"] = submit_result["success"]
+            if submit_result["success"]:
+                logger.info(
+                    "exit_order_submitted",
+                    token_id=token_id[:16],
+                    price=sell_price_str,
+                    size=sell_size_str,
+                    urgency=urgency,
+                )
+            else:
+                result["error"] = submit_result["error"]
 
         except (ClobRestartError, ClobPausedError) as e:
             result["error"] = f"submit_error: {e}"
@@ -472,32 +547,13 @@ class OrderManager:
         Arb orders should be all-or-nothing.
         """
         results = []
-        batches = self._batcher.batch(orders)
-
-        for batch in batches:
-            try:
-                responses = await self._client.create_orders_batch(batch)
-                for req, resp in zip(batch, responses):
-                    tracked = TrackedOrder(
-                        order_id=resp.order_id or resp.id,
-                        token_id=req.token_id,
-                        side=req.side.value,
-                        price=req.price,
-                        original_size=req.size,
-                        remaining_size=req.size,
-                        state=OrderState.SUBMITTED,
-                        neg_risk=req.neg_risk,
-                        strategy="arb",
-                        order_type=req.order_type.value,
-                    )
-                    self._tracker.track(tracked)
-                    results.append({
-                        "order_id": resp.order_id or resp.id,
-                        "success": resp.success,
-                        "error": resp.error_msg,
-                    })
-            except Exception as e:
-                results.append({"error": str(e)})
-                logger.error("arb_execution_error", error=str(e))
+        try:
+            results = await self._submit_orders([
+                OrderSubmission(request=req, strategy="arb")
+                for req in orders
+            ])
+        except Exception as e:
+            results.append({"order_id": "", "success": False, "error": str(e)})
+            logger.error("arb_execution_error", error=str(e))
 
         return results

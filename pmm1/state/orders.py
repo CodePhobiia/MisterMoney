@@ -85,6 +85,35 @@ _VALID_TRANSITIONS: dict[OrderState, set[OrderState]] = {
 TERMINAL_STATES = {OrderState.FILLED, OrderState.CANCELED, OrderState.EXPIRED, OrderState.FAILED}
 ACTIVE_STATES = {OrderState.SUBMITTED, OrderState.LIVE, OrderState.PARTIAL, OrderState.MATCHED, OrderState.DELAYED}
 
+LIFECYCLE_COUNTER_NAMES = (
+    "submitted",
+    "live",
+    "matched",
+    "delayed",
+    "partial_fill",
+    "filled",
+    "canceled",
+    "expired",
+    "failed",
+)
+
+_STATE_TO_LIFECYCLE_COUNTER: dict[OrderState, str] = {
+    OrderState.SUBMITTED: "submitted",
+    OrderState.LIVE: "live",
+    OrderState.MATCHED: "matched",
+    OrderState.DELAYED: "delayed",
+    OrderState.PARTIAL: "partial_fill",
+    OrderState.FILLED: "filled",
+    OrderState.CANCELED: "canceled",
+    OrderState.EXPIRED: "expired",
+    OrderState.FAILED: "failed",
+}
+
+
+def zero_lifecycle_counts() -> dict[str, int]:
+    """Return an empty lifecycle counter snapshot."""
+    return {name: 0 for name in LIFECYCLE_COUNTER_NAMES}
+
 
 class TrackedOrder(BaseModel):
     """An order tracked through its lifecycle."""
@@ -228,6 +257,7 @@ class OrderTracker:
         self._orders: dict[str, TrackedOrder] = {}  # order_id → TrackedOrder
         self._by_token: dict[str, set[str]] = {}  # token_id → set of order_ids
         self._by_strategy: dict[str, set[str]] = {}  # strategy → set of order_ids
+        self._lifecycle_counts: dict[str, int] = zero_lifecycle_counts()
 
     def track(self, order: TrackedOrder) -> None:
         """Start tracking a new order."""
@@ -238,27 +268,64 @@ class OrderTracker:
         if order.strategy:
             self._by_strategy.setdefault(order.strategy, set()).add(order.order_id)
 
+    def _record_lifecycle_state(self, order: TrackedOrder, state: OrderState) -> None:
+        """Increment canonical lifecycle counters for a state transition."""
+        counter_name = _STATE_TO_LIFECYCLE_COUNTER.get(state)
+        if counter_name:
+            self._lifecycle_counts[counter_name] += 1
+
+    def track_submitted(self, order: TrackedOrder, source: str = "") -> bool:
+        """Track an order that was successfully accepted by the exchange."""
+        if not order.order_id:
+            logger.warning(
+                "track_submitted_missing_order_id",
+                token_id=order.token_id[:16] if order.token_id else "?",
+                strategy=order.strategy or source or "?",
+            )
+            return False
+
+        now = time.time()
+        order.state = OrderState.SUBMITTED
+        order.updated_at = now
+        if order.submitted_at is None:
+            order.submitted_at = now
+
+        self.track(order)
+        self._record_lifecycle_state(order, OrderState.SUBMITTED)
+        return True
+
     def get(self, order_id: str) -> TrackedOrder | None:
         """Get order by ID."""
         return self._orders.get(order_id)
 
-    def update_state(self, order_id: str, new_state: OrderState) -> bool:
+    def update_state(self, order_id: str, new_state: OrderState, source: str = "") -> bool:
         """Update order state."""
         order = self._orders.get(order_id)
         if order is None:
             logger.warning("update_unknown_order", order_id=order_id)
             return False
-        return order.transition_to(new_state)
+        old_state = order.state
+        updated = order.transition_to(new_state)
+        if updated and order.state != old_state:
+            self._record_lifecycle_state(order, order.state)
+        return updated
 
     def apply_fill(
-        self, order_id: str, fill_size: str, fill_price: str | None = None
+        self,
+        order_id: str,
+        fill_size: str,
+        fill_price: str | None = None,
+        source: str = "",
     ) -> bool:
         """Apply a fill to a tracked order."""
         order = self._orders.get(order_id)
         if order is None:
             logger.warning("fill_unknown_order", order_id=order_id)
             return False
+        old_state = order.state
         order.apply_fill(fill_size, fill_price)
+        if order.state != old_state:
+            self._record_lifecycle_state(order, order.state)
         return True
 
     def get_active_orders(self, token_id: str | None = None) -> list[TrackedOrder]:
@@ -325,9 +392,7 @@ class OrderTracker:
 
         # Mark missing orders as canceled
         for oid in missing_from_exchange:
-            order = self._orders.get(oid)
-            if order:
-                order.transition_to(OrderState.CANCELED)
+            self.update_state(oid, OrderState.CANCELED, source="reconcile")
 
         result = {
             "unknown_on_exchange": list(unknown_on_exchange),
@@ -349,3 +414,21 @@ class OrderTracker:
     @property
     def total_tracked(self) -> int:
         return len(self._orders)
+
+    def snapshot_lifecycle_counts(self) -> dict[str, int]:
+        """Return a copy of cumulative lifecycle counters."""
+        return dict(self._lifecycle_counts)
+
+    def diff_lifecycle_counts(self, baseline: dict[str, int] | None = None) -> dict[str, int]:
+        """Return lifecycle counter deltas from a prior snapshot."""
+        current = self.snapshot_lifecycle_counts()
+        reference = zero_lifecycle_counts()
+        if baseline:
+            for key, value in baseline.items():
+                if key in reference:
+                    reference[key] = value
+
+        return {
+            key: current.get(key, 0) - reference.get(key, 0)
+            for key in LIFECYCLE_COUNTER_NAMES
+        }

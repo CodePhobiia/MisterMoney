@@ -384,29 +384,47 @@ class ClobPrivateClient:
                 raise ClobPausedError(error_str) from e
             raise ClobAuthError(error_str) from e
 
-        logger.info(
-            "order_created",
-            token_id=order.token_id,
-            side=order.side.value,
-            price=order.price,
-            size=order.size,
-            response=data,
-        )
-
         # SDK returns a dict-like response; normalize to OrderResponse
+        response: OrderResponse
         if isinstance(data, dict):
-            return OrderResponse.model_validate(data)
+            response = OrderResponse.model_validate(data)
         # If the SDK returns a requests.Response, extract json
-        if hasattr(data, 'json'):
+        elif hasattr(data, 'json'):
             try:
                 json_data = data.json()
-                return OrderResponse.model_validate(json_data)
+                response = OrderResponse.model_validate(json_data)
             except Exception:
-                return OrderResponse(
+                response = OrderResponse(
                     success=True,
                     status="SUBMITTED",
                 )
-        return OrderResponse(success=True, status="SUBMITTED")
+        else:
+            response = OrderResponse(success=True, status="SUBMITTED")
+
+        order_id = response.order_id or response.id
+        if response.success and order_id:
+            logger.info(
+                "order_submitted",
+                token_id=order.token_id,
+                order_id=order_id,
+                side=order.side.value,
+                price=order.price,
+                size=order.size,
+                status=response.status,
+            )
+        # If the SDK returns a requests.Response, extract json
+        else:
+            logger.warning(
+                "order_submission_rejected",
+                token_id=order.token_id,
+                side=order.side.value,
+                price=order.price,
+                size=order.size,
+                status=response.status,
+                error=response.error_msg or "missing_order_id",
+            )
+
+        return response
 
     async def create_orders_batch(
         self, orders: list[CreateOrderRequest]
