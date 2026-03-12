@@ -255,6 +255,33 @@ def test_submit_exit_replaces_passive_mm_order() -> None:
     assert new_exit.post_only is False
 
 
+def test_diff_and_apply_uses_side_specific_suppression_reasons() -> None:
+    tracker = OrderTracker()
+    tracker.track(_tracked_order("bid-live", side="BUY", price="0.45"))
+    tracker.track(_tracked_order("ask-live", side="SELL", price="0.55"))
+    manager = OrderManager(client=_FakeClobClient(), order_tracker=tracker, use_gtd=False)
+
+    result = asyncio.run(
+        manager.diff_and_apply(
+            QuoteIntent(
+                token_id="tok-1",
+                condition_id="cond-1",
+                strategy="mm",
+                bid_suppression_reasons=["book_stale"],
+                ask_suppression_reasons=["no_inventory_to_offer"],
+            ),
+            Decimal("0.01"),
+        )
+    )
+
+    assert result["canceled"] == 2
+    assert result["submitted"] == 0
+    assert result["replacement_reason_counts"]["book_stale"] == 1
+    assert result["replacement_reason_counts"]["no_inventory_to_offer"] == 1
+    assert tracker.get("bid-live").state == OrderState.CANCELED
+    assert tracker.get("ask-live").state == OrderState.CANCELED
+
+
 def test_fill_escalator_allows_single_taker_trigger_until_fill() -> None:
     escalator = FillEscalator(
         FillEscalationConfig(
@@ -267,4 +294,3 @@ def test_fill_escalator_allows_single_taker_trigger_until_fill() -> None:
 
     assert escalator.should_take_liquidity() is True
     assert escalator.should_take_liquidity() is False
-

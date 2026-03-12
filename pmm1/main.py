@@ -64,6 +64,15 @@ from pmm1.strategy.features import FeatureEngine
 from pmm1.strategy.fill_escalation import FillEscalator
 from pmm1.strategy.neg_risk_arb import NegRiskArbDetector, NegRiskOutcome
 from pmm1.strategy.exit_manager import ExitManager
+from pmm1.strategy.market_sanity import (
+    MarketTelemetry,
+    MarketTelemetryEvent,
+    apply_quote_book_guards,
+    assess_live_market,
+    audit_active_markets,
+    compute_concentration_suppressions,
+    inventory_context_for_token,
+)
 from pmm1.strategy.quote_engine import QuoteEngine
 from pmm1.strategy.rewards import RewardEstimator
 from pmm1.strategy.universe import MarketMetadata, select_universe
@@ -114,6 +123,42 @@ class _LRUDedup:
         return False
 
 
+def _emit_market_telemetry(
+    telemetry: MarketTelemetry,
+    *,
+    kind: str,
+    stage: str,
+    reason: str,
+    condition_id: str,
+    token_id: str = "",
+    side: str = "BOTH",
+    question: str = "",
+    **details: Any,
+) -> None:
+    """Emit rate-limited structured market telemetry."""
+    event = MarketTelemetryEvent(
+        kind=kind,
+        stage=stage,
+        reason=reason,
+        condition_id=condition_id,
+        token_id=token_id,
+        side=side,
+        question=question[:120] if question else "",
+        details={key: value for key, value in details.items() if value is not None},
+    )
+    if telemetry.record(event):
+        logger.info(
+            kind,
+            stage=stage,
+            reason=reason,
+            condition_id=condition_id,
+            token_id=token_id[:16] if token_id else "",
+            side=side,
+            question=event.question,
+            **event.details,
+        )
+
+
 class BotState:
     """Central bot state container."""
 
@@ -156,6 +201,7 @@ class BotState:
         # Analytics
         self.metrics = MetricsCollector()
         self.pnl_tracker = PnLTracker()
+        self.market_telemetry = MarketTelemetry()
 
         # Market universe
         self.universe: list[MarketMetadata] = []
@@ -259,7 +305,7 @@ async def run(settings: Settings | None = None) -> None:
                 condition_id=market.condition_id,
                 token_id_yes=token_ids[0],
                 token_id_no=token_ids[1] if len(token_ids) > 1 else "",
-                event_id="",  # Not available from /markets endpoint
+                event_id=market.primary_event_id,
                 question=market.question,
                 slug=market.market_slug,
                 active=market.active,
@@ -370,16 +416,61 @@ async def run(settings: Settings | None = None) -> None:
         api_secret=settings.api.api_secret,
     )
 
-    # ── 5. Select universe ──
-    selected = select_universe(
+    # ── 5. Select + audit universe ──
+    selection_pool_size = max(settings.bot.max_markets * 3, settings.bot.max_markets)
+    ranked_candidates = select_universe(
         all_markets,
         settings.market_filters,
         settings.universe_weights,
-        max_markets=settings.bot.max_markets,
+        max_markets=selection_pool_size,
+    )
+    market_audit = audit_active_markets(
+        ranked_candidates,
+        settings.market_filters,
+        settings.bot.max_markets,
+        classify_theme=state.correlation.classify,
     )
 
-    for scored in selected:
+    for entry in market_audit.entries:
+        if entry.selected:
+            continue
+        for reason in entry.reasons:
+            _emit_market_telemetry(
+                state.market_telemetry,
+                kind="market_selection_rejected",
+                stage="startup_universe_audit",
+                reason=reason,
+                condition_id=entry.condition_id,
+                question=entry.question,
+                event_id=entry.event_id,
+                theme=entry.theme,
+                score=round(entry.score, 4),
+                spread_cents=round(entry.spread_cents, 2),
+                liquidity=round(entry.liquidity, 2),
+                reward_eligible=entry.reward_eligible,
+                reward_capture_ok=entry.reward_capture_ok,
+                hours_to_end=round(entry.hours_to_end, 2)
+                if entry.hours_to_end != float("inf")
+                else None,
+            )
+
+    logger.info(
+        "active_market_audit_summary",
+        candidates=len(ranked_candidates),
+        selected=len(market_audit.selected),
+        reason_counts=market_audit.reason_counts,
+        event_counts=market_audit.event_counts,
+        theme_counts=market_audit.theme_counts,
+        reward_capture_selected=market_audit.reward_capture_selected,
+        avg_spread_cents=round(market_audit.avg_selected_spread_cents, 2),
+        avg_liquidity=round(market_audit.avg_selected_liquidity, 2),
+    )
+
+    for scored in market_audit.selected:
         md = scored.metadata
+        md.universe_score = scored.score
+        md.universe_rank = scored.rank
+
         state.active_markets[md.condition_id] = md
         state.position_tracker.register_market(
             md.condition_id, md.token_id_yes, md.token_id_no,
@@ -422,6 +513,13 @@ async def run(settings: Settings | None = None) -> None:
 
     # Re-register event groupings for any newly enriched event_ids
     for md in state.active_markets.values():
+        state.position_tracker.register_market(
+            md.condition_id,
+            md.token_id_yes,
+            md.token_id_no,
+            neg_risk=md.neg_risk,
+            event_id=md.event_id,
+        )
         if md.neg_risk and md.event_id and md.event_id not in state.neg_risk_events:
             state.neg_risk_events[md.event_id] = []
             # Find all markets with this event_id
@@ -967,6 +1065,67 @@ async def run(settings: Settings | None = None) -> None:
                         oracle[tid] = ba.price_float
         return oracle
 
+    def _add_suppression_reason(intent: Any, side: str, reason: str) -> None:
+        """Attach a side-specific suppression reason to a QuoteIntent."""
+        if not reason:
+            return
+        target = (
+            intent.bid_suppression_reasons
+            if side == "BUY"
+            else intent.ask_suppression_reasons
+        )
+        if reason not in target:
+            target.append(reason)
+
+    async def _clear_token_quotes(
+        token_id: str,
+        condition_id: str,
+        tick_size: Decimal,
+        neg_risk: bool,
+        bid_reasons: list[str],
+        ask_reasons: list[str],
+    ) -> dict[str, Any]:
+        """Cancel any live quotes for a token by diffing to an empty intent."""
+        if paper_mode and paper_engine:
+            paper_engine.cancel_all_orders(token_id)
+            return {
+                "canceled": 0,
+                "submitted": 0,
+                "rejected": 0,
+                "unchanged": 0,
+                "replacement_reason_counts": {},
+                "errors": [],
+            }
+
+        if order_manager is None:
+            return {
+                "canceled": 0,
+                "submitted": 0,
+                "rejected": 0,
+                "unchanged": 0,
+                "replacement_reason_counts": {},
+                "errors": ["order_manager_unavailable"],
+            }
+
+        return await order_manager.diff_and_apply(
+            QuoteIntent(
+                token_id=token_id,
+                condition_id=condition_id,
+                strategy="mm",
+                neg_risk=neg_risk,
+                bid_suppression_reasons=list(dict.fromkeys(bid_reasons)),
+                ask_suppression_reasons=list(dict.fromkeys(ask_reasons)),
+            ),
+            tick_size,
+        )
+
+    def _merge_replacement_reasons(
+        target_counts: dict[str, int],
+        result: dict[str, Any],
+    ) -> None:
+        for reason, count in result.get("replacement_reason_counts", {}).items():
+            target_counts[reason] += count
+
     # Wait briefly for WS connections to establish
     warmup_s = 5.0 if paper_mode else 2.0
     logger.info("warmup_wait", seconds=warmup_s, paper_mode=paper_mode)
@@ -996,6 +1155,7 @@ async def run(settings: Settings | None = None) -> None:
     last_rebate_check = 0.0  # S0-3: track last rebate check time
     summary_lifecycle_counts = zero_lifecycle_counts()
     summary_replacement_reason_counts: dict[str, int] = defaultdict(int)
+    summary_market_telemetry_counts: dict[str, int] = defaultdict(int)
 
     try:
         while not shutdown_event.is_set():
@@ -1152,15 +1312,56 @@ async def run(settings: Settings | None = None) -> None:
                 if not paper_mode
                 else None
             )
+            concentration_suppressions = compute_concentration_suppressions(
+                state.eligible_markets(),
+                settings.market_filters,
+                classify_theme=state.correlation.classify,
+            )
+            escalation_ticks = state.fill_escalator.get_escalation_ticks()
 
             for md in state.eligible_markets():
-                # Skip if resolution risk says stop
+                question = md.question or md.slug or md.condition_id
+                token_id = md.token_id_yes
+                tick_size = state.tick_sizes.get(token_id, Decimal("0.01")) if token_id else Decimal("0.01")
+
+                # Hard stop: cancel quotes when resolution risk says stop
                 if not state.resolution_risk.should_quote(md.condition_id):
+                    for suppress_token in filter(None, [md.token_id_yes, md.token_id_no]):
+                        suppress_tick = state.tick_sizes.get(suppress_token, Decimal("0.01"))
+                        suppress_result = await _clear_token_quotes(
+                            suppress_token,
+                            md.condition_id,
+                            suppress_tick,
+                            md.neg_risk,
+                            ["resolution_quote_halt"],
+                            ["resolution_quote_halt"],
+                        )
+                        _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result)
+                    _emit_market_telemetry(
+                        state.market_telemetry,
+                        kind="quote_market_suppressed",
+                        stage="resolution_gate",
+                        reason="resolution_quote_halt",
+                        condition_id=md.condition_id,
+                        question=question,
+                        hours_to_end=round(
+                            state.resolution_risk.get(md.condition_id).hours_remaining, 2
+                        )
+                        if state.resolution_risk.get(md.condition_id) is not None
+                        else None,
+                    )
                     continue
 
                 # For arb detection, we'll use the YES token book (arb logic already handles both)
-                token_id = md.token_id_yes
                 if not token_id:
+                    _emit_market_telemetry(
+                        state.market_telemetry,
+                        kind="quote_market_rejected",
+                        stage="quote_loop_precheck",
+                        reason="missing_yes_token",
+                        condition_id=md.condition_id,
+                        question=question,
+                    )
                     continue
 
                 book = state.book_manager.get(token_id)
@@ -1189,9 +1390,35 @@ async def run(settings: Settings | None = None) -> None:
                     book = state.rest_book_cache.get(rest_cache_key)
 
                 if book is None or (not book._bids and not book._asks):
+                    suppress_result = await _clear_token_quotes(
+                        token_id,
+                        md.condition_id,
+                        tick_size,
+                        md.neg_risk,
+                        ["book_missing"],
+                        ["book_missing"],
+                    )
+                    _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result)
+                    if md.token_id_no:
+                        suppress_result_no = await _clear_token_quotes(
+                            md.token_id_no,
+                            md.condition_id,
+                            state.tick_sizes.get(md.token_id_no, Decimal("0.01")),
+                            md.neg_risk,
+                            ["book_missing"],
+                            ["book_missing"],
+                        )
+                        _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
+                    _emit_market_telemetry(
+                        state.market_telemetry,
+                        kind="quote_market_suppressed",
+                        stage="book_precheck",
+                        reason="book_missing",
+                        condition_id=md.condition_id,
+                        token_id=token_id,
+                        question=question,
+                    )
                     continue
-
-                tick_size = state.tick_sizes.get(token_id, Decimal("0.01"))
 
                 # ── Compute features ──
                 features = state.feature_engine.compute(
@@ -1200,6 +1427,47 @@ async def run(settings: Settings | None = None) -> None:
                     condition_id=md.condition_id,
                     end_date=md.end_date,
                 )
+                live_assessment = assess_live_market(
+                    md,
+                    book,
+                    features,
+                    settings.market_filters,
+                )
+                if not live_assessment.tradable:
+                    for reason in live_assessment.reasons:
+                        _emit_market_telemetry(
+                            state.market_telemetry,
+                            kind="quote_market_suppressed",
+                            stage="live_market_sanity",
+                            reason=reason,
+                            condition_id=md.condition_id,
+                            token_id=token_id,
+                            question=question,
+                            spread_cents=round(live_assessment.spread_cents, 2),
+                            min_side_depth=round(live_assessment.min_side_depth, 2),
+                            reward_eligible=md.reward_eligible,
+                            reward_capture_ok=live_assessment.reward_capture_ok,
+                        )
+                    suppress_result = await _clear_token_quotes(
+                        token_id,
+                        md.condition_id,
+                        tick_size,
+                        md.neg_risk,
+                        live_assessment.reasons,
+                        live_assessment.reasons,
+                    )
+                    _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result)
+                    if md.token_id_no:
+                        suppress_result_no = await _clear_token_quotes(
+                            md.token_id_no,
+                            md.condition_id,
+                            state.tick_sizes.get(md.token_id_no, Decimal("0.01")),
+                            md.neg_risk,
+                            live_assessment.reasons,
+                            live_assessment.reasons,
+                        )
+                        _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
+                    continue
 
                 # ── Check arb opportunities first ──
                 if settings.strategy.enable_binary_parity:
@@ -1312,6 +1580,36 @@ async def run(settings: Settings | None = None) -> None:
 
                     # Skip extreme prices — no counterparty flow below 15c or above 85c
                     if base_fair_value < 0.15 or base_fair_value > 0.85:
+                        for reason in ("extreme_fair_value",):
+                            _emit_market_telemetry(
+                                state.market_telemetry,
+                                kind="quote_market_suppressed",
+                                stage="fair_value_gate",
+                                reason=reason,
+                                condition_id=md.condition_id,
+                                token_id=token_id,
+                                question=question,
+                                fair_value=round(base_fair_value, 4),
+                            )
+                        suppress_result = await _clear_token_quotes(
+                            token_id,
+                            md.condition_id,
+                            tick_size,
+                            md.neg_risk,
+                            ["extreme_fair_value"],
+                            ["extreme_fair_value"],
+                        )
+                        _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result)
+                        if md.token_id_no:
+                            suppress_result_no = await _clear_token_quotes(
+                                md.token_id_no,
+                                md.condition_id,
+                                state.tick_sizes.get(md.token_id_no, Decimal("0.01")),
+                                md.neg_risk,
+                                ["extreme_fair_value"],
+                                ["extreme_fair_value"],
+                            )
+                            _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
                         continue
 
                     # Inventory (YES position)
@@ -1328,14 +1626,25 @@ async def run(settings: Settings | None = None) -> None:
 
                     # Resolution exit: check if we should block new buys
                     block_new_buys = False
+                    bid_block_reasons: list[str] = []
                     res_action = exit_manager.get_resolution_action(
                         md.condition_id, state.active_markets
                     )
                     if res_action and res_action.block_new_buys:
                         block_new_buys = True
+                        bid_block_reasons.append("resolution_block_new_buys")
+                    concentration_reasons = concentration_suppressions.get(md.condition_id, [])
+                    if concentration_reasons:
+                        block_new_buys = True
+                        bid_block_reasons.extend(concentration_reasons)
 
                     # Reward EV
                     reward_ev = state.reward_estimator.compute_reward_ev_for_universe(md.condition_id)
+                    market_inventory_yes, cluster_inventory_yes = inventory_context_for_token(
+                        is_no_token=False,
+                        market_inventory=market_inv,
+                        cluster_inventory=cluster_inv,
+                    )
 
                     # Quote
                     quote_intent = state.quote_engine.compute_quote(
@@ -1344,50 +1653,20 @@ async def run(settings: Settings | None = None) -> None:
                         fair_value=fv_estimate.fair_value,
                         haircut=fv_estimate.haircut,
                         confidence=fv_estimate.confidence,
-                        market_inventory=market_inv,
-                        cluster_inventory=cluster_inv,
+                        market_inventory=market_inventory_yes,
+                        cluster_inventory=cluster_inventory_yes,
                         tick_size=float(tick_size),
                         reward_ev=reward_ev,
                         neg_risk=md.neg_risk,
                         condition_id=md.condition_id,
                         position_age_hours=position_age_hours,
                     )
-
-                    # ── FILL-SPEED MODE: Escalation + Top-of-Book Clamp ──
-                    # Apply escalation ticks first (improves prices)
-                    escalation_ticks = state.fill_escalator.get_escalation_ticks()
-                    if escalation_ticks > 0 and book is not None:
-                        tick_float = float(tick_size)
-                        if quote_intent.bid_price:
-                            quote_intent.bid_price += escalation_ticks * tick_float
-                        if quote_intent.ask_price:
-                            quote_intent.ask_price -= escalation_ticks * tick_float
-                        
-                        # Clamp to valid price range
-                        if quote_intent.bid_price:
-                            quote_intent.bid_price = max(tick_float, min(1.0 - tick_float, quote_intent.bid_price))
-                        if quote_intent.ask_price:
-                            quote_intent.ask_price = max(tick_float, min(1.0 - tick_float, quote_intent.ask_price))
-
-                    # Top-of-book guard: prevent crossing, but respect inventory skew
-                    if book is not None:
-                        bb = book.get_best_bid()
-                        ba = book.get_best_ask()
-                        tick_float = float(tick_size)
-
-                        # Bid: never go above best bid (would cross/improve)
-                        # But DO allow bid below best bid (inventory skew pushing us back)
-                        if bb and quote_intent.bid_price:
-                            best_bid_float = bb.price_float
-                            if quote_intent.bid_price > best_bid_float:
-                                quote_intent.bid_price = best_bid_float
-
-                        # Ask: never go below best ask (would cross/improve)
-                        # But DO allow ask above best ask (inventory skew pushing us back)
-                        if ba and quote_intent.ask_price:
-                            best_ask_float = ba.price_float
-                            if quote_intent.ask_price < best_ask_float:
-                                quote_intent.ask_price = best_ask_float
+                    apply_quote_book_guards(
+                        quote_intent,
+                        book,
+                        tick_size,
+                        escalation_ticks=escalation_ticks,
+                    )
 
                     # SELL logic: only post asks when we hold inventory
                     if not paper_mode:
@@ -1395,6 +1674,7 @@ async def run(settings: Settings | None = None) -> None:
                             # No inventory — don't post sells
                             quote_intent.ask_size = None
                             quote_intent.ask_price = None
+                            _add_suppression_reason(quote_intent, "SELL", "no_inventory_to_offer")
                         else:
                             # Cap sell size to what we actually hold
                             if quote_intent.ask_size and quote_intent.ask_size > market_inv:
@@ -1407,11 +1687,18 @@ async def run(settings: Settings | None = None) -> None:
                                     # Can't meet minimum — skip sell
                                     quote_intent.ask_size = None
                                     quote_intent.ask_price = None
+                                    _add_suppression_reason(
+                                        quote_intent,
+                                        "SELL",
+                                        "inventory_below_min_sell_size",
+                                    )
 
                     # Block new buys during resolution exit window
                     if block_new_buys:
                         quote_intent.bid_size = None
                         quote_intent.bid_price = None
+                        for reason in bid_block_reasons:
+                            _add_suppression_reason(quote_intent, "BUY", reason)
 
                     # Apply drawdown adjustments
                     if dd_state.should_widen_quotes:
@@ -1421,9 +1708,13 @@ async def run(settings: Settings | None = None) -> None:
                             quote_intent.ask_size *= dd_state.size_multiplier
 
                     # Apply risk limits
-                    quote_intent = state.risk_limits.apply_to_quote(
+                    quote_intent, risk_diag = state.risk_limits.apply_to_quote_with_diagnostics(
                         quote_intent, event_id=md.event_id
                     )
+                    for reason in risk_diag.bid_reasons:
+                        _add_suppression_reason(quote_intent, "BUY", reason)
+                    for reason in risk_diag.ask_reasons:
+                        _add_suppression_reason(quote_intent, "SELL", reason)
 
                     # Apply resolution risk size multiplier
                     res_mult = state.resolution_risk.get_size_multiplier(md.condition_id)
@@ -1433,25 +1724,16 @@ async def run(settings: Settings | None = None) -> None:
                         if quote_intent.ask_size:
                             quote_intent.ask_size *= res_mult
 
-                    # Crossing guard: ask must be above best bid, bid below best ask
-                    if book is not None:
-                        bb = book.get_best_bid()
-                        ba = book.get_best_ask()
-                        if bb and quote_intent.ask_price and quote_intent.ask_price <= bb.price_float:
-                            # Ask would cross the bid — place above best bid + tick
-                            quote_intent.ask_price = bb.price_float + float(tick_size)
-                        if ba and quote_intent.bid_price and quote_intent.bid_price >= ba.price_float:
-                            # Bid would cross the ask — place below best ask - tick
-                            quote_intent.bid_price = ba.price_float - float(tick_size)
-
                     # Final min-size enforcement (after all multipliers)
                     MIN_SHARES_FINAL = 5.0
                     if quote_intent.bid_size is not None and quote_intent.bid_size < MIN_SHARES_FINAL:
                         quote_intent.bid_size = None
                         quote_intent.bid_price = None
+                        _add_suppression_reason(quote_intent, "BUY", "size_below_min_after_adjustment")
                     if quote_intent.ask_size is not None and quote_intent.ask_size < MIN_SHARES_FINAL:
                         quote_intent.ask_size = None
                         quote_intent.ask_price = None
+                        _add_suppression_reason(quote_intent, "SELL", "size_below_min_after_adjustment")
 
                     # Execute
                     if token_id in tokens_under_exit:
@@ -1459,9 +1741,40 @@ async def run(settings: Settings | None = None) -> None:
                         quote_intent.bid_size = None
                         quote_intent.ask_price = None
                         quote_intent.ask_size = None
+                        _add_suppression_reason(quote_intent, "BUY", "exit_in_progress")
+                        _add_suppression_reason(quote_intent, "SELL", "exit_in_progress")
 
-                    if quote_intent.has_bid or quote_intent.has_ask:
-                        if paper_mode and paper_engine and paper_logger:
+                    if quote_intent.bid_price is None and quote_intent.bid_suppression_reasons:
+                        for reason in quote_intent.bid_suppression_reasons:
+                            _emit_market_telemetry(
+                                state.market_telemetry,
+                                kind="quote_side_suppressed",
+                                stage="yes_quote",
+                                reason=reason,
+                                condition_id=md.condition_id,
+                                token_id=token_id,
+                                side="BUY",
+                                question=question,
+                                fair_value=round(fv_estimate.fair_value, 4),
+                                inventory=round(market_inv, 2),
+                            )
+                    if quote_intent.ask_price is None and quote_intent.ask_suppression_reasons:
+                        for reason in quote_intent.ask_suppression_reasons:
+                            _emit_market_telemetry(
+                                state.market_telemetry,
+                                kind="quote_side_suppressed",
+                                stage="yes_quote",
+                                reason=reason,
+                                condition_id=md.condition_id,
+                                token_id=token_id,
+                                side="SELL",
+                                question=question,
+                                fair_value=round(fv_estimate.fair_value, 4),
+                                inventory=round(market_inv, 2),
+                            )
+
+                    if paper_mode and paper_engine and paper_logger:
+                        if quote_intent.has_bid or quote_intent.has_ask:
                             # Paper mode: submit to paper engine, log the quote
                             paper_engine.cancel_all_orders(token_id)  # replace previous quotes
                             paper_engine.submit_quote(
@@ -1488,14 +1801,17 @@ async def run(settings: Settings | None = None) -> None:
                             )
                             orders_submitted += (1 if quote_intent.has_bid else 0) + (1 if quote_intent.has_ask else 0)
                             markets_quoted += 1
-                        elif order_manager:
-                            quote_result = await order_manager.diff_and_apply(
-                                quote_intent, tick_size
-                            )
-                            for reason, count in quote_result.get("replacement_reason_counts", {}).items():
-                                cycle_replacement_reason_counts[reason] += count
+                        else:
+                            paper_engine.cancel_all_orders(token_id)
+                    elif order_manager:
+                        quote_result = await order_manager.diff_and_apply(
+                            quote_intent, tick_size
+                        )
+                        _merge_replacement_reasons(cycle_replacement_reason_counts, quote_result)
+                        if quote_intent.has_bid or quote_intent.has_ask:
                             markets_quoted += 1
 
+                    if quote_intent.has_bid or quote_intent.has_ask:
                         # Record for backtest
                         recorder.record_quote_intent(
                             token_id=token_id,
@@ -1541,171 +1857,275 @@ async def run(settings: Settings | None = None) -> None:
                                     pass
                             book_no = state.rest_book_cache.get(rest_cache_key_no)
 
-                        if book_no and (book_no._bids or book_no._asks):
-                            tick_size_no = state.tick_sizes.get(token_id_no, Decimal("0.01"))
+                        tick_size_no = state.tick_sizes.get(token_id_no, Decimal("0.01"))
 
-                            # Compute features for NO token
-                            features_no = state.feature_engine.compute(
-                                token_id=token_id_no,
-                                book=book_no,
-                                condition_id=md.condition_id,
-                                end_date=md.end_date,
+                        if book_no is None or (not book_no._bids and not book_no._asks):
+                            suppress_result_no = await _clear_token_quotes(
+                                token_id_no,
+                                md.condition_id,
+                                tick_size_no,
+                                md.neg_risk,
+                                ["book_missing"],
+                                ["book_missing"],
                             )
+                            _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
+                            _emit_market_telemetry(
+                                state.market_telemetry,
+                                kind="quote_market_suppressed",
+                                stage="no_book_precheck",
+                                reason="book_missing",
+                                condition_id=md.condition_id,
+                                token_id=token_id_no,
+                                question=question,
+                            )
+                            continue
 
-                            # Invert fair value for NO token: NO_fv = 1.0 - YES_fv
-                            no_fair_value = 1.0 - base_fair_value
-
-                            # Skip if inverted fair value is extreme
-                            if no_fair_value >= 0.15 and no_fair_value <= 0.85:
-                                # Inventory for NO side
-                                no_token_inventory = no_inventory
-                                
-                                # Position age (same as YES since it's the same market)
-                                position_age_hours_no = 0.0
-                                if pos and pos.last_update > 0 and pos.net_exposure != 0:
-                                    position_age_hours_no = (time.time() - pos.last_update) / 3600.0
-
-                                # Resolution exit check
-                                block_new_buys_no = False
-                                res_action_no = exit_manager.get_resolution_action(
-                                    md.condition_id, state.active_markets
-                                )
-                                if res_action_no and res_action_no.block_new_buys:
-                                    block_new_buys_no = True
-
-                                # Reward EV (same for both sides)
-                                reward_ev_no = state.reward_estimator.compute_reward_ev_for_universe(md.condition_id)
-
-                                # Quote NO token
-                                quote_intent_no = state.quote_engine.compute_quote(
-                                    token_id=token_id_no,
-                                    features=features_no,
-                                    fair_value=no_fair_value,
-                                    haircut=fv_estimate.haircut,  # Use same haircut
-                                    confidence=fv_estimate.confidence,  # Use same confidence
-                                    market_inventory=-market_inv,  # Invert inventory sign for NO
-                                    cluster_inventory=cluster_inv,
-                                    tick_size=float(tick_size_no),
-                                    reward_ev=reward_ev_no,
-                                    neg_risk=md.neg_risk,
+                        features_no = state.feature_engine.compute(
+                            token_id=token_id_no,
+                            book=book_no,
+                            condition_id=md.condition_id,
+                            end_date=md.end_date,
+                        )
+                        live_assessment_no = assess_live_market(
+                            md,
+                            book_no,
+                            features_no,
+                            settings.market_filters,
+                        )
+                        if not live_assessment_no.tradable:
+                            for reason in live_assessment_no.reasons:
+                                _emit_market_telemetry(
+                                    state.market_telemetry,
+                                    kind="quote_market_suppressed",
+                                    stage="no_live_market_sanity",
+                                    reason=reason,
                                     condition_id=md.condition_id,
-                                    position_age_hours=position_age_hours_no,
+                                    token_id=token_id_no,
+                                    question=question,
+                                    spread_cents=round(live_assessment_no.spread_cents, 2),
+                                    min_side_depth=round(live_assessment_no.min_side_depth, 2),
+                                    reward_eligible=md.reward_eligible,
+                                    reward_capture_ok=live_assessment_no.reward_capture_ok,
                                 )
+                            suppress_result_no = await _clear_token_quotes(
+                                token_id_no,
+                                md.condition_id,
+                                tick_size_no,
+                                md.neg_risk,
+                                live_assessment_no.reasons,
+                                live_assessment_no.reasons,
+                            )
+                            _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
+                            continue
 
-                                # SELL logic for NO: only post asks when we hold NO inventory
-                                if not paper_mode:
-                                    if no_token_inventory <= 0:
+                        no_fair_value = 1.0 - base_fair_value
+                        if no_fair_value < 0.15 or no_fair_value > 0.85:
+                            _emit_market_telemetry(
+                                state.market_telemetry,
+                                kind="quote_market_suppressed",
+                                stage="no_fair_value_gate",
+                                reason="extreme_fair_value",
+                                condition_id=md.condition_id,
+                                token_id=token_id_no,
+                                question=question,
+                                fair_value=round(no_fair_value, 4),
+                            )
+                            suppress_result_no = await _clear_token_quotes(
+                                token_id_no,
+                                md.condition_id,
+                                tick_size_no,
+                                md.neg_risk,
+                                ["extreme_fair_value"],
+                                ["extreme_fair_value"],
+                            )
+                            _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
+                            continue
+
+                        no_token_inventory = no_inventory
+                        position_age_hours_no = 0.0
+                        if pos and pos.last_update > 0 and pos.net_exposure != 0:
+                            position_age_hours_no = (time.time() - pos.last_update) / 3600.0
+
+                        block_new_buys_no = False
+                        bid_block_reasons_no: list[str] = []
+                        if res_action and res_action.block_new_buys:
+                            block_new_buys_no = True
+                            bid_block_reasons_no.append("resolution_block_new_buys")
+                        if concentration_reasons:
+                            block_new_buys_no = True
+                            bid_block_reasons_no.extend(concentration_reasons)
+
+                        reward_ev_no = state.reward_estimator.compute_reward_ev_for_universe(md.condition_id)
+                        market_inventory_no, cluster_inventory_no = inventory_context_for_token(
+                            is_no_token=True,
+                            market_inventory=market_inv,
+                            cluster_inventory=cluster_inv,
+                        )
+
+                        quote_intent_no = state.quote_engine.compute_quote(
+                            token_id=token_id_no,
+                            features=features_no,
+                            fair_value=no_fair_value,
+                            haircut=fv_estimate.haircut,
+                            confidence=fv_estimate.confidence,
+                            market_inventory=market_inventory_no,
+                            cluster_inventory=cluster_inventory_no,
+                            tick_size=float(tick_size_no),
+                            reward_ev=reward_ev_no,
+                            neg_risk=md.neg_risk,
+                            condition_id=md.condition_id,
+                            position_age_hours=position_age_hours_no,
+                        )
+                        apply_quote_book_guards(
+                            quote_intent_no,
+                            book_no,
+                            tick_size_no,
+                            escalation_ticks=escalation_ticks,
+                        )
+
+                        if not paper_mode:
+                            if no_token_inventory <= 0:
+                                quote_intent_no.ask_size = None
+                                quote_intent_no.ask_price = None
+                                _add_suppression_reason(quote_intent_no, "SELL", "no_inventory_to_offer")
+                            else:
+                                if quote_intent_no.ask_size and quote_intent_no.ask_size > no_token_inventory:
+                                    quote_intent_no.ask_size = no_token_inventory
+                                if quote_intent_no.ask_size and quote_intent_no.ask_size < 5.0:
+                                    if no_token_inventory >= 5.0:
+                                        quote_intent_no.ask_size = 5.0
+                                    else:
                                         quote_intent_no.ask_size = None
                                         quote_intent_no.ask_price = None
-                                    else:
-                                        if quote_intent_no.ask_size and quote_intent_no.ask_size > no_token_inventory:
-                                            quote_intent_no.ask_size = no_token_inventory
-                                        if quote_intent_no.ask_size and quote_intent_no.ask_size < 5.0:
-                                            if no_token_inventory >= 5.0:
-                                                quote_intent_no.ask_size = 5.0
-                                            else:
-                                                quote_intent_no.ask_size = None
-                                                quote_intent_no.ask_price = None
+                                        _add_suppression_reason(
+                                            quote_intent_no,
+                                            "SELL",
+                                            "inventory_below_min_sell_size",
+                                        )
 
-                                # Block new buys during resolution exit
-                                if block_new_buys_no:
-                                    quote_intent_no.bid_size = None
-                                    quote_intent_no.bid_price = None
+                        if block_new_buys_no:
+                            quote_intent_no.bid_size = None
+                            quote_intent_no.bid_price = None
+                            for reason in bid_block_reasons_no:
+                                _add_suppression_reason(quote_intent_no, "BUY", reason)
 
-                                # Apply drawdown adjustments
-                                if dd_state.should_widen_quotes:
-                                    if quote_intent_no.bid_size:
-                                        quote_intent_no.bid_size *= dd_state.size_multiplier
-                                    if quote_intent_no.ask_size:
-                                        quote_intent_no.ask_size *= dd_state.size_multiplier
+                        if dd_state.should_widen_quotes:
+                            if quote_intent_no.bid_size:
+                                quote_intent_no.bid_size *= dd_state.size_multiplier
+                            if quote_intent_no.ask_size:
+                                quote_intent_no.ask_size *= dd_state.size_multiplier
 
-                                # Apply risk limits
-                                quote_intent_no = state.risk_limits.apply_to_quote(
-                                    quote_intent_no, event_id=md.event_id
+                        quote_intent_no, risk_diag_no = state.risk_limits.apply_to_quote_with_diagnostics(
+                            quote_intent_no, event_id=md.event_id
+                        )
+                        for reason in risk_diag_no.bid_reasons:
+                            _add_suppression_reason(quote_intent_no, "BUY", reason)
+                        for reason in risk_diag_no.ask_reasons:
+                            _add_suppression_reason(quote_intent_no, "SELL", reason)
+
+                        res_mult_no = state.resolution_risk.get_size_multiplier(md.condition_id)
+                        if res_mult_no < 1.0:
+                            if quote_intent_no.bid_size:
+                                quote_intent_no.bid_size *= res_mult_no
+                            if quote_intent_no.ask_size:
+                                quote_intent_no.ask_size *= res_mult_no
+
+                        if quote_intent_no.bid_size is not None and quote_intent_no.bid_size < 5.0:
+                            quote_intent_no.bid_size = None
+                            quote_intent_no.bid_price = None
+                            _add_suppression_reason(quote_intent_no, "BUY", "size_below_min_after_adjustment")
+                        if quote_intent_no.ask_size is not None and quote_intent_no.ask_size < 5.0:
+                            quote_intent_no.ask_size = None
+                            quote_intent_no.ask_price = None
+                            _add_suppression_reason(quote_intent_no, "SELL", "size_below_min_after_adjustment")
+
+                        if token_id_no in tokens_under_exit:
+                            quote_intent_no.bid_price = None
+                            quote_intent_no.bid_size = None
+                            quote_intent_no.ask_price = None
+                            quote_intent_no.ask_size = None
+                            _add_suppression_reason(quote_intent_no, "BUY", "exit_in_progress")
+                            _add_suppression_reason(quote_intent_no, "SELL", "exit_in_progress")
+
+                        if quote_intent_no.bid_price is None and quote_intent_no.bid_suppression_reasons:
+                            for reason in quote_intent_no.bid_suppression_reasons:
+                                _emit_market_telemetry(
+                                    state.market_telemetry,
+                                    kind="quote_side_suppressed",
+                                    stage="no_quote",
+                                    reason=reason,
+                                    condition_id=md.condition_id,
+                                    token_id=token_id_no,
+                                    side="BUY",
+                                    question=question,
+                                    fair_value=round(no_fair_value, 4),
+                                    inventory=round(-market_inv, 2),
+                                )
+                        if quote_intent_no.ask_price is None and quote_intent_no.ask_suppression_reasons:
+                            for reason in quote_intent_no.ask_suppression_reasons:
+                                _emit_market_telemetry(
+                                    state.market_telemetry,
+                                    kind="quote_side_suppressed",
+                                    stage="no_quote",
+                                    reason=reason,
+                                    condition_id=md.condition_id,
+                                    token_id=token_id_no,
+                                    side="SELL",
+                                    question=question,
+                                    fair_value=round(no_fair_value, 4),
+                                    inventory=round(-market_inv, 2),
                                 )
 
-                                # Apply resolution risk size multiplier
-                                res_mult_no = state.resolution_risk.get_size_multiplier(md.condition_id)
-                                if res_mult_no < 1.0:
-                                    if quote_intent_no.bid_size:
-                                        quote_intent_no.bid_size *= res_mult_no
-                                    if quote_intent_no.ask_size:
-                                        quote_intent_no.ask_size *= res_mult_no
+                        if paper_mode and paper_engine and paper_logger:
+                            if quote_intent_no.has_bid or quote_intent_no.has_ask:
+                                paper_engine.cancel_all_orders(token_id_no)
+                                paper_engine.submit_quote(
+                                    token_id=token_id_no,
+                                    condition_id=md.condition_id,
+                                    bid_price=quote_intent_no.bid_price,
+                                    bid_size=quote_intent_no.bid_size,
+                                    ask_price=quote_intent_no.ask_price,
+                                    ask_size=quote_intent_no.ask_size,
+                                    strategy="mm",
+                                    neg_risk=md.neg_risk,
+                                )
+                                paper_logger.log_quote(
+                                    token_id=token_id_no,
+                                    condition_id=md.condition_id,
+                                    bid_price=quote_intent_no.bid_price,
+                                    bid_size=quote_intent_no.bid_size,
+                                    ask_price=quote_intent_no.ask_price,
+                                    ask_size=quote_intent_no.ask_size,
+                                    reservation_price=quote_intent_no.reservation_price,
+                                    fair_value=no_fair_value,
+                                    half_spread=quote_intent_no.half_spread,
+                                    inventory=-market_inv,
+                                )
+                                orders_submitted += (1 if quote_intent_no.has_bid else 0) + (1 if quote_intent_no.has_ask else 0)
+                            else:
+                                paper_engine.cancel_all_orders(token_id_no)
+                        elif order_manager:
+                            quote_result_no = await order_manager.diff_and_apply(
+                                quote_intent_no, tick_size_no
+                            )
+                            _merge_replacement_reasons(cycle_replacement_reason_counts, quote_result_no)
 
-                                # Crossing guard for NO token
-                                if book_no is not None:
-                                    bb_no = book_no.get_best_bid()
-                                    ba_no = book_no.get_best_ask()
-                                    if bb_no and quote_intent_no.ask_price and quote_intent_no.ask_price <= bb_no.price_float:
-                                        quote_intent_no.ask_price = bb_no.price_float + float(tick_size_no)
-                                    if ba_no and quote_intent_no.bid_price and quote_intent_no.bid_price >= ba_no.price_float:
-                                        quote_intent_no.bid_price = ba_no.price_float - float(tick_size_no)
+                        if quote_intent_no.has_bid or quote_intent_no.has_ask:
+                            recorder.record_quote_intent(
+                                token_id=token_id_no,
+                                bid_price=quote_intent_no.bid_price,
+                                bid_size=quote_intent_no.bid_size,
+                                ask_price=quote_intent_no.ask_price,
+                                ask_size=quote_intent_no.ask_size,
+                                reservation_price=quote_intent_no.reservation_price,
+                                fair_value=no_fair_value,
+                                half_spread=quote_intent_no.half_spread,
+                                inventory=-market_inv,
+                            )
 
-                                # Final min-size enforcement for NO (after all multipliers)
-                                if quote_intent_no.bid_size is not None and quote_intent_no.bid_size < 5.0:
-                                    quote_intent_no.bid_size = None
-                                    quote_intent_no.bid_price = None
-                                if quote_intent_no.ask_size is not None and quote_intent_no.ask_size < 5.0:
-                                    quote_intent_no.ask_size = None
-                                    quote_intent_no.ask_price = None
-
-                                # Execute NO token quote
-                                if token_id_no in tokens_under_exit:
-                                    quote_intent_no.bid_price = None
-                                    quote_intent_no.bid_size = None
-                                    quote_intent_no.ask_price = None
-                                    quote_intent_no.ask_size = None
-
-                                if quote_intent_no.has_bid or quote_intent_no.has_ask:
-                                    if paper_mode and paper_engine and paper_logger:
-                                        paper_engine.cancel_all_orders(token_id_no)
-                                        paper_engine.submit_quote(
-                                            token_id=token_id_no,
-                                            condition_id=md.condition_id,
-                                            bid_price=quote_intent_no.bid_price,
-                                            bid_size=quote_intent_no.bid_size,
-                                            ask_price=quote_intent_no.ask_price,
-                                            ask_size=quote_intent_no.ask_size,
-                                            strategy="mm",
-                                            neg_risk=md.neg_risk,
-                                        )
-                                        paper_logger.log_quote(
-                                            token_id=token_id_no,
-                                            condition_id=md.condition_id,
-                                            bid_price=quote_intent_no.bid_price,
-                                            bid_size=quote_intent_no.bid_size,
-                                            ask_price=quote_intent_no.ask_price,
-                                            ask_size=quote_intent_no.ask_size,
-                                            reservation_price=quote_intent_no.reservation_price,
-                                            fair_value=no_fair_value,
-                                            half_spread=quote_intent_no.half_spread,
-                                            inventory=-market_inv,
-                                        )
-                                        orders_submitted += (1 if quote_intent_no.has_bid else 0) + (1 if quote_intent_no.has_ask else 0)
-                                    elif order_manager:
-                                        quote_result_no = await order_manager.diff_and_apply(
-                                            quote_intent_no, tick_size_no
-                                        )
-                                        for reason, count in quote_result_no.get("replacement_reason_counts", {}).items():
-                                            cycle_replacement_reason_counts[reason] += count
-
-                                    # Record NO token quote
-                                    recorder.record_quote_intent(
-                                        token_id=token_id_no,
-                                        bid_price=quote_intent_no.bid_price,
-                                        bid_size=quote_intent_no.bid_size,
-                                        ask_price=quote_intent_no.ask_price,
-                                        ask_size=quote_intent_no.ask_size,
-                                        reservation_price=quote_intent_no.reservation_price,
-                                        fair_value=no_fair_value,
-                                        half_spread=quote_intent_no.half_spread,
-                                        inventory=-market_inv,
-                                    )
-
-                                    # Record NO token spread metric
-                                    if quote_intent_no.bid_price and quote_intent_no.ask_price:
-                                        spread_cents_no = (quote_intent_no.ask_price - quote_intent_no.bid_price) * 100
-                                        state.metrics.record_quote(token_id_no, md.condition_id, spread_cents_no)
+                            if quote_intent_no.bid_price and quote_intent_no.ask_price:
+                                spread_cents_no = (quote_intent_no.ask_price - quote_intent_no.bid_price) * 100
+                                state.metrics.record_quote(token_id_no, md.condition_id, spread_cents_no)
 
             # ── Exit Manager: evaluate all sell/exit signals ──
             if not paper_mode and order_manager:
@@ -1871,6 +2291,9 @@ async def run(settings: Settings | None = None) -> None:
                 summary_lifecycle_counts[key] += value
             for key, value in cycle_replacement_reason_counts.items():
                 summary_replacement_reason_counts[key] += value
+            cycle_market_telemetry_counts = state.market_telemetry.consume_reason_counts()
+            for key, value in cycle_market_telemetry_counts.items():
+                summary_market_telemetry_counts[key] += value
 
             # ── Cycle metrics ──
             cycle_duration = (time.time() - cycle_start) * 1000
@@ -1924,9 +2347,11 @@ async def run(settings: Settings | None = None) -> None:
                         dd_tier=dd_state.tier.value,
                         resolution_exits=resolution_markets,
                         replacement_reasons=dict(summary_replacement_reason_counts),
+                        market_suppressions=dict(summary_market_telemetry_counts),
                     )
                 summary_lifecycle_counts = zero_lifecycle_counts()
                 summary_replacement_reason_counts = defaultdict(int)
+                summary_market_telemetry_counts = defaultdict(int)
 
             # ── Sleep until next cycle ──
             elapsed = time.time() - cycle_start

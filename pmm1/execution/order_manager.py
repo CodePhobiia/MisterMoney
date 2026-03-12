@@ -327,14 +327,14 @@ class OrderManager:
             live_orders=live_bids,
             desired_request=desired_bid,
             desired_strategy=intent.strategy,
-            no_desired_reasons=["quote_removed"],
+            no_desired_reasons=intent.bid_suppression_reasons or ["quote_removed"],
         )
         self._plan_side(
             diff=diff,
             live_orders=live_asks,
             desired_request=desired_ask,
             desired_strategy=intent.strategy,
-            no_desired_reasons=["quote_removed"],
+            no_desired_reasons=intent.ask_suppression_reasons or ["quote_removed"],
         )
 
         for submission in diff.to_submit:

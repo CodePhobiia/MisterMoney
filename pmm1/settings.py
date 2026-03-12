@@ -44,6 +44,9 @@ class MarketFiltersConfig(BaseModel):
     min_volume_24h_usd: float = 1_000  # Lowered from 50k; Gamma volume_24h often sparse
     max_top_spread_cents: float = 10.0  # Widened from 4c; let scoring handle preference
     min_depth_within_2c_shares: float = 0  # Gamma doesn't provide depth; skip by default
+    min_live_depth_within_2c_shares: float = 25.0
+    max_markets_per_event: int = 2
+    max_markets_per_theme: int = 4
     allow_sports: bool = False
     allow_crypto_intraday: bool = False
     require_clear_rules: bool = True

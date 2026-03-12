@@ -42,6 +42,7 @@ class GammaMarket(BaseModel):
     rewards_max_spread: float = Field(alias="rewardsMaxSpread", default=0.0)
     rewards_daily_rate: float = Field(alias="rewardsDailyRate", default=0.0)
     fees_enabled: bool = Field(alias="feesEnabled", default=False)
+    events: list[dict[str, Any]] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
 
@@ -66,6 +67,14 @@ class GammaMarket(BaseModel):
             return [float(p) for p in json.loads(self.outcome_prices)]
         except (json.JSONDecodeError, TypeError, ValueError):
             return []
+
+    @property
+    def primary_event_id(self) -> str:
+        """Best-effort event id from nested Gamma market metadata."""
+        if not self.events:
+            return ""
+        first_event = self.events[0] or {}
+        return str(first_event.get("id", "") or "")
 
     @property
     def end_date(self) -> datetime | None:

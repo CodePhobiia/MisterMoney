@@ -50,6 +50,9 @@ class MarketMetadata(BaseModel):
     resolution_risk: float = 0.0
     reward_ev: float = 0.0
     arb_ev: float = 0.0
+    universe_score: float = 0.0
+    universe_rank: int = 0
+    theme: str = ""
 
 
 class EligibilityResult(BaseModel):

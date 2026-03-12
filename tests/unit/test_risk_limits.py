@@ -107,6 +107,14 @@ class TestApplyToQuote:
         assert result.bid_size == 10.0
         assert result.ask_size == 10.0
 
+    def test_diagnostics_report_bid_reduction_reason(self):
+        limits = _make_limits(nav=100.0, per_market_gross_nav=0.01)
+        intent = self._make_intent(bid_size=100.0, ask_size=10.0)
+
+        _, diagnostics = limits.apply_to_quote_with_diagnostics(intent)
+
+        assert "per_market_gross" in diagnostics.bid_reasons
+
 
 class TestThematicCorrelation:
     def test_classify_election(self):

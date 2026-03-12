@@ -21,7 +21,7 @@ import math
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from pmm1.settings import PricingConfig
 from pmm1.strategy.features import FeatureVector
@@ -43,6 +43,8 @@ class QuoteIntent(BaseModel):
     strategy: str = "mm"
     confidence: float = 0.0
     neg_risk: bool = False
+    bid_suppression_reasons: list[str] = Field(default_factory=list)
+    ask_suppression_reasons: list[str] = Field(default_factory=list)
 
     @property
     def has_bid(self) -> bool:

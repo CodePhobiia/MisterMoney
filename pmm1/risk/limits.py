@@ -16,7 +16,7 @@ falling time-to-catalyst, deepening drawdown, falling reward EV.
 from __future__ import annotations
 
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from pmm1.risk.correlation import ThematicCorrelation
 from pmm1.settings import RiskConfig
@@ -31,8 +31,15 @@ class LimitCheckResult(BaseModel):
     """Result of a risk limit check."""
 
     passed: bool = True
-    breaches: list[str] = []
-    adjustments: dict[str, float] = {}  # field → adjusted value
+    breaches: list[str] = Field(default_factory=list)
+    adjustments: dict[str, float] = Field(default_factory=dict)  # field → adjusted value
+
+
+class QuoteRiskDiagnostics(BaseModel):
+    """Structured diagnostics for risk-based quote adjustments."""
+
+    bid_reasons: list[str] = Field(default_factory=list)
+    ask_reasons: list[str] = Field(default_factory=list)
 
 
 class RiskLimits:
@@ -191,15 +198,17 @@ class RiskLimits:
             )
         return LimitCheckResult(passed=True)
 
-    def apply_to_quote(
+    def apply_to_quote_with_diagnostics(
         self,
         intent: QuoteIntent,
         event_id: str = "",
-    ) -> QuoteIntent:
+    ) -> tuple[QuoteIntent, QuoteRiskDiagnostics]:
         """Apply all risk limits to a quote intent, adjusting sizes as needed.
 
-        Returns a modified QuoteIntent with sizes reduced to comply with limits.
+        Returns a modified QuoteIntent plus structured diagnostics.
         """
+        diagnostics = QuoteRiskDiagnostics()
+
         # Risk limits only constrain BUY orders (asks reduce exposure)
         # Save ask side — risk checks only touch bids
         saved_ask_price = intent.ask_price
@@ -218,9 +227,11 @@ class RiskLimits:
                 if max_add <= 0:
                     intent.bid_size = 0
                     intent.bid_price = None
+                    diagnostics.bid_reasons.append("per_market_gross")
                     logger.warning("risk_zeroed_bid", condition_id=intent.condition_id[:16], reason="per_market_gross")
                 elif intent.bid_price and intent.bid_price > 0:
                     intent.bid_size = min(intent.bid_size, max_add / intent.bid_price)
+                    diagnostics.bid_reasons.append("per_market_gross")
 
             # Theme correlation check (buys only)
             if self.correlation and intent.bid_size and intent.bid_size > 0:
@@ -232,9 +243,11 @@ class RiskLimits:
                     if theme_max <= 0:
                         intent.bid_size = 0
                         intent.bid_price = None
+                        diagnostics.bid_reasons.append("theme_correlation")
                         logger.warning("risk_zeroed_bid", condition_id=intent.condition_id[:16], reason="theme_correlation")
                     elif intent.bid_price and intent.bid_price > 0:
                         intent.bid_size = min(intent.bid_size, theme_max / intent.bid_price)
+                        diagnostics.bid_reasons.append("theme_correlation")
 
             # Event cluster check (buys only)
             if event_id and intent.bid_size and intent.bid_size > 0:
@@ -248,9 +261,11 @@ class RiskLimits:
                     if max_add <= 0:
                         intent.bid_size = 0
                         intent.bid_price = None
+                        diagnostics.bid_reasons.append("event_cluster")
                         logger.warning("risk_zeroed_bid", condition_id=intent.condition_id[:16], reason="event_cluster")
                     elif intent.bid_price and intent.bid_price > 0:
                         intent.bid_size = min(intent.bid_size, max_add / intent.bid_price)
+                        diagnostics.bid_reasons.append("event_cluster")
 
         # Restore ask side (never blocked by risk limits)
         intent.ask_price = saved_ask_price
@@ -263,6 +278,20 @@ class RiskLimits:
             # Scale down proportionally
             intent.bid_size = (intent.bid_size or 0) * 0.5
             intent.ask_size = (intent.ask_size or 0) * 0.5
+            diagnostics.bid_reasons.append("total_directional")
+            if intent.ask_size:
+                diagnostics.ask_reasons.append("total_directional")
             logger.warning("risk_scaled_quote", condition_id=intent.condition_id[:16], reason="total_directional")
 
-        return intent
+        diagnostics.bid_reasons = list(dict.fromkeys(diagnostics.bid_reasons))
+        diagnostics.ask_reasons = list(dict.fromkeys(diagnostics.ask_reasons))
+        return intent, diagnostics
+
+    def apply_to_quote(
+        self,
+        intent: QuoteIntent,
+        event_id: str = "",
+    ) -> QuoteIntent:
+        """Apply all risk limits to a quote intent."""
+        adjusted_intent, _ = self.apply_to_quote_with_diagnostics(intent, event_id)
+        return adjusted_intent
