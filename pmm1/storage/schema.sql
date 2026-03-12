@@ -76,11 +76,11 @@ CREATE TABLE IF NOT EXISTS queue_state (
 CREATE TABLE IF NOT EXISTS allocation_decision (
     ts TEXT NOT NULL,
     condition_id TEXT NOT NULL,
-    current_capital_usdc REAL,
-    target_capital_usdc REAL,
-    delta_capital_usdc REAL,
-    reason TEXT,
-    confidence REAL,
+    bundle TEXT NOT NULL DEFAULT 'B1',
+    capital_usdc REAL,
+    slots INTEGER,
+    marginal_return_bps REAL,
+    status TEXT,
     PRIMARY KEY (ts, condition_id)
 );
 

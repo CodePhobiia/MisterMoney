@@ -96,10 +96,13 @@ class ParquetWriter:
                 df = pl.DataFrame(records)
                 path = self._get_path(dt)
 
-                # Append to existing file if it exists
+                # Append to existing file if it exists.
+                # Use diagonal_relaxed so older parquet files with Null-inferred
+                # columns (e.g. ask_price/bid_price on one-sided quote hours)
+                # can still accept later Float64 rows.
                 if path.exists():
                     existing = pl.read_parquet(path)
-                    df = pl.concat([existing, df])
+                    df = pl.concat([existing, df], how="diagonal_relaxed")
 
                 df.write_parquet(path, compression="zstd")
                 count = len(records)

@@ -52,7 +52,54 @@ class Database:
         await self._conn.executescript(schema_sql)
         await self._conn.commit()
 
+        await self._run_migrations()
+
         logger.info("database_initialized", db_path=str(self.db_path))
+
+    async def _run_migrations(self) -> None:
+        """Apply lightweight schema migrations for existing SQLite databases."""
+        if not self._conn:
+            raise RuntimeError("Database not initialized. Call init() first.")
+
+        await self._migrate_allocation_decision_table()
+        await self._conn.commit()
+
+    async def _migrate_allocation_decision_table(self) -> None:
+        """Bring allocation_decision in line with the PMM-2 allocator writer."""
+        if not self._conn:
+            raise RuntimeError("Database not initialized. Call init() first.")
+
+        cursor = await self._conn.execute("PRAGMA table_info(allocation_decision)")
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+        if not rows:
+            return
+
+        existing = {row[1] for row in rows}
+        required_columns = {
+            "bundle": "TEXT DEFAULT 'B1'",
+            "capital_usdc": "REAL",
+            "slots": "INTEGER",
+            "marginal_return_bps": "REAL",
+            "status": "TEXT",
+        }
+
+        added_columns: list[str] = []
+        for column, column_type in required_columns.items():
+            if column in existing:
+                continue
+            await self._conn.execute(
+                f"ALTER TABLE allocation_decision ADD COLUMN {column} {column_type}"
+            )
+            added_columns.append(column)
+
+        if added_columns:
+            logger.info(
+                "database_schema_migrated",
+                table="allocation_decision",
+                added_columns=added_columns,
+            )
 
     async def close(self) -> None:
         """Close database connection."""
