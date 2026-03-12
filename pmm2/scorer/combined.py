@@ -77,8 +77,13 @@ class MarketEVScorer:
 
         # Estimate queue ahead from visible book depth at our price level.
         # For a new order, all visible depth at or better than our price is "ahead".
-        queue_ahead_bid = max(market.depth_at_best_bid - bundle.bid_size, 0.0)
-        queue_ahead_ask = max(market.depth_at_best_ask - bundle.ask_size, 0.0)
+        # Be defensive here: PMM-1 book snapshots may carry Decimal values.
+        depth_at_best_bid = float(market.depth_at_best_bid)
+        depth_at_best_ask = float(market.depth_at_best_ask)
+        bid_size = float(bundle.bid_size)
+        ask_size = float(bundle.ask_size)
+        queue_ahead_bid = max(depth_at_best_bid - bid_size, 0.0)
+        queue_ahead_ask = max(depth_at_best_ask - ask_size, 0.0)
 
         fill_prob_bid = self.fill_hazard.fill_probability(
             queue_ahead=queue_ahead_bid,
@@ -107,8 +112,14 @@ class MarketEVScorer:
         bundle.arb_ev = compute_arb_ev(market=market)
 
         # Liquidity reward EV
-        # Estimate competitor mass from liquidity (rough proxy)
-        q_others = max(market.liquidity * 0.1, 50.0)  # 10% of liquidity or min 50
+        # Estimate competitor scoring mass from visible book depth, not total
+        # market liquidity. Using market.liquidity here wildly overstates
+        # competitor mass and makes reward EV disappear even on good reward
+        # markets.
+        q_others = max(
+            float(market.depth_at_best_bid) + float(market.depth_at_best_ask),
+            max(market.reward_min_size * 2.0, 10.0),
+        )
         bundle.liq_ev = compute_reward_ev(
             market=market,
             bundle=bundle,

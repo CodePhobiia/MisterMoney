@@ -96,6 +96,7 @@ class PMM2Runtime:
         self.running = False
         self.nav = 100.0
         self.tasks: list[asyncio.Task] = []
+        self._recent_v1_cancel_count = 0
 
         logger.info(
             "pmm2_runtime_initialized",
@@ -224,6 +225,7 @@ class PMM2Runtime:
         try:
             self.queue_estimator.remove_order(order_id)
             self.persistence.sm.remove_order(order_id)
+            self._recent_v1_cancel_count += 1
         except Exception as e:
             logger.error("on_order_canceled_error", error=str(e))
 
@@ -303,6 +305,7 @@ class PMM2Runtime:
             try:
                 # 0. Capture V1 state snapshot (for shadow mode comparison)
                 v1_snapshot = V1StateSnapshot.capture(bot_state)
+                v1_snapshot["cancel_count_recent"] = self._recent_v1_cancel_count
                 
                 # 1. Enrich depth from V1 book snapshots, then score
                 all_bundles = []
@@ -470,6 +473,7 @@ class PMM2Runtime:
                             }
                             for m in all_mutations
                         ],
+                        "target_order_count": sum(len(tp.ladder) for tp in new_plans.values()),
                         "total_ev": sum(b.marginal_return for b in plan.funded_bundles),
                     }
 
@@ -510,6 +514,9 @@ class PMM2Runtime:
                         ready_for_live=self.counterfactual_engine.is_ready_for_live(),
                     )
 
+                    # Reset recent V1 cancel counter after each comparison window.
+                    self._recent_v1_cancel_count = 0
+
                 # 7. Persist decisions
                 await self.allocator.persist_decisions(self.db, plan)
                 await self.scorer.persist_scores(all_bundles)
@@ -545,12 +552,21 @@ class PMM2Runtime:
                 rewards = getattr(bot_state, "rewards_client", None)
 
                 if gamma and rewards:
-                    self.enriched_universe = await build_enriched_universe(
+                    from pmm2.universe.scorer import UniverseScorer
+
+                    full_universe = await build_enriched_universe(
                         gamma, rewards, settings
                     )
+                    selector = UniverseScorer()
+                    candidate_count = min(
+                        len(full_universe),
+                        max(self.config.max_markets_active * 8, self.config.max_markets_active),
+                    )
+                    self.enriched_universe = selector.select_top(full_universe, candidate_count)
                     logger.info(
                         "universe_refreshed",
                         universe_size=len(self.enriched_universe),
+                        raw_universe_size=len(full_universe),
                     )
                 else:
                     logger.warning(

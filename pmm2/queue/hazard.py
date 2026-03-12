@@ -41,10 +41,19 @@ class FillHazard:
         Returns:
             Probability of fill in [0, 1]
         """
-        if order_size <= 0 or depletion_rate <= 0:
+        if order_size <= 0 or depletion_rate <= 0 or horizon_sec <= 0:
             return 0.0
-        ratio = self.kappa * queue_ahead / order_size if order_size > 0 else float("inf")
-        exponent = -depletion_rate * horizon_sec / (1 + ratio)
+
+        # Approximate fills from expected queue depletion over the horizon.
+        # The previous formula made fill probability nearly independent of order
+        # size when queue_ahead ~= 0, which wildly overestimated fills for huge
+        # low-price orders. Use effective shares-to-clear instead.
+        effective_shares = queue_ahead + self.rho * order_size
+        if effective_shares <= 0:
+            return 0.0
+
+        expected_queue_cleared = depletion_rate * horizon_sec
+        exponent = -expected_queue_cleared / effective_shares
         return 1.0 - math.exp(exponent)
 
     def eta(self, queue_ahead: float, order_size: float, depletion_rate: float) -> float:

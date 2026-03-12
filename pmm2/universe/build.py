@@ -64,17 +64,30 @@ async def build_enriched_universe(
 
     logger.info("gamma_markets_fetched", count=len(raw_markets))
 
-    # Step 2: Refresh reward surface
+    # Step 2: Build condition -> event mapping so allocator correlation
+    # penalties can actually work.
+    event_map: dict[str, str] = {}
+    try:
+        active_events = await gamma_client.get_active_events(limit=500)
+        for event in active_events:
+            for event_market in event.markets:
+                if event_market.condition_id:
+                    event_map[event_market.condition_id] = event.id
+        logger.info("gamma_event_map_built", events=len(active_events), mapped_conditions=len(event_map))
+    except Exception as e:
+        logger.warning("gamma_event_map_failed", error=str(e))
+
+    # Step 3: Refresh reward surface
     reward_surface = RewardSurface(ttl_seconds=300)
     await reward_surface.refresh(rewards_client)
 
-    # Step 3: Build fee surface from Gamma data
+    # Step 4: Build fee surface from Gamma data
     # Convert GammaMarket pydantic models to dicts for fee_surface
     fee_surface = FeeSurface(ttl_seconds=300)
     raw_dicts = [m.model_dump() for m in raw_markets]
     fee_surface.update_from_markets(raw_dicts)
 
-    # Step 4: Enrich each market
+    # Step 5: Enrich each market
     enriched: list[EnrichedMarket] = []
     now = datetime.now(timezone.utc)
 
@@ -126,7 +139,7 @@ async def build_enriched_universe(
             question=market.question,
             token_id_yes=token_id_yes,
             token_id_no=token_id_no,
-            event_id="",  # TODO: Extract from Gamma if available
+            event_id=event_map.get(market.condition_id, ""),
             best_bid=market.best_bid,
             best_ask=market.best_ask,
             mid=mid,

@@ -104,14 +104,18 @@ class CounterfactualEngine:
         pmm2_reward_count = len(pmm2_reward_markets)
         reward_improvement = pmm2_reward_count - v1_reward_count
 
-        # Churn comparison (mutations needed)
+        # Churn comparison (recent V1 actual cancels vs PMM-2 projected cancel rate)
         v1_order_count = len(v1_state.get("orders", []))
+        v1_cancel_count = float(v1_state.get("cancel_count_recent", 0) or 0.0)
         pmm2_mutations = pmm2_plan.get("mutations", [])
         pmm2_cancels = len([m for m in pmm2_mutations if m.get("action") == "cancel"])
+        pmm2_target_order_count = float(
+            pmm2_plan.get("target_order_count", 0) or max(len(pmm2_plan.get("markets", [])) * 2, 1)
+        )
 
-        # Assume V1 also has some churn (estimate from order count change)
-        # For now, we'll compare mutation counts
-        churn_reduction = (v1_order_count - pmm2_cancels) / max(v1_order_count, 1)
+        v1_cancel_rate = v1_cancel_count / max(v1_order_count, 1)
+        pmm2_cancel_rate = pmm2_cancels / max(pmm2_target_order_count, 1)
+        churn_reduction = v1_cancel_rate - pmm2_cancel_rate
 
         # EV delta (PMM-2 total EV vs V1's implicit EV)
         pmm2_ev = pmm2_plan.get("total_ev", 0.0)
@@ -145,8 +149,11 @@ class CounterfactualEngine:
             "pmm2_reward_count": pmm2_reward_count,
             "reward_improvement": reward_improvement,
             "v1_order_count": v1_order_count,
+            "v1_cancel_count": v1_cancel_count,
+            "v1_cancel_rate": v1_cancel_rate,
             "pmm2_mutation_count": len(pmm2_mutations),
             "pmm2_cancel_count": pmm2_cancels,
+            "pmm2_cancel_rate": pmm2_cancel_rate,
             "churn_reduction": churn_reduction,
             "v1_estimated_ev": v1_estimated_ev,
             "pmm2_ev": pmm2_ev,
