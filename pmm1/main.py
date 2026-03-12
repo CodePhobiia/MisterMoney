@@ -963,6 +963,13 @@ async def run(settings: Settings | None = None) -> None:
     logger.info("warmup_wait", seconds=warmup_s, paper_mode=paper_mode)
     await asyncio.sleep(warmup_s)
 
+    # Before seeding drawdown, force an initial reconciliation in live mode.
+    # Otherwise startup can mark stale/local positions to market, then a first
+    # exchange sync zeroes them out and falsely trips flatten-only drawdown.
+    if not paper_mode and reconciler:
+        logger.info("startup_reconciliation_before_drawdown")
+        await reconciler.full_reconciliation()
+
     # Initialize drawdown with current NAV (mark-to-market)
     if paper_mode and paper_engine:
         nav = paper_engine.get_nav(state.book_manager)

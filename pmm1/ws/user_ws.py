@@ -175,7 +175,17 @@ class UserWebSocket:
 
     async def _handle_trade_update(self, msg: dict[str, Any]) -> None:
         """Process trade/fill notification from WS."""
-        order_id = msg.get("orderID") or msg.get("order_id") or msg.get("id", "")
+        # Trade payloads can carry a generic `id` that is the match/trade UUID,
+        # not our order ID. Only use explicit order-id fields for tracker updates.
+        order_id = (
+            msg.get("orderID")
+            or msg.get("order_id")
+            or msg.get("makerOrderID")
+            or msg.get("maker_order_id")
+            or msg.get("takerOrderID")
+            or msg.get("taker_order_id")
+            or ""
+        )
         fill_size = msg.get("size") or msg.get("matchSize", "0")
         fill_price = msg.get("price") or msg.get("matchPrice")
 

@@ -313,8 +313,8 @@ class PMM2Runtime:
                         if book:
                             bb = book.get_best_bid()
                             ba = book.get_best_ask()
-                            market.depth_at_best_bid = bb.size if bb else 0.0
-                            market.depth_at_best_ask = ba.size if ba else 0.0
+                            market.depth_at_best_bid = float(bb.size) if bb else 0.0
+                            market.depth_at_best_ask = float(ba.size) if ba else 0.0
                     bundles = await self.scorer.score_market(market, self.nav)
                     all_bundles.extend(bundles)
 
@@ -437,7 +437,7 @@ class PMM2Runtime:
                         "bundles": [
                             {
                                 "market_condition_id": b.market_condition_id,
-                                "expected_return_bps": b.expected_return_bps,
+                                "expected_return_bps": b.marginal_return * 10000.0,
                                 "is_reward_eligible": getattr(b, "is_reward_eligible", False),
                             }
                             for b in plan.funded_bundles
@@ -455,7 +455,7 @@ class PMM2Runtime:
                             }
                             for m in all_mutations
                         ],
-                        "total_ev": sum(b.expected_return_bps for b in plan.funded_bundles) / 10000.0,
+                        "total_ev": sum(b.marginal_return for b in plan.funded_bundles),
                     }
 
                     # Run counterfactual comparison
@@ -471,7 +471,7 @@ class PMM2Runtime:
                         "v1_orders": v1_snapshot.get("orders", []),
                         "pmm2_mutations": pmm2_plan["mutations"],
                         "ev_breakdown": [
-                            {"condition_id": b.market_condition_id, "ev_bps": b.expected_return_bps}
+                            {"condition_id": b.market_condition_id, "ev_bps": b.marginal_return * 10000.0}
                             for b in plan.funded_bundles
                         ],
                         "allocator_output": {
@@ -612,6 +612,8 @@ class PMM2Runtime:
             return float(bot_state.wallet_balance)
         if hasattr(bot_state, "total_equity"):
             return float(bot_state.total_equity)
+        if hasattr(bot_state, "inventory_manager") and hasattr(bot_state.inventory_manager, "get_total_nav_estimate"):
+            return float(bot_state.inventory_manager.get_total_nav_estimate())
 
         # Fallback
         logger.warning("nav_not_available_using_default")
