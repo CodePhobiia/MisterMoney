@@ -98,6 +98,8 @@ class MarketEVScorer:
             horizon_sec=horizon_sec,
             depletion_rate=depletion_ask,
         )
+        bundle.fill_prob_bid = fill_prob_bid
+        bundle.fill_prob_ask = fill_prob_ask
 
         # --- 2. Compute each EV component ---
         # Spread EV
@@ -116,23 +118,25 @@ class MarketEVScorer:
         # market liquidity. Using market.liquidity here wildly overstates
         # competitor mass and makes reward EV disappear even on good reward
         # markets.
-        q_others = max(
+        visible_competitor_depth = max(
             float(market.depth_at_best_bid) + float(market.depth_at_best_ask),
+            bundle.bid_size + bundle.ask_size,
             max(market.reward_min_size * 2.0, 10.0),
         )
         bundle.liq_ev = compute_reward_ev(
             market=market,
             bundle=bundle,
-            q_others=q_others,
-            p_scoring=0.85,
+            q_others=visible_competitor_depth,
+            p_scoring=1.0,
             h_allocator=1.0,
             t_epoch=24.0,
         )
 
         # Rebate EV
-        # Estimate fills per hour from volume (rough proxy)
-        fills_per_hour = max(market.volume_24h / 24.0 / 100.0, 0.1)  # conservative
-        total_depth = max(market.liquidity, 100.0)
+        # Estimate fills against the visible top-of-book we are actually competing with,
+        # not the market's headline lifetime liquidity.
+        fills_per_hour = max(market.volume_24h / 24.0 / max(visible_competitor_depth, 25.0), 0.1)
+        total_depth = visible_competitor_depth
         bundle.rebate_ev = compute_rebate_ev(
             market=market,
             bundle=bundle,
@@ -193,6 +197,7 @@ class MarketEVScorer:
         nav: float,
         reservation_price: float | None = None,
         min_order_size: float = 5.0,
+        per_market_cap_usdc: float | None = None,
     ) -> list[QuoteBundle]:
         """Generate and score all bundles for a market.
 
@@ -209,7 +214,12 @@ class MarketEVScorer:
             reservation_price = market.mid
 
         # --- 1. Generate bundles ---
-        bundles = generate_bundles(market=market, nav=nav, min_order_size=min_order_size)
+        bundles = generate_bundles(
+            market=market,
+            nav=nav,
+            min_order_size=min_order_size,
+            per_market_cap_usdc=per_market_cap_usdc,
+        )
 
         if not bundles:
             logger.debug(
@@ -227,6 +237,13 @@ class MarketEVScorer:
                 reservation_price=reservation_price,
                 nav=nav,
             )
+            if scored.bundle_type == "B3" and scored.spread_ev <= 0.0:
+                logger.debug(
+                    "bundle_b3_filtered_non_positive_edge",
+                    condition_id=market.condition_id,
+                    spread_ev=scored.spread_ev,
+                )
+                continue
             scored_bundles.append(scored)
 
         # --- 3. Sort by marginal return desc ---

@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from pmm2.universe.fee_surface import FeeSurface
-from pmm2.universe.metadata import EnrichedMarket, compute_ambiguity_score
+from pmm2.universe.metadata import (
+    EnrichedMarket,
+    compute_ambiguity_score,
+    detect_placeholder_outcomes,
+)
 from pmm2.universe.reward_surface import RewardSurface
 
 if TYPE_CHECKING:
@@ -154,7 +158,7 @@ async def build_enriched_universe(
             fee_rate=fee_rate,
             hours_to_resolution=hours_to_resolution,
             is_neg_risk=market.neg_risk,
-            has_placeholder_outcomes=False,  # TODO: Implement detection
+            has_placeholder_outcomes=detect_placeholder_outcomes(market.question),
             ambiguity_score=ambiguity_score,
             tick_size="0.01",  # Standard Polymarket tick size
             accepting_orders=market.accepting_orders,

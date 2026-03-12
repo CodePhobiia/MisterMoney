@@ -30,11 +30,12 @@ class UniverseScorer:
         """Compute composite score for a market.
 
         Scoring formula:
-        - base = log(1 + volume_24h) * (1 / max(spread_cents, 0.5))
-        - reward_bonus = reward_daily_rate * 10 if reward_eligible else 0
-        - fee_bonus = 2.0 if fees_enabled else 0
-        - risk_penalty = ambiguity_score * 5 + (1 / max(hours_to_resolution, 6)) * 2
-        - extreme_penalty = 10 if mid < 0.05 or mid > 0.95 else 0
+        - base = 0.6*log(1 + volume_24h) + 0.4*log(1 + liquidity)
+        - spread_penalty = spread_cents
+        - reward_bonus = bounded hourly reward return on minimum viable quote capital
+        - fee_bonus = bounded maker-fee intensity, not a fixed constant
+        - risk_penalty = ambiguity + near-resolution pressure
+        - extreme_penalty = high for near-certain markets where market making is thin
         - score = base + reward_bonus + fee_bonus - risk_penalty - extreme_penalty
 
         Args:
@@ -43,25 +44,28 @@ class UniverseScorer:
         Returns:
             Composite score (higher is better).
         """
-        # Base score: volume-weighted inverse spread
-        volume_log = math.log1p(market.volume_24h)
-        spread_safe = max(market.spread_cents, 0.5)  # Avoid division by zero
-        base = volume_log * (1.0 / spread_safe)
+        # Base score: prefer liquid markets but not solely on historical volume.
+        base = 0.6 * math.log1p(max(market.volume_24h, 0.0)) + 0.4 * math.log1p(
+            max(market.liquidity, 0.0)
+        )
+        spread_penalty = max(market.spread_cents, 0.5)
 
-        # Reward bonus
+        # Reward bonus: use reward EV intensity on the minimum two-sided size so
+        # large pools on impossible-to-score markets do not dominate selection.
         reward_bonus = 0.0
-        if market.reward_eligible:
-            reward_bonus = market.reward_daily_rate * 10.0
+        if market.reward_eligible and market.reward_daily_rate > 0.0:
+            min_scoring_cap = max(market.reward_min_size * 2.0, 10.0)
+            reward_hourly_return = (market.reward_daily_rate / 24.0) / min_scoring_cap
+            reward_bonus = min(reward_hourly_return * 100.0, 6.0)
 
-        # Fee bonus (fees mean potential rebates)
-        fee_bonus = 2.0 if market.fees_enabled else 0.0
+        fee_bonus = min(max(market.fee_rate, 0.0) * 500.0, 2.0) if market.fees_enabled else 0.0
 
         # Risk penalty
         ambiguity_penalty = market.ambiguity_score * 5.0
 
         # Resolution risk penalty (higher near resolution)
         hours_safe = max(market.hours_to_resolution, 6.0)
-        resolution_penalty = (1.0 / hours_safe) * 2.0
+        resolution_penalty = (6.0 / hours_safe) * 2.0
 
         risk_penalty = ambiguity_penalty + resolution_penalty
 
@@ -71,7 +75,7 @@ class UniverseScorer:
             extreme_penalty = 10.0
 
         # Compute final score
-        score = base + reward_bonus + fee_bonus - risk_penalty - extreme_penalty
+        score = base + reward_bonus + fee_bonus - spread_penalty - risk_penalty - extreme_penalty
 
         return score
 

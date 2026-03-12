@@ -26,6 +26,7 @@ class AdjustedScore(BaseModel):
     raw_return: float = 0.0  # R = V / Cap (from scorer)
     corr_penalty: float = 0.0  # λ · correlation with existing positions
     churn_penalty: float = 0.0  # φ · cost of entering/exiting this market
+    reward_credit: float = 0.0  # reward/rebate economics that justify paying entry churn
     queue_penalty: float = 0.0  # ψ · queue uncertainty
     inventory_penalty: float = 0.0  # μ · |net_exposure| / cap
     adjusted_return: float = 0.0  # R̃ = R - all penalties
@@ -99,6 +100,12 @@ class AdjustedScorer:
             # Entering a new market: fixed cost
             churn_penalty = self.churn_phi
 
+        reward_credit = 0.0
+        if churn_penalty > 0.0 and bundle.capital_usdc > 0.0:
+            reward_return = max(0.0, (bundle.liq_ev + bundle.rebate_ev) / bundle.capital_usdc)
+            reward_credit = min(churn_penalty, reward_return)
+            churn_penalty = max(0.0, churn_penalty - reward_credit)
+
         # --- Queue Uncertainty Penalty ---
         # Scale by queue_uncertainty (0-1)
         queue_penalty = self.queue_psi * queue_uncertainty
@@ -119,6 +126,7 @@ class AdjustedScorer:
             raw_return=raw_return,
             corr_penalty=corr_penalty,
             churn_penalty=churn_penalty,
+            reward_credit=reward_credit,
             queue_penalty=queue_penalty,
             inventory_penalty=inventory_penalty,
             adjusted_return=adjusted_return,
@@ -131,6 +139,7 @@ class AdjustedScorer:
             raw_return=raw_return,
             corr_penalty=corr_penalty,
             churn_penalty=churn_penalty,
+            reward_credit=reward_credit,
             queue_penalty=queue_penalty,
             inventory_penalty=inventory_penalty,
             adjusted_return=adjusted_return,

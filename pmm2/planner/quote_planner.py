@@ -27,6 +27,9 @@ class QuoteLadderRung(BaseModel):
     side: str  # BUY or SELL
     price: float
     size: float
+    capital_usdc: float = 0.0
+    fill_prob_30s: float = 0.0
+    quote_role: str = ""
     intent: str = "reward_core"  # reward_core, reward_depth, edge_extension
     bundle_type: str = "B1"  # B1, B2, B3
     neg_risk: bool = False
@@ -132,6 +135,9 @@ class QuotePlanner:
                     side=bid_side,
                     price=round(bundle.bid_price / tick_size) * tick_size,
                     size=bundle.bid_size,
+                    capital_usdc=bundle.bid_size * bundle.bid_price,
+                    fill_prob_30s=bundle.fill_prob_bid,
+                    quote_role="bid",
                     intent=intent,
                     bundle_type=bundle.bundle_type,
                     neg_risk=neg_risk,
@@ -159,6 +165,9 @@ class QuotePlanner:
                     side=ask_side,
                     price=round(ask_price / tick_size) * tick_size,
                     size=bundle.ask_size,
+                    capital_usdc=bundle.ask_size * max(0.0, 1.0 - ask_price),
+                    fill_prob_30s=bundle.fill_prob_ask,
+                    quote_role="ask",
                     intent=intent,
                     bundle_type=bundle.bundle_type,
                     neg_risk=neg_risk,

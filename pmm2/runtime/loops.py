@@ -17,7 +17,7 @@ import time
 
 import structlog
 
-from pmm2.allocator import CapitalAllocator
+from pmm2.allocator import AdjustedScorer, AllocationConstraints, CapitalAllocator
 from pmm2.config import PMM2Config
 from pmm2.persistence.action_ev import ActionEVCalculator
 from pmm2.persistence.hysteresis import HysteresisConfig, HysteresisGate
@@ -28,6 +28,13 @@ from pmm2.planner import DiffEngine, QuotePlanner
 from pmm2.queue import DepletionCalculator, FillHazard, QueueEstimator
 from pmm2.scorer.combined import MarketEVScorer
 from pmm2.shadow import CounterfactualEngine, ShadowDashboard, ShadowLogger, V1StateSnapshot
+from pmm2.shadow.valuation import (
+    aggregate_market_evaluations,
+    evaluate_quote_set,
+    market_context_from_object,
+    merge_market_contexts,
+    shadow_quote_from_rung,
+)
 from pmm2.universe.metadata import EnrichedMarket
 
 logger = structlog.get_logger(__name__)
@@ -63,7 +70,21 @@ class PMM2Runtime:
         self.fill_hazard = FillHazard()
         self.depletion_calc = DepletionCalculator()
         self.scorer = MarketEVScorer(db, self.fill_hazard, self.queue_estimator)
-        self.allocator = CapitalAllocator(nav=100.0)  # Updated from wallet
+        allocator_constraints = AllocationConstraints(
+            total_capital=100.0,
+            total_slots=config.max_slots_total,
+        )
+        adjusted_scorer = AdjustedScorer(
+            corr_lambda=config.corr_penalty_lambda / 100.0,
+            churn_phi=config.churn_penalty_phi / 100.0,
+            queue_psi=config.queue_uncertainty_psi / 100.0,
+        )
+        self.allocator = CapitalAllocator(
+            nav=100.0,
+            constraints=allocator_constraints,
+            scorer=adjusted_scorer,
+            min_positive_return_bps=config.min_positive_return_bps,
+        )
 
         # Persistence optimizer components
         state_machine = StateMachine()
@@ -270,7 +291,11 @@ class PMM2Runtime:
                     market = self._find_market(cid)
                     if market:
                         # Re-score this market
-                        bundles = await self.scorer.score_market(market, self.nav)
+                        bundles = await self.scorer.score_market(
+                            market,
+                            self.nav,
+                            per_market_cap_usdc=self.allocator.checker.per_market_cap(self.nav),
+                        )
                         # Note: we don't reallocate here, just refresh scores
                         # The allocator loop will pick up new scores on next cycle
 
@@ -304,11 +329,20 @@ class PMM2Runtime:
         while self.running:
             try:
                 # 0. Capture V1 state snapshot (for shadow mode comparison)
-                v1_snapshot = V1StateSnapshot.capture(bot_state)
+                shadow_market_contexts = self._build_shadow_market_contexts(bot_state)
+                v1_snapshot = V1StateSnapshot.capture(
+                    bot_state,
+                    market_contexts=shadow_market_contexts,
+                    queue_estimator=self.queue_estimator,
+                    fill_hazard=self.fill_hazard,
+                    allocator_interval_sec=self.config.allocator_interval_sec,
+                )
                 v1_snapshot["cancel_count_recent"] = self._recent_v1_cancel_count
+                v1_snapshot["cycle_minutes"] = self.config.allocator_interval_sec / 60.0
                 
                 # 1. Enrich depth from V1 book snapshots, then score
                 all_bundles = []
+                per_market_cap_usdc = self.allocator.checker.per_market_cap(self.nav)
                 for market in self.enriched_universe:
                     # Populate depth_at_best from V1 book (T1-01 wiring)
                     if hasattr(bot_state, 'book_manager'):
@@ -318,7 +352,11 @@ class PMM2Runtime:
                             ba = book.get_best_ask()
                             market.depth_at_best_bid = float(bb.size) if bb else 0.0
                             market.depth_at_best_ask = float(ba.size) if ba else 0.0
-                    bundles = await self.scorer.score_market(market, self.nav)
+                    bundles = await self.scorer.score_market(
+                        market,
+                        self.nav,
+                        per_market_cap_usdc=per_market_cap_usdc,
+                    )
                     all_bundles.extend(bundles)
 
                 logger.info(
@@ -449,39 +487,19 @@ class PMM2Runtime:
 
                 # 6. Shadow mode: counterfactual comparison and logging
                 if self.config.shadow_mode:
-                    # Build PMM-2 plan summary
-                    pmm2_plan = {
-                        "markets": list(new_plans.keys()),
-                        "bundles": [
-                            {
-                                "market_condition_id": b.market_condition_id,
-                                "expected_return_bps": b.marginal_return * 10000.0,
-                                "is_reward_eligible": getattr(b, "is_reward_eligible", False),
-                            }
-                            for b in plan.funded_bundles
-                        ],
-                        "mutations": [
-                            {
-                                "action": m.action,
-                                "condition_id": m.condition_id,
-                                "token_id": m.token_id,
-                                "side": m.side,
-                                "price": m.price,
-                                "size": m.size,
-                                "order_id": m.order_id,
-                                "reason": m.reason,
-                            }
-                            for m in all_mutations
-                        ],
-                        "target_order_count": sum(len(tp.ladder) for tp in new_plans.values()),
-                        "total_ev": sum(b.marginal_return for b in plan.funded_bundles),
-                    }
+                    pmm2_plan = self._build_shadow_plan_summary(
+                        plan,
+                        new_plans,
+                        all_mutations,
+                        shadow_market_contexts,
+                    )
 
                     # Run counterfactual comparison
                     comparison = self.counterfactual_engine.compare_cycle(v1_snapshot, pmm2_plan)
 
                     # Log full cycle
                     cycle_data = {
+                        "timestamp": v1_snapshot.get("timestamp"),
                         "v1_state": v1_snapshot,
                         "pmm2_plan": pmm2_plan,
                         "comparison": comparison,
@@ -496,10 +514,13 @@ class PMM2Runtime:
                         "allocator_output": {
                             "funded_bundles": len(plan.funded_bundles),
                             "total_capital_used": plan.total_capital_used,
+                            "reward_markets_funded": plan.reward_markets_funded,
+                            "skipped_bundles": list(plan.skipped_bundles),
                         },
                     }
 
                     self.shadow_logger.log_allocation_cycle(cycle_data)
+                    await self.shadow_logger.persist_allocation_cycle(cycle_data)
 
                     # Check for milestone reports (every 100 cycles)
                     cycle_num = self.counterfactual_engine.cycle_count
@@ -510,7 +531,7 @@ class PMM2Runtime:
                     logger.info(
                         "shadow_cycle_logged",
                         cycle=cycle_num,
-                        ev_delta=comparison.get("ev_delta", 0.0),
+                        ev_delta_usdc=comparison.get("ev_delta_usdc", 0.0),
                         ready_for_live=self.counterfactual_engine.is_ready_for_live(),
                     )
 
@@ -626,6 +647,110 @@ class PMM2Runtime:
             if m.condition_id == condition_id:
                 return m
         return None
+
+    def _build_shadow_market_contexts(self, bot_state) -> dict[str, any]:
+        """Merge PMM-2 universe metadata with PMM-1 active market truth."""
+
+        contexts: dict[str, any] = {}
+        for market in self.enriched_universe:
+            context = market_context_from_object(market)
+            contexts[market.condition_id] = merge_market_contexts(
+                contexts.get(market.condition_id),
+                context,
+            ) or context
+
+        reward_set = set(getattr(bot_state, "reward_eligible", set()) or set())
+        active_markets = getattr(bot_state, "active_markets", {}) or {}
+        for condition_id, market in active_markets.items():
+            context = market_context_from_object(
+                market,
+                reward_eligible_override=condition_id in reward_set,
+            )
+            if not context.condition_id:
+                context.condition_id = condition_id
+            contexts[condition_id] = merge_market_contexts(
+                contexts.get(condition_id),
+                context,
+            ) or context
+
+        return contexts
+
+    def _build_shadow_plan_summary(
+        self,
+        plan,
+        new_plans: dict[str, any],
+        all_mutations: list,
+        shadow_market_contexts: dict[str, any],
+    ) -> dict[str, any]:
+        """Build an apples-to-apples PMM-2 plan summary for shadow comparison."""
+
+        market_evaluations = []
+        for condition_id, target_plan in new_plans.items():
+            shadow_quotes = []
+            for rung in target_plan.ladder:
+                quote = shadow_quote_from_rung(rung)
+                if quote is not None:
+                    shadow_quotes.append(quote)
+
+            evaluation = evaluate_quote_set(
+                shadow_market_contexts.get(condition_id),
+                shadow_quotes,
+            )
+            market_evaluations.append(evaluation)
+
+        aggregate = aggregate_market_evaluations(market_evaluations)
+        cycle_minutes = self.config.allocator_interval_sec / 60.0
+        target_order_count = sum(len(tp.ladder) for tp in new_plans.values())
+        projected_cancel_count = sum(
+            1 for mutation in all_mutations if getattr(mutation, "action", "") == "cancel"
+        )
+
+        return {
+            "markets": list(new_plans.keys()),
+            "bundles": [
+                {
+                    "market_condition_id": bundle.market_condition_id,
+                    "bundle_type": bundle.bundle_type,
+                    "capital_usdc": bundle.capital_usdc,
+                    "spread_ev_usdc": bundle.spread_ev,
+                    "reward_ev_usdc": bundle.liq_ev,
+                    "rebate_ev_usdc": bundle.rebate_ev,
+                    "total_value_usdc": bundle.total_value,
+                    "expected_return_bps": bundle.marginal_return * 10000.0,
+                    "is_reward_eligible": getattr(bundle, "is_reward_eligible", False),
+                }
+                for bundle in plan.funded_bundles
+            ],
+            "mutations": [
+                {
+                    "action": mutation.action,
+                    "condition_id": mutation.condition_id,
+                    "token_id": mutation.token_id,
+                    "side": mutation.side,
+                    "price": mutation.price,
+                    "size": mutation.size,
+                    "order_id": mutation.order_id,
+                    "reason": mutation.reason,
+                }
+                for mutation in all_mutations
+            ],
+            "market_evaluations": [
+                evaluation.model_dump() for evaluation in market_evaluations
+            ],
+            "target_order_count": target_order_count,
+            "live_order_minutes": target_order_count * cycle_minutes,
+            "cycle_minutes": cycle_minutes,
+            "projected_cancel_count": projected_cancel_count,
+            "total_capital_usdc": plan.total_capital_used,
+            "total_expected_ev_usdc": aggregate["total_ev_usdc"],
+            "bundle_total_value_usdc": sum(bundle.total_value for bundle in plan.funded_bundles),
+            "total_reward_ev_usdc": aggregate["total_reward_ev_usdc"],
+            "total_rebate_ev_usdc": aggregate["total_rebate_ev_usdc"],
+            "reward_market_count": aggregate["reward_market_count"],
+            "reward_pair_mass_total": aggregate["reward_pair_mass_total"],
+            "ev_sample_valid": aggregate["ev_sample_valid"],
+            "invalid_markets": aggregate["invalid_markets"],
+        }
 
     def _get_nav(self, bot_state) -> float:
         """Get current NAV from bot state.

@@ -113,9 +113,49 @@ CREATE TABLE IF NOT EXISTS scoring_history (
     PRIMARY KEY (ts, order_id)
 );
 
+-- Shadow cycle comparisons and readiness diagnostics
+CREATE TABLE IF NOT EXISTS shadow_cycle (
+    ts TEXT NOT NULL,
+    cycle_num INTEGER NOT NULL,
+    ready_for_live INTEGER NOT NULL DEFAULT 0,
+    window_cycles INTEGER DEFAULT 0,
+    ev_sample_count INTEGER DEFAULT 0,
+    reward_sample_count INTEGER DEFAULT 0,
+    churn_sample_count INTEGER DEFAULT 0,
+    gate_ev_positive INTEGER DEFAULT 0,
+    gate_reward_capture INTEGER DEFAULT 0,
+    gate_churn INTEGER DEFAULT 0,
+    gate_sample_size INTEGER DEFAULT 0,
+    v1_market_count INTEGER DEFAULT 0,
+    pmm2_market_count INTEGER DEFAULT 0,
+    market_overlap_pct REAL DEFAULT 0.0,
+    overlap_quote_distance_bps REAL DEFAULT 0.0,
+    v1_total_ev_usdc REAL DEFAULT 0.0,
+    pmm2_total_ev_usdc REAL DEFAULT 0.0,
+    ev_delta_usdc REAL DEFAULT 0.0,
+    v1_reward_market_count INTEGER DEFAULT 0,
+    pmm2_reward_market_count INTEGER DEFAULT 0,
+    reward_market_delta REAL DEFAULT 0.0,
+    v1_reward_ev_usdc REAL DEFAULT 0.0,
+    pmm2_reward_ev_usdc REAL DEFAULT 0.0,
+    reward_ev_delta_usdc REAL DEFAULT 0.0,
+    v1_cancel_rate_per_order_min REAL DEFAULT 0.0,
+    pmm2_cancel_rate_per_order_min REAL DEFAULT 0.0,
+    churn_delta_per_order_min REAL DEFAULT 0.0,
+    gate_blockers_json TEXT,
+    gate_diagnostics_json TEXT,
+    comparison_json TEXT,
+    summary_json TEXT,
+    v1_state_json TEXT,
+    pmm2_plan_json TEXT,
+    PRIMARY KEY (ts, cycle_num)
+);
+
 -- Create indices for common queries
 CREATE INDEX IF NOT EXISTS idx_fill_record_ts ON fill_record(ts);
 CREATE INDEX IF NOT EXISTS idx_fill_record_condition ON fill_record(condition_id);
 CREATE INDEX IF NOT EXISTS idx_book_snapshot_ts ON book_snapshot(ts);
 CREATE INDEX IF NOT EXISTS idx_book_snapshot_condition ON book_snapshot(condition_id);
 CREATE INDEX IF NOT EXISTS idx_scoring_history_order ON scoring_history(order_id);
+CREATE INDEX IF NOT EXISTS idx_shadow_cycle_ts ON shadow_cycle(ts);
+CREATE INDEX IF NOT EXISTS idx_shadow_cycle_ready ON shadow_cycle(ready_for_live, ts);

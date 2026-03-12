@@ -34,6 +34,7 @@ class CapitalAllocator:
         scorer: AdjustedScorer | None = None,
         hysteresis: ReallocationHysteresis | None = None,
         circuit_breaker: CircuitBreaker | None = None,
+        min_positive_return_bps: float = 6.0,
     ):
         """Initialize capital allocator.
 
@@ -48,7 +49,12 @@ class CapitalAllocator:
         self.constraints = constraints or AllocationConstraints(total_capital=nav)
         self.scorer = scorer or AdjustedScorer()
         self.checker = ConstraintChecker(self.constraints)
-        self.greedy = GreedyAllocator(self.constraints, self.checker)
+        self.min_positive_return_bps = min_positive_return_bps
+        self.greedy = GreedyAllocator(
+            self.constraints,
+            self.checker,
+            min_positive_return_bps=min_positive_return_bps,
+        )
         self.hysteresis = hysteresis or ReallocationHysteresis()
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
 
@@ -58,6 +64,7 @@ class CapitalAllocator:
             active_cap=self.constraints.total_capital * self.constraints.active_cap_frac,
             per_market_cap=self.checker.per_market_cap(nav),
             per_event_cap=self.constraints.total_capital * self.constraints.per_event_cap_frac,
+            min_positive_return_bps=min_positive_return_bps,
         )
 
     def update_nav(self, nav: float):
@@ -152,6 +159,7 @@ class CapitalAllocator:
         raw_plan = self.greedy.allocate(
             scored_bundles=adjusted_scores,
             event_clusters=event_clusters,
+            min_positive_return_bps=self.min_positive_return_bps,
         )
 
         logger.info(

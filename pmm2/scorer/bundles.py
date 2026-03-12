@@ -32,6 +32,8 @@ class QuoteBundle(BaseModel):
     bid_size: float = 0.0
     ask_price: float = 0.0
     ask_size: float = 0.0
+    fill_prob_bid: float = 0.0
+    fill_prob_ask: float = 0.0
 
     # EV components (filled by scorer)
     spread_ev: float = 0.0
@@ -53,7 +55,10 @@ class QuoteBundle(BaseModel):
 
 
 def generate_bundles(
-    market: EnrichedMarket, nav: float, min_order_size: float = 5.0
+    market: EnrichedMarket,
+    nav: float,
+    min_order_size: float = 5.0,
+    per_market_cap_usdc: float | None = None,
 ) -> list[QuoteBundle]:
     """Generate B1/B2/B3 nested bundles for a market.
 
@@ -82,9 +87,11 @@ def generate_bundles(
     if market.best_bid <= 0 or market.best_ask <= 0 or market.best_ask <= market.best_bid:
         return bundles
 
-    # Per-market capital limit: scale-aware
-    # B1 needs 2 × min_order_size ($10), so floor must cover that
-    per_market_cap = max(nav * 0.08, 2.5 * min_order_size)
+    # Per-market capital limit: use allocator truth when available so the scorer
+    # does not rate bundles the allocator can never legally fund.
+    per_market_cap = per_market_cap_usdc
+    if per_market_cap is None:
+        per_market_cap = max(nav * 0.08, 2.5 * min_order_size)
 
     # Tick size (convert string to float)
     try:

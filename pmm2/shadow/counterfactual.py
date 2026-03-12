@@ -1,18 +1,4 @@
-"""Counterfactual comparison engine — V1 actuals vs PMM-2 what-if.
-
-Compares every allocation cycle:
-1. Market selection divergence (which markets to quote)
-2. Pricing divergence (how prices differ)
-3. Predicted fill improvement (better queue positioning)
-4. Reward capture improvement (more reward-eligible markets)
-5. Overall EV delta (expected value improvement)
-
-Tracks launch readiness gates from spec Section 14:
-- Gate 1: Positive EV delta in ≥70% of cycles
-- Gate 2: Better market selection (more reward-eligible)
-- Gate 3: Lower churn (fewer cancels per live minute)
-- Gate 4: At least 100 cycles of data
-"""
+"""Counterfactual comparison engine for PMM-1 actuals vs PMM-2 shadow plans."""
 
 from __future__ import annotations
 
@@ -25,297 +11,358 @@ logger = structlog.get_logger(__name__)
 
 
 class CounterfactualEngine:
-    """Compare V1 actuals vs PMM-2 counterfactuals.
+    """Compare V1 actuals vs PMM-2 using real state and rolling diagnostics."""
 
-    For each allocator cycle, computes:
-    1. Market selection divergence
-    2. Pricing divergence
-    3. Predicted fill improvement
-    4. Reward capture improvement
-    5. Overall EV delta
-    """
+    ROLLING_WINDOW = 100
+    MIN_EV_SAMPLES = 60
+    MIN_REWARD_SAMPLES = 60
+    MIN_CHURN_SAMPLES = 60
+    MIN_POSITIVE_EV_PCT = 55.0
 
     def __init__(self, shadow_logger):
-        """Initialize counterfactual engine.
-
-        Args:
-            shadow_logger: ShadowLogger instance for logging comparisons
-        """
         self.shadow_logger = shadow_logger
         self.cycle_count: int = 0
-        self.positive_ev_cycles: int = 0
-        self.total_ev_delta: float = 0.0
-
-        # Rolling metrics
+        self.history: list[dict[str, Any]] = []
         self.metrics: dict[str, list[float]] = {
-            "market_overlap_pct": [],  # how many markets both agree on
-            "pmm2_reward_markets": [],  # reward-eligible in PMM-2 vs V1
-            "pmm2_churn_reduction": [],  # fewer cancels predicted
-            "ev_delta_per_cycle": [],  # EV improvement estimate
+            "market_overlap_pct": [],
+            "reward_market_delta": [],
+            "reward_ev_delta_usdc": [],
+            "churn_delta_per_order_min": [],
+            "ev_delta_usdc": [],
+            "overlap_quote_distance_bps": [],
         }
 
         logger.info("counterfactual_engine_initialized")
 
     def compare_cycle(
         self,
-        v1_state: dict[str, Any],  # V1's current state snapshot
-        pmm2_plan: dict[str, Any],  # PMM-2's target plan
+        v1_state: dict[str, Any],
+        pmm2_plan: dict[str, Any],
     ) -> dict[str, Any]:
-        """Compare a single allocation cycle.
+        """Compare one allocator cycle."""
 
-        v1_state: {
-            markets: set of condition_ids,
-            orders: list of {token_id, side, price, size},
-            scoring_count: int,
-            reward_eligible_count: int,
-        }
-
-        pmm2_plan: {
-            markets: set of condition_ids,
-            bundles: list of QuoteBundle,
-            mutations: list of OrderMutation,
-            total_ev: float,
-        }
-
-        Returns comparison dict with divergence metrics.
-        """
         self.cycle_count += 1
 
-        # Extract sets of markets
         v1_markets = set(v1_state.get("markets", []))
         pmm2_markets = set(pmm2_plan.get("markets", []))
-
-        # Calculate market overlap
         overlap = v1_markets & pmm2_markets
         union = v1_markets | pmm2_markets
-        overlap_pct = len(overlap) / len(union) if union else 0.0
+        overlap_pct = len(overlap) / len(union) if union else 1.0
 
-        # Market selection divergence
-        pmm2_only = pmm2_markets - v1_markets
-        v1_only = v1_markets - pmm2_markets
+        v1_total_ev = float(v1_state.get("total_expected_ev_usdc", 0.0) or 0.0)
+        pmm2_total_ev = float(pmm2_plan.get("total_expected_ev_usdc", 0.0) or 0.0)
+        ev_sample_valid = bool(
+            v1_state.get("ev_sample_valid", True) and pmm2_plan.get("ev_sample_valid", True)
+        )
+        ev_delta = pmm2_total_ev - v1_total_ev if ev_sample_valid else 0.0
 
-        # Reward market comparison (count unique markets, not bundles/orders)
-        v1_reward_count = v1_state.get("reward_eligible_count", 0)
-        pmm2_reward_markets = {
-            b.get("market_condition_id")
-            for b in pmm2_plan.get("bundles", [])
-            if b.get("is_reward_eligible", False) and b.get("market_condition_id")
-        }
-        pmm2_reward_count = len(pmm2_reward_markets)
-        reward_improvement = pmm2_reward_count - v1_reward_count
+        v1_reward_markets = int(v1_state.get("reward_market_count", 0) or 0)
+        pmm2_reward_markets = int(pmm2_plan.get("reward_market_count", 0) or 0)
+        reward_market_delta = pmm2_reward_markets - v1_reward_markets
+        v1_reward_ev = float(v1_state.get("total_reward_ev_usdc", 0.0) or 0.0)
+        pmm2_reward_ev = float(pmm2_plan.get("total_reward_ev_usdc", 0.0) or 0.0)
+        reward_ev_delta = pmm2_reward_ev - v1_reward_ev
+        reward_sample_valid = ev_sample_valid
 
-        # Churn comparison (recent V1 actual cancels vs PMM-2 projected cancel rate)
-        v1_order_count = len(v1_state.get("orders", []))
-        v1_cancel_count = float(v1_state.get("cancel_count_recent", 0) or 0.0)
-        pmm2_mutations = pmm2_plan.get("mutations", [])
-        pmm2_cancels = len([m for m in pmm2_mutations if m.get("action") == "cancel"])
-        pmm2_target_order_count = float(
-            pmm2_plan.get("target_order_count", 0) or max(len(pmm2_plan.get("markets", [])) * 2, 1)
+        cycle_minutes = max(float(v1_state.get("cycle_minutes", 0.0) or 0.0), 0.0)
+        if cycle_minutes <= 0.0:
+            cycle_minutes = max(float(pmm2_plan.get("cycle_minutes", 0.0) or 0.0), 0.0)
+        if cycle_minutes <= 0.0:
+            cycle_minutes = 1.0
+
+        v1_cancel_count = float(v1_state.get("cancel_count_recent", 0.0) or 0.0)
+        pmm2_cancel_count = float(pmm2_plan.get("projected_cancel_count", 0.0) or 0.0)
+        v1_live_order_minutes = float(v1_state.get("live_order_minutes", 0.0) or 0.0)
+        pmm2_live_order_minutes = float(pmm2_plan.get("live_order_minutes", 0.0) or 0.0)
+        churn_sample_valid = (v1_live_order_minutes + pmm2_live_order_minutes) > 0.0
+        v1_cancel_rate = (
+            v1_cancel_count / max(v1_live_order_minutes, 1e-9)
+            if churn_sample_valid
+            else 0.0
+        )
+        pmm2_cancel_rate = (
+            pmm2_cancel_count / max(pmm2_live_order_minutes, 1e-9)
+            if churn_sample_valid
+            else 0.0
+        )
+        churn_delta = v1_cancel_rate - pmm2_cancel_rate if churn_sample_valid else 0.0
+
+        quote_distance_bps = self._quote_distance_bps(
+            v1_state.get("market_evaluations", []),
+            pmm2_plan.get("market_evaluations", []),
+            overlap,
         )
 
-        v1_cancel_rate = v1_cancel_count / max(v1_order_count, 1)
-        pmm2_cancel_rate = pmm2_cancels / max(pmm2_target_order_count, 1)
-        churn_reduction = v1_cancel_rate - pmm2_cancel_rate
-
-        # EV delta (PMM-2 total EV vs V1's implicit EV)
-        pmm2_ev = pmm2_plan.get("total_ev", 0.0)
-        # V1 doesn't track EV explicitly, so we'll estimate from scoring count
-        # Each scoring order might earn ~$0.01/day in rewards
-        v1_scoring_count = v1_state.get("scoring_count", 0)
-        v1_estimated_ev = v1_scoring_count * 0.01  # Rough estimate
-        ev_delta = pmm2_ev - v1_estimated_ev
-
-        # Track positive EV cycles
-        if ev_delta > 0:
-            self.positive_ev_cycles += 1
-
-        self.total_ev_delta += ev_delta
-
-        # Update rolling metrics
-        self.metrics["market_overlap_pct"].append(overlap_pct)
-        self.metrics["pmm2_reward_markets"].append(reward_improvement)
-        self.metrics["pmm2_churn_reduction"].append(churn_reduction)
-        self.metrics["ev_delta_per_cycle"].append(ev_delta)
-
-        # Build comparison result
         comparison = {
             "cycle_num": self.cycle_count,
             "market_overlap_pct": overlap_pct,
-            "v1_markets": list(v1_markets),
-            "pmm2_markets": list(pmm2_markets),
-            "pmm2_only_markets": list(pmm2_only),
-            "v1_only_markets": list(v1_only),
-            "v1_reward_count": v1_reward_count,
-            "pmm2_reward_count": pmm2_reward_count,
-            "reward_improvement": reward_improvement,
-            "v1_order_count": v1_order_count,
+            "overlap_quote_distance_bps": quote_distance_bps,
+            "v1_markets": sorted(v1_markets),
+            "pmm2_markets": sorted(pmm2_markets),
+            "pmm2_only_markets": sorted(pmm2_markets - v1_markets),
+            "v1_only_markets": sorted(v1_markets - pmm2_markets),
+            "ev_sample_valid": ev_sample_valid,
+            "reward_sample_valid": reward_sample_valid,
+            "churn_sample_valid": churn_sample_valid,
+            "v1_total_ev_usdc": v1_total_ev,
+            "pmm2_total_ev_usdc": pmm2_total_ev,
+            "ev_delta_usdc": ev_delta,
+            "v1_reward_market_count": v1_reward_markets,
+            "pmm2_reward_market_count": pmm2_reward_markets,
+            "reward_market_delta": reward_market_delta,
+            "v1_reward_ev_usdc": v1_reward_ev,
+            "pmm2_reward_ev_usdc": pmm2_reward_ev,
+            "reward_ev_delta_usdc": reward_ev_delta,
             "v1_cancel_count": v1_cancel_count,
-            "v1_cancel_rate": v1_cancel_rate,
-            "pmm2_mutation_count": len(pmm2_mutations),
-            "pmm2_cancel_count": pmm2_cancels,
-            "pmm2_cancel_rate": pmm2_cancel_rate,
-            "churn_reduction": churn_reduction,
-            "v1_estimated_ev": v1_estimated_ev,
-            "pmm2_ev": pmm2_ev,
-            "ev_delta": ev_delta,
+            "pmm2_cancel_count": pmm2_cancel_count,
+            "v1_cancel_rate_per_order_min": v1_cancel_rate,
+            "pmm2_cancel_rate_per_order_min": pmm2_cancel_rate,
+            "churn_delta_per_order_min": churn_delta,
+            "divergences": [],
         }
 
-        # Log divergences if significant
-        if overlap_pct < 0.5:
-            self.shadow_logger.log_divergence(
-                "market_selection",
-                {
-                    "overlap_pct": overlap_pct,
-                    "pmm2_only": list(pmm2_only),
-                    "v1_only": list(v1_only),
-                },
-            )
+        comparison["divergences"] = self._log_divergences(comparison)
 
-        if abs(ev_delta) > 0.01:  # More than $0.01 EV difference
-            self.shadow_logger.log_divergence(
-                "scoring_difference",
-                {
-                    "v1_ev": v1_estimated_ev,
-                    "pmm2_ev": pmm2_ev,
-                    "delta": ev_delta,
-                },
-            )
+        self.history.append(comparison)
+        self.metrics["market_overlap_pct"].append(overlap_pct)
+        self.metrics["reward_market_delta"].append(float(reward_market_delta))
+        self.metrics["reward_ev_delta_usdc"].append(reward_ev_delta)
+        self.metrics["churn_delta_per_order_min"].append(churn_delta)
+        self.metrics["ev_delta_usdc"].append(ev_delta)
+        self.metrics["overlap_quote_distance_bps"].append(quote_distance_bps)
+
+        gate_diagnostics = self.get_gate_diagnostics()
+        summary = self.get_summary()
+        comparison["gate_diagnostics"] = gate_diagnostics
+        comparison["summary"] = summary
 
         logger.info(
             "counterfactual_cycle_compared",
             cycle=self.cycle_count,
             overlap_pct=overlap_pct,
-            ev_delta=ev_delta,
-            reward_improvement=reward_improvement,
+            ev_delta_usdc=ev_delta,
+            reward_ev_delta_usdc=reward_ev_delta,
+            churn_delta_per_order_min=churn_delta,
+            ready_for_live=summary["ready_for_live"],
         )
 
         return comparison
 
-    def get_summary(self) -> dict[str, Any]:
-        """Get rolling summary of shadow performance.
+    def _recent_history(self, window: int | None = None) -> list[dict[str, Any]]:
+        sample_window = window or self.ROLLING_WINDOW
+        if sample_window <= 0:
+            return list(self.history)
+        return self.history[-sample_window:]
 
-        Returns:
-        {
-            'cycles_run': 150,
-            'positive_ev_pct': 72.0,  # % of cycles where PMM-2 had higher EV
-            'avg_ev_delta': 0.005,
-            'avg_market_overlap': 0.65,
-            'avg_reward_improvement': 3.2,  # more reward markets
-            'avg_churn_reduction': 0.15,  # 15% fewer cancels
-            'ready_for_live': True/False,
+    def _mean(self, values: list[float]) -> float:
+        return statistics.mean(values) if values else 0.0
+
+    def _quote_distance_bps(
+        self,
+        v1_market_evaluations: list[dict[str, Any]],
+        pmm2_market_evaluations: list[dict[str, Any]],
+        overlapping_markets: set[str],
+    ) -> float:
+        if not overlapping_markets:
+            return 0.0
+
+        v1_map = {
+            evaluation.get("condition_id"): evaluation
+            for evaluation in v1_market_evaluations
+            if evaluation.get("condition_id")
         }
-        """
+        pmm2_map = {
+            evaluation.get("condition_id"): evaluation
+            for evaluation in pmm2_market_evaluations
+            if evaluation.get("condition_id")
+        }
+
+        quote_diffs = []
+        for condition_id in overlapping_markets:
+            v1_eval = v1_map.get(condition_id)
+            pmm2_eval = pmm2_map.get(condition_id)
+            if not v1_eval or not pmm2_eval:
+                continue
+            for key in ("best_bid", "best_ask"):
+                v1_px = float(v1_eval.get(key, 0.0) or 0.0)
+                pmm2_px = float(pmm2_eval.get(key, 0.0) or 0.0)
+                if v1_px > 0.0 and pmm2_px > 0.0:
+                    quote_diffs.append(abs(v1_px - pmm2_px) * 10000.0)
+
+        return self._mean(quote_diffs)
+
+    def _log_divergences(self, comparison: dict[str, Any]) -> list[dict[str, Any]]:
+        divergences: list[dict[str, Any]] = []
+
+        if comparison["market_overlap_pct"] < 0.5:
+            details = {
+                "overlap_pct": comparison["market_overlap_pct"],
+                "pmm2_only": comparison["pmm2_only_markets"],
+                "v1_only": comparison["v1_only_markets"],
+            }
+            self.shadow_logger.log_divergence("market_selection", details)
+            divergences.append({"type": "market_selection", "details": details})
+
+        if comparison["ev_sample_valid"] and comparison["ev_delta_usdc"] < 0.0:
+            details = {
+                "v1_ev": comparison["v1_total_ev_usdc"],
+                "pmm2_ev": comparison["pmm2_total_ev_usdc"],
+                "delta": comparison["ev_delta_usdc"],
+            }
+            self.shadow_logger.log_divergence("economic_regression", details)
+            divergences.append({"type": "economic_regression", "details": details})
+
+        if comparison["reward_sample_valid"] and comparison["reward_ev_delta_usdc"] < 0.0:
+            details = {
+                "v1_reward_ev": comparison["v1_reward_ev_usdc"],
+                "pmm2_reward_ev": comparison["pmm2_reward_ev_usdc"],
+                "delta": comparison["reward_ev_delta_usdc"],
+            }
+            self.shadow_logger.log_divergence("reward_regression", details)
+            divergences.append({"type": "reward_regression", "details": details})
+
+        if comparison["churn_sample_valid"] and comparison["churn_delta_per_order_min"] < 0.0:
+            details = {
+                "v1_cancel_rate": comparison["v1_cancel_rate_per_order_min"],
+                "pmm2_cancel_rate": comparison["pmm2_cancel_rate_per_order_min"],
+                "delta": comparison["churn_delta_per_order_min"],
+            }
+            self.shadow_logger.log_divergence("churn_regression", details)
+            divergences.append({"type": "churn_regression", "details": details})
+
+        return divergences
+
+    def get_gate_diagnostics(self, window: int | None = None) -> dict[str, Any]:
+        recent = self._recent_history(window)
+        ev_samples = [row for row in recent if row.get("ev_sample_valid", False)]
+        reward_samples = [row for row in recent if row.get("reward_sample_valid", False)]
+        churn_samples = [row for row in recent if row.get("churn_sample_valid", False)]
+
+        positive_ev_pct = (
+            (sum(1 for row in ev_samples if row["ev_delta_usdc"] > 0.0) / len(ev_samples)) * 100.0
+            if ev_samples
+            else 0.0
+        )
+        avg_ev_delta = self._mean([row["ev_delta_usdc"] for row in ev_samples])
+        avg_reward_market_delta = self._mean([row["reward_market_delta"] for row in reward_samples])
+        avg_reward_ev_delta = self._mean([row["reward_ev_delta_usdc"] for row in reward_samples])
+        avg_churn_delta = self._mean([row["churn_delta_per_order_min"] for row in churn_samples])
+
+        gates = {
+            "gate_ev_positive": {
+                "pass": len(ev_samples) >= self.MIN_EV_SAMPLES
+                and avg_ev_delta > 0.0
+                and positive_ev_pct >= self.MIN_POSITIVE_EV_PCT,
+                "sample_count": len(ev_samples),
+                "threshold_sample_count": self.MIN_EV_SAMPLES,
+                "observed_avg_ev_delta_usdc": avg_ev_delta,
+                "observed_positive_ev_pct": positive_ev_pct,
+                "threshold_positive_ev_pct": self.MIN_POSITIVE_EV_PCT,
+            },
+            "gate_reward_capture": {
+                "pass": len(reward_samples) >= self.MIN_REWARD_SAMPLES
+                and avg_reward_ev_delta >= 0.0
+                and avg_reward_market_delta >= 0.0,
+                "sample_count": len(reward_samples),
+                "threshold_sample_count": self.MIN_REWARD_SAMPLES,
+                "observed_avg_reward_ev_delta_usdc": avg_reward_ev_delta,
+                "observed_avg_reward_market_delta": avg_reward_market_delta,
+            },
+            "gate_churn": {
+                "pass": len(churn_samples) >= self.MIN_CHURN_SAMPLES
+                and avg_churn_delta >= 0.0,
+                "sample_count": len(churn_samples),
+                "threshold_sample_count": self.MIN_CHURN_SAMPLES,
+                "observed_avg_churn_delta_per_order_min": avg_churn_delta,
+            },
+            "gate_sample_size": {
+                "pass": len(recent) >= self.ROLLING_WINDOW
+                and len(ev_samples) >= self.MIN_EV_SAMPLES
+                and len(reward_samples) >= self.MIN_REWARD_SAMPLES
+                and len(churn_samples) >= self.MIN_CHURN_SAMPLES,
+                "window_cycles": len(recent),
+                "threshold_window_cycles": self.ROLLING_WINDOW,
+                "ev_sample_count": len(ev_samples),
+                "reward_sample_count": len(reward_samples),
+                "churn_sample_count": len(churn_samples),
+            },
+        }
+
+        blocking_gates = [name for name, details in gates.items() if not details["pass"]]
+        ready_for_live = all(details["pass"] for details in gates.values())
+
+        return {
+            "window_cycles": len(recent),
+            "ev_sample_count": len(ev_samples),
+            "reward_sample_count": len(reward_samples),
+            "churn_sample_count": len(churn_samples),
+            "gates": gates,
+            "blocking_gates": blocking_gates,
+            "ready_for_live": ready_for_live,
+        }
+
+    def get_summary(self) -> dict[str, Any]:
         if self.cycle_count == 0:
             return {
                 "cycles_run": 0,
+                "rolling_window_cycles": 0,
                 "positive_ev_pct": 0.0,
-                "avg_ev_delta": 0.0,
+                "avg_ev_delta_usdc": 0.0,
                 "avg_market_overlap": 0.0,
-                "avg_reward_improvement": 0.0,
-                "avg_churn_reduction": 0.0,
+                "avg_reward_market_delta": 0.0,
+                "avg_reward_ev_delta_usdc": 0.0,
+                "avg_churn_delta_per_order_min": 0.0,
+                "avg_overlap_quote_distance_bps": 0.0,
                 "ready_for_live": False,
+                "gate_blockers": [],
+                "ev_sample_count": 0,
+                "reward_sample_count": 0,
+                "churn_sample_count": 0,
             }
 
-        # Calculate averages from rolling metrics (last 100 cycles)
-        def avg_last_n(metric_list: list[float], n: int = 100) -> float:
-            recent = metric_list[-n:] if len(metric_list) > n else metric_list
-            return statistics.mean(recent) if recent else 0.0
+        recent = self._recent_history()
+        ev_samples = [row for row in recent if row.get("ev_sample_valid", False)]
+        reward_samples = [row for row in recent if row.get("reward_sample_valid", False)]
+        churn_samples = [row for row in recent if row.get("churn_sample_valid", False)]
+        gate_diagnostics = self.get_gate_diagnostics()
 
-        positive_ev_pct = (self.positive_ev_cycles / self.cycle_count) * 100.0
-        avg_ev_delta = self.total_ev_delta / self.cycle_count
-
-        # Compute readiness inline to avoid circular dependency
-        ready = False
-        if self.cycle_count >= 100:
-            gate_1 = positive_ev_pct >= 70.0
-            gate_2 = avg_last_n(self.metrics["pmm2_reward_markets"]) > 0.0
-            gate_3 = avg_last_n(self.metrics["pmm2_churn_reduction"]) > 0.0
-            gate_4 = True  # Already checked cycle_count
-            ready = gate_1 and gate_2 and gate_3 and gate_4
-
-        summary = {
-            "cycles_run": self.cycle_count,
-            "positive_ev_pct": positive_ev_pct,
-            "avg_ev_delta": avg_ev_delta,
-            "avg_market_overlap": avg_last_n(self.metrics["market_overlap_pct"]),
-            "avg_reward_improvement": avg_last_n(self.metrics["pmm2_reward_markets"]),
-            "avg_churn_reduction": avg_last_n(self.metrics["pmm2_churn_reduction"]),
-            "ready_for_live": ready,
-        }
-
-        return summary
-
-    def is_ready_for_live(self) -> bool:
-        """Check if PMM-2 meets the launch gates from spec Section 14.
-
-        Gates:
-        1. Positive EV delta in at least 70% of cycles
-        2. Better market selection (more reward-eligible on average)
-        3. Lower churn (fewer cancels per live minute)
-        4. At least 100 cycles of data
-
-        Returns:
-            True if all gates passed
-        """
-        if self.cycle_count < 100:
-            return False
-
-        # Helper to compute average of last N values
-        def avg_last_n(metric_list: list[float], n: int = 100) -> float:
-            recent = metric_list[-n:] if len(metric_list) > n else metric_list
-            return statistics.mean(recent) if recent else 0.0
-
-        positive_ev_pct = (self.positive_ev_cycles / self.cycle_count) * 100.0
-
-        # Gate 1: Positive EV in ≥70% of cycles
-        gate_1 = positive_ev_pct >= 70.0
-
-        # Gate 2: Better market selection (more reward markets)
-        gate_2 = avg_last_n(self.metrics["pmm2_reward_markets"]) > 0.0
-
-        # Gate 3: Lower churn (positive reduction)
-        gate_3 = avg_last_n(self.metrics["pmm2_churn_reduction"]) > 0.0
-
-        # Gate 4: Enough data
-        gate_4 = self.cycle_count >= 100
-
-        all_gates_passed = gate_1 and gate_2 and gate_3 and gate_4
-
-        logger.info(
-            "launch_gates_checked",
-            gate_1_positive_ev=gate_1,
-            gate_2_better_selection=gate_2,
-            gate_3_lower_churn=gate_3,
-            gate_4_enough_data=gate_4,
-            ready=all_gates_passed,
+        positive_ev_pct = (
+            (sum(1 for row in ev_samples if row["ev_delta_usdc"] > 0.0) / len(ev_samples)) * 100.0
+            if ev_samples
+            else 0.0
         )
 
-        return all_gates_passed
+        return {
+            "cycles_run": self.cycle_count,
+            "rolling_window_cycles": len(recent),
+            "positive_ev_pct": positive_ev_pct,
+            "avg_ev_delta_usdc": self._mean([row["ev_delta_usdc"] for row in ev_samples]),
+            "avg_market_overlap": self._mean([row["market_overlap_pct"] for row in recent]),
+            "avg_reward_market_delta": self._mean(
+                [row["reward_market_delta"] for row in reward_samples]
+            ),
+            "avg_reward_ev_delta_usdc": self._mean(
+                [row["reward_ev_delta_usdc"] for row in reward_samples]
+            ),
+            "avg_churn_delta_per_order_min": self._mean(
+                [row["churn_delta_per_order_min"] for row in churn_samples]
+            ),
+            "avg_overlap_quote_distance_bps": self._mean(
+                [row["overlap_quote_distance_bps"] for row in recent]
+            ),
+            "ready_for_live": gate_diagnostics["ready_for_live"],
+            "gate_blockers": gate_diagnostics["blocking_gates"],
+            "ev_sample_count": len(ev_samples),
+            "reward_sample_count": len(reward_samples),
+            "churn_sample_count": len(churn_samples),
+        }
+
+    def is_ready_for_live(self) -> bool:
+        return self.get_gate_diagnostics()["ready_for_live"]
 
     def get_gates_status(self) -> dict[str, bool]:
-        """Get detailed status of each launch gate.
-
-        Returns:
-            Dict mapping gate name to pass/fail
-        """
-        if self.cycle_count < 100:
-            return {
-                "gate_1_positive_ev": False,
-                "gate_2_better_selection": False,
-                "gate_3_lower_churn": False,
-                "gate_4_enough_data": False,
-            }
-
-        # Helper to compute average of last N values
-        def avg_last_n(metric_list: list[float], n: int = 100) -> float:
-            recent = metric_list[-n:] if len(metric_list) > n else metric_list
-            return statistics.mean(recent) if recent else 0.0
-
-        positive_ev_pct = (self.positive_ev_cycles / self.cycle_count) * 100.0
-
+        diagnostics = self.get_gate_diagnostics()
         return {
-            "gate_1_positive_ev": positive_ev_pct >= 70.0,
-            "gate_2_better_selection": avg_last_n(self.metrics["pmm2_reward_markets"]) > 0.0,
-            "gate_3_lower_churn": avg_last_n(self.metrics["pmm2_churn_reduction"]) > 0.0,
-            "gate_4_enough_data": self.cycle_count >= 100,
+            gate_name: gate_details["pass"]
+            for gate_name, gate_details in diagnostics["gates"].items()
         }

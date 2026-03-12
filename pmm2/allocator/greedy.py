@@ -42,7 +42,10 @@ class GreedyAllocator:
     """
 
     def __init__(
-        self, constraints: AllocationConstraints, checker: ConstraintChecker | None = None
+        self,
+        constraints: AllocationConstraints,
+        checker: ConstraintChecker | None = None,
+        min_positive_return_bps: float = 6.0,
     ):
         """Initialize greedy allocator.
 
@@ -52,6 +55,7 @@ class GreedyAllocator:
         """
         self.constraints = constraints
         self.checker = checker or ConstraintChecker(constraints)
+        self.min_positive_return_bps = min_positive_return_bps
 
         logger.info(
             "greedy_allocator_initialized",
@@ -59,13 +63,14 @@ class GreedyAllocator:
             active_cap=constraints.total_capital * constraints.active_cap_frac,
             per_market_cap=self.checker.per_market_cap(constraints.total_capital),
             per_event_cap=constraints.total_capital * constraints.per_event_cap_frac,
+            min_positive_return_bps=min_positive_return_bps,
         )
 
     def allocate(
         self,
         scored_bundles: list[AdjustedScore],
         event_clusters: dict[str, str],
-        min_positive_return_bps: float = 6.0,
+        min_positive_return_bps: float | None = None,
     ) -> AllocationPlan:
         """
         Greedy allocation:
@@ -92,8 +97,12 @@ class GreedyAllocator:
         Returns:
             AllocationPlan with funded bundles and tracking info
         """
-        # Convert bps to decimal
-        min_return = min_positive_return_bps / 10000.0
+        threshold_bps = (
+            self.min_positive_return_bps
+            if min_positive_return_bps is None
+            else min_positive_return_bps
+        )
+        min_return = threshold_bps / 10000.0
 
         # --- 1. Filter to positive adjusted return ---
         positive_bundles = [
@@ -104,7 +113,7 @@ class GreedyAllocator:
             "greedy_allocation_started",
             total_bundles=len(scored_bundles),
             positive_bundles=len(positive_bundles),
-            min_return_bps=min_positive_return_bps,
+            min_return_bps=threshold_bps,
         )
 
         if not positive_bundles:
@@ -187,8 +196,12 @@ class GreedyAllocator:
         # Count reward-eligible markets
         # (We don't have market metadata here, so we approximate from bundle types)
         # Markets with B2 are likely reward-eligible
-        reward_markets = sum(
-            1 for cid, types in funded_bundles.items() if "B2" in types or "B1" in types
+        reward_markets = len(
+            {
+                bundle.market_condition_id
+                for bundle in funded
+                if bundle.is_reward_eligible and bundle.liq_ev > 0.0
+            }
         )
 
         plan = AllocationPlan(

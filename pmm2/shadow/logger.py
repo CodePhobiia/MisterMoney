@@ -99,6 +99,69 @@ class ShadowLogger:
         except Exception as e:
             logger.error("shadow_log_write_failed", error=str(e), exc_info=True)
 
+    async def persist_allocation_cycle(self, cycle_data: dict):
+        """Persist the cycle to SQLite so readiness decisions are auditable."""
+
+        if self.db is None or not hasattr(self.db, "execute"):
+            return
+
+        comparison = cycle_data.get("comparison", {})
+        summary = comparison.get("summary", cycle_data.get("summary", {}))
+        diagnostics = comparison.get("gate_diagnostics", cycle_data.get("gate_diagnostics", {}))
+        gates = diagnostics.get("gates", {})
+
+        await self.db.execute(
+            """
+            INSERT OR REPLACE INTO shadow_cycle (
+                ts, cycle_num, ready_for_live,
+                window_cycles, ev_sample_count, reward_sample_count, churn_sample_count,
+                gate_ev_positive, gate_reward_capture, gate_churn, gate_sample_size,
+                v1_market_count, pmm2_market_count, market_overlap_pct, overlap_quote_distance_bps,
+                v1_total_ev_usdc, pmm2_total_ev_usdc, ev_delta_usdc,
+                v1_reward_market_count, pmm2_reward_market_count, reward_market_delta,
+                v1_reward_ev_usdc, pmm2_reward_ev_usdc, reward_ev_delta_usdc,
+                v1_cancel_rate_per_order_min, pmm2_cancel_rate_per_order_min, churn_delta_per_order_min,
+                gate_blockers_json, gate_diagnostics_json, comparison_json, summary_json,
+                v1_state_json, pmm2_plan_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cycle_data.get("timestamp"),
+                int(comparison.get("cycle_num", 0) or 0),
+                int(bool(summary.get("ready_for_live", False))),
+                int(diagnostics.get("window_cycles", 0) or 0),
+                int(diagnostics.get("ev_sample_count", 0) or 0),
+                int(diagnostics.get("reward_sample_count", 0) or 0),
+                int(diagnostics.get("churn_sample_count", 0) or 0),
+                int(bool(gates.get("gate_ev_positive", {}).get("pass", False))),
+                int(bool(gates.get("gate_reward_capture", {}).get("pass", False))),
+                int(bool(gates.get("gate_churn", {}).get("pass", False))),
+                int(bool(gates.get("gate_sample_size", {}).get("pass", False))),
+                len(cycle_data.get("v1_markets", [])),
+                len(cycle_data.get("pmm2_markets", [])),
+                float(comparison.get("market_overlap_pct", 0.0) or 0.0),
+                float(comparison.get("overlap_quote_distance_bps", 0.0) or 0.0),
+                float(comparison.get("v1_total_ev_usdc", 0.0) or 0.0),
+                float(comparison.get("pmm2_total_ev_usdc", 0.0) or 0.0),
+                float(comparison.get("ev_delta_usdc", 0.0) or 0.0),
+                int(comparison.get("v1_reward_market_count", 0) or 0),
+                int(comparison.get("pmm2_reward_market_count", 0) or 0),
+                float(comparison.get("reward_market_delta", 0.0) or 0.0),
+                float(comparison.get("v1_reward_ev_usdc", 0.0) or 0.0),
+                float(comparison.get("pmm2_reward_ev_usdc", 0.0) or 0.0),
+                float(comparison.get("reward_ev_delta_usdc", 0.0) or 0.0),
+                float(comparison.get("v1_cancel_rate_per_order_min", 0.0) or 0.0),
+                float(comparison.get("pmm2_cancel_rate_per_order_min", 0.0) or 0.0),
+                float(comparison.get("churn_delta_per_order_min", 0.0) or 0.0),
+                json.dumps(diagnostics.get("blocking_gates", []), sort_keys=True),
+                json.dumps(diagnostics, sort_keys=True),
+                json.dumps(comparison, sort_keys=True),
+                json.dumps(summary, sort_keys=True),
+                json.dumps(cycle_data.get("v1_state", {}), sort_keys=True),
+                json.dumps(cycle_data.get("pmm2_plan", {}), sort_keys=True),
+            ),
+        )
+
     def log_divergence(self, divergence_type: str, details: dict):
         """Log a specific divergence between V1 and PMM-2.
 

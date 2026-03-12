@@ -62,34 +62,36 @@ class ShadowDashboard:
         ]
 
         # Positive EV gate
-        ev_emoji = "✅" if gates.get("gate_1_positive_ev", False) else "⏳"
+        ev_emoji = "✅" if gates.get("gate_ev_positive", False) else "⏳"
         lines.append(
-            f"{ev_emoji} {summary['positive_ev_pct']:.1f}% positive EV (gate: 70%)"
+            f"{ev_emoji} {summary['positive_ev_pct']:.1f}% positive EV ({summary['ev_sample_count']} samples)"
         )
 
         # EV delta
-        ev_delta = summary["avg_ev_delta"]
+        ev_delta = summary["avg_ev_delta_usdc"]
         ev_sign = "+" if ev_delta >= 0 else ""
         lines.append(f"📈 Avg EV delta: {ev_sign}${ev_delta:.4f}/cycle")
 
-        # Reward markets
-        reward_emoji = "✅" if gates.get("gate_2_better_selection", False) else "⏳"
-        reward_improvement = summary["avg_reward_improvement"]
+        reward_emoji = "✅" if gates.get("gate_reward_capture", False) else "⏳"
+        reward_improvement = summary["avg_reward_market_delta"]
         reward_sign = "+" if reward_improvement >= 0 else ""
         lines.append(
-            f"{reward_emoji} Reward improvement: {reward_sign}{reward_improvement:.1f} markets"
+            f"{reward_emoji} Reward delta: {reward_sign}{reward_improvement:.1f} markets / ${summary['avg_reward_ev_delta_usdc']:+.4f}"
         )
 
         # Churn reduction
-        churn_emoji = "✅" if gates.get("gate_3_lower_churn", False) else "⏳"
-        churn_reduction = summary["avg_churn_reduction"]
-        churn_pct = churn_reduction * 100
-        churn_sign = "-" if churn_reduction >= 0 else "+"
-        lines.append(f"{churn_emoji} Churn: {churn_sign}{abs(churn_pct):.1f}% vs V1")
+        churn_emoji = "✅" if gates.get("gate_churn", False) else "⏳"
+        churn_delta = summary["avg_churn_delta_per_order_min"]
+        lines.append(
+            f"{churn_emoji} Churn delta: {churn_delta:+.4f} cancels/order-min"
+        )
 
         # Market overlap
         overlap = summary["avg_market_overlap"]
         lines.append(f"🎯 Market overlap: {overlap:.1%}")
+        lines.append(
+            f"🪞 Quote gap: {summary['avg_overlap_quote_distance_bps']:.1f} bps on overlapping markets"
+        )
 
         # Launch readiness
         lines.append("")
@@ -102,14 +104,14 @@ class ShadowDashboard:
 
             # Show which gates are blocking
             blocking = []
-            if not gates.get("gate_1_positive_ev", False):
-                blocking.append("positive EV")
-            if not gates.get("gate_2_better_selection", False):
-                blocking.append("market selection")
-            if not gates.get("gate_3_lower_churn", False):
-                blocking.append("churn reduction")
-            if not gates.get("gate_4_enough_data", False):
-                blocking.append("data volume")
+            if not gates.get("gate_ev_positive", False):
+                blocking.append("rolling EV")
+            if not gates.get("gate_reward_capture", False):
+                blocking.append("reward capture")
+            if not gates.get("gate_churn", False):
+                blocking.append("churn")
+            if not gates.get("gate_sample_size", False):
+                blocking.append("sample size")
 
             if blocking:
                 lines.append(f"Blocking: {', '.join(blocking)}")
@@ -186,8 +188,9 @@ class ShadowDashboard:
             "gates": gates,
             "raw_metrics": {
                 "market_overlap_history": self.cf.metrics["market_overlap_pct"][-20:],
-                "reward_improvement_history": self.cf.metrics["pmm2_reward_markets"][-20:],
-                "churn_reduction_history": self.cf.metrics["pmm2_churn_reduction"][-20:],
-                "ev_delta_history": self.cf.metrics["ev_delta_per_cycle"][-20:],
+                "reward_market_delta_history": self.cf.metrics["reward_market_delta"][-20:],
+                "reward_ev_delta_history": self.cf.metrics["reward_ev_delta_usdc"][-20:],
+                "churn_delta_history": self.cf.metrics["churn_delta_per_order_min"][-20:],
+                "ev_delta_history": self.cf.metrics["ev_delta_usdc"][-20:],
             },
         }
