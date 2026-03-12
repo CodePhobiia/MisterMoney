@@ -220,6 +220,7 @@ class BotState:
 
         # Sampling (reward-eligible) condition IDs
         self.reward_eligible: set[str] = set()
+        self.pmm2_runtime = None
 
     def eligible_markets(self) -> list[MarketMetadata]:
         """Get markets eligible for quoting in current mode."""
@@ -227,7 +228,15 @@ class BotState:
             return []  # No new quotes
         if self.mode in ("SHUTDOWN", "STARTUP"):
             return []
-        return list(self.active_markets.values())
+        markets = list(self.active_markets.values())
+        runtime = getattr(self, "pmm2_runtime", None)
+        if runtime is None:
+            return markets
+        return [
+            md
+            for md in markets
+            if not runtime.should_v1_skip_market(md.condition_id)
+        ]
 
 
 async def run(settings: Settings | None = None) -> None:
@@ -721,6 +730,7 @@ async def run(settings: Settings | None = None) -> None:
         pmm2_on_order_live, pmm2_on_order_canceled,
     )
     pmm2_runtime = await maybe_init_pmm2(settings, db, state)
+    state.pmm2_runtime = pmm2_runtime
 
     # ── V3 fair value integration (if enabled) ──
     v3_integrator = None
@@ -2368,6 +2378,7 @@ async def run(settings: Settings | None = None) -> None:
                 markets_quoted=markets_quoted,
                 cycle_lifecycle_counts=cycle_lifecycle_counts,
                 cycle_duration_ms=cycle_duration,
+                pmm2_status=pmm2_runtime.get_status() if pmm2_runtime else None,
             )
 
             if cycle_count % 100 == 0:

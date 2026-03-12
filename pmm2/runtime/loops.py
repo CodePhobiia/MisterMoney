@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import Counter
+from typing import Any
 
 import structlog
 
@@ -24,7 +26,7 @@ from pmm2.persistence.hysteresis import HysteresisConfig, HysteresisGate
 from pmm2.persistence.optimizer import PersistenceOptimizer
 from pmm2.persistence.state_machine import StateMachine
 from pmm2.persistence.warmup import WarmupEstimator
-from pmm2.planner import DiffEngine, QuotePlanner
+from pmm2.planner import DiffEngine, OrderMutation, QuotePlanner, TargetQuotePlan
 from pmm2.queue import DepletionCalculator, FillHazard, QueueEstimator
 from pmm2.scorer.combined import MarketEVScorer
 from pmm2.shadow import CounterfactualEngine, ShadowDashboard, ShadowLogger, V1StateSnapshot
@@ -73,6 +75,10 @@ class PMM2Runtime:
         allocator_constraints = AllocationConstraints(
             total_capital=100.0,
             total_slots=config.max_slots_total,
+            per_market_cap_frac=config.per_market_cap_nav,
+            per_market_cap_floor=config.per_market_cap_floor,
+            per_event_cap_frac=config.per_event_cap_nav,
+            active_cap_frac=config.effective_active_cap_pct,
         )
         adjusted_scorer = AdjustedScorer(
             corr_lambda=config.corr_penalty_lambda / 100.0,
@@ -113,15 +119,30 @@ class PMM2Runtime:
 
         # State
         self.enriched_universe: list[EnrichedMarket] = []
-        self.current_plan: dict[str, any] = {}  # condition_id → TargetQuotePlan
+        self.current_plan: dict[str, Any] = {}  # condition_id → TargetQuotePlan
         self.running = False
         self.nav = 100.0
         self.tasks: list[asyncio.Task] = []
         self._recent_v1_cancel_count = 0
+        self.bot_state = None
+        self.controlled_markets: set[str] = set()
+        self.last_execution_summary: dict[str, Any] = {
+            "attempted_mutations": 0,
+            "executed": 0,
+            "failed": 0,
+            "shadow": config.shadow_mode,
+        }
+        self.last_cycle_summary: dict[str, Any] = {}
+        self.last_canary_summary: dict[str, Any] = self._blank_canary_summary()
 
         logger.info(
             "pmm2_runtime_initialized",
             shadow_mode=config.shadow_mode,
+            stage=config.stage_name,
+            controller=config.controller_label,
+            live_capital_pct=config.live_capital_pct,
+            effective_active_cap_pct=config.effective_active_cap_pct,
+            canary_enabled=config.canary.enabled,
             allocator_interval=config.allocator_interval_sec,
             max_markets=config.max_markets_active,
         )
@@ -141,10 +162,11 @@ class PMM2Runtime:
             return self.tasks
 
         self.running = True
+        self.bot_state = bot_state
 
         # Update NAV from bot state
         self.nav = self._get_nav(bot_state)
-        self.allocator.update_nav(self.nav)
+        self._apply_allocator_budget(self.nav)
 
         # Start all concurrent loops
         self.tasks = [
@@ -328,6 +350,8 @@ class PMM2Runtime:
         """
         while self.running:
             try:
+                controlled_markets_before = set(self.controlled_markets)
+
                 # 0. Capture V1 state snapshot (for shadow mode comparison)
                 shadow_market_contexts = self._build_shadow_market_contexts(bot_state)
                 v1_snapshot = V1StateSnapshot.capture(
@@ -434,22 +458,18 @@ class PMM2Runtime:
                 # 4. Diff target vs live orders & collect all mutations
                 all_mutations = []
                 for cid, target in new_plans.items():
-                    # Get live orders for this market
-                    if not hasattr(bot_state, "order_tracker"):
-                        logger.warning("bot_state_missing_order_tracker")
-                        continue
+                    market_orders = self._get_live_market_orders(bot_state, cid)
+                    matchable_orders = market_orders
+                    foreign_orders = []
 
-                    live = bot_state.order_tracker.get_active_orders(token_id=None)
-
-                    # Filter to this market's orders (by condition_id if available)
-                    market_orders = []
-                    for o in live:
-                        if hasattr(o, "condition_id") and o.condition_id == cid:
-                            market_orders.append(o)
+                    if self.config.is_live:
+                        matchable_orders, foreign_orders = self._partition_controlled_orders(
+                            market_orders
+                        )
 
                     # Get persistence decisions for these orders
                     persistence_decisions = self.persistence.decide_all(
-                        live_orders=[o.order_id for o in market_orders if hasattr(o, "order_id")],
+                        live_orders=[o.order_id for o in matchable_orders if hasattr(o, "order_id")],
                         reservation_prices={},
                         target_prices={},
                         depletion_rates={},
@@ -458,8 +478,21 @@ class PMM2Runtime:
 
                     # Diff to generate mutations
                     mutations = self.diff_engine.diff(
-                        target, market_orders, persistence_decisions
+                        target, matchable_orders, persistence_decisions
                     )
+                    if foreign_orders:
+                        reason = (
+                            "handoff_to_pmm2_control"
+                            if cid not in controlled_markets_before
+                            else "foreign_order_in_pmm2_market"
+                        )
+                        mutations.extend(
+                            self._build_force_cancel_mutations(
+                                foreign_orders,
+                                condition_id=cid,
+                                reason=reason,
+                            )
+                        )
 
                     # Check reprice rate limit
                     if mutations and not self.planner.can_reprice(cid):
@@ -473,17 +506,61 @@ class PMM2Runtime:
                     if mutations:
                         all_mutations.extend(mutations)
 
+                if self.config.is_live:
+                    dropped_markets = controlled_markets_before - set(new_plans)
+                    for cid in sorted(dropped_markets):
+                        market_orders = self._get_live_market_orders(bot_state, cid)
+                        if not market_orders:
+                            continue
+                        cancel_plan = TargetQuotePlan(condition_id=cid)
+                        all_mutations.extend(
+                            self.diff_engine.diff(
+                                cancel_plan,
+                                market_orders,
+                                persistence_decisions={},
+                            )
+                        )
+
                 # 5. Execute mutations through bridge (respects shadow mode)
+                result = {
+                    "executed": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "shadow": self.config.shadow_mode,
+                    "details": [],
+                }
                 if all_mutations:
                     result = await self.bridge.execute_mutations(all_mutations)
                     logger.info(
                         "pmm2_allocation_executed",
+                        controller=self.config.controller_label,
+                        stage=self.config.stage_name,
                         total_mutations=len(all_mutations),
                         **result,
                     )
+                self.last_execution_summary = {
+                    "attempted_mutations": len(all_mutations),
+                    "executed": result.get("executed", 0),
+                    "skipped": result.get("skipped", 0),
+                    "failed": result.get("failed", 0),
+                    "shadow": result.get("shadow", self.config.shadow_mode),
+                    "controller": self.config.controller_label,
+                    "stage": self.config.stage_name,
+                }
 
                 # Update current plan
                 self.current_plan = new_plans
+                if not self.config.is_live:
+                    self.controlled_markets = set()
+                elif result.get("failed", 0) > 0:
+                    self.controlled_markets = controlled_markets_before
+                    logger.warning(
+                        "pmm2_control_handoff_preserved_previous_markets",
+                        failed_mutations=result.get("failed", 0),
+                        previous_controlled_markets=sorted(controlled_markets_before),
+                    )
+                else:
+                    self.controlled_markets = set(new_plans)
 
                 # 6. Shadow mode: counterfactual comparison and logging
                 if self.config.shadow_mode:
@@ -547,7 +624,15 @@ class PMM2Runtime:
                     markets=len(new_plans),
                     bundles=len(plan.funded_bundles),
                     capital_used=plan.total_capital_used,
+                    controlled_markets=len(self.controlled_markets),
                 )
+                self.last_cycle_summary = {
+                    "markets": len(new_plans),
+                    "funded_bundles": len(plan.funded_bundles),
+                    "capital_used": plan.total_capital_used,
+                    "mutations": len(all_mutations),
+                    "controlled_markets": len(self.controlled_markets),
+                }
 
             except Exception as e:
                 logger.error("pmm2_allocator_loop_error", error=str(e), exc_info=True)
@@ -583,11 +668,18 @@ class PMM2Runtime:
                         len(full_universe),
                         max(self.config.max_markets_active * 8, self.config.max_markets_active),
                     )
-                    self.enriched_universe = selector.select_top(full_universe, candidate_count)
+                    candidate_universe = selector.select_top(full_universe, candidate_count)
+                    self.last_canary_summary = self._summarize_canary_universe(
+                        candidate_universe
+                    )
+                    self.enriched_universe = self._select_live_universe(candidate_universe)
                     logger.info(
                         "universe_refreshed",
                         universe_size=len(self.enriched_universe),
                         raw_universe_size=len(full_universe),
+                        canary_eligible=self.last_canary_summary.get("eligible_markets", 0),
+                        canary_selected=self.last_canary_summary.get("selected_markets", 0),
+                        canary_rejections=self.last_canary_summary.get("rejection_counts", {}),
                     )
                 else:
                     logger.warning(
@@ -601,11 +693,12 @@ class PMM2Runtime:
                 if abs(new_nav - self.nav) > 1.0:  # NAV changed by more than $1
                     old_nav = self.nav
                     self.nav = new_nav
-                    self.allocator.update_nav(self.nav)
+                    self._apply_allocator_budget(self.nav)
                     logger.info(
                         "nav_updated",
                         old_nav=old_nav,
                         new_nav=new_nav,
+                        effective_active_cap_pct=self.config.effective_active_cap_pct,
                     )
 
                 # TODO: Refresh depletion rates from historical data
@@ -633,6 +726,210 @@ class PMM2Runtime:
     # ────────────────────────────────────────────────────────────────
     # Helper methods
     # ────────────────────────────────────────────────────────────────
+
+    def _blank_canary_summary(self) -> dict[str, Any]:
+        return {
+            "enabled": self.config.canary.enabled,
+            "stage": self.config.stage_name,
+            "controller": self.config.controller_label,
+            "evaluated_markets": 0,
+            "eligible_markets": 0,
+            "selected_markets": 0,
+            "rejected_markets": 0,
+            "preview_condition_ids": [],
+            "selected_condition_ids": [],
+            "rejection_counts": {},
+        }
+
+    def _apply_allocator_budget(self, nav: float) -> None:
+        """Apply runtime capital limits for shadow, canary, or full live mode."""
+        self.allocator.update_nav(nav)
+        self.allocator.constraints.total_slots = self.config.max_slots_total
+        self.allocator.constraints.per_market_cap_frac = self.config.per_market_cap_nav
+        self.allocator.constraints.per_market_cap_floor = self.config.per_market_cap_floor
+        self.allocator.constraints.per_event_cap_frac = self.config.per_event_cap_nav
+        self.allocator.constraints.active_cap_frac = self.config.effective_active_cap_pct
+
+    def _evaluate_canary_market(self, market: EnrichedMarket) -> tuple[bool, list[str]]:
+        """Return whether a market is eligible for live PMM-2 canary control."""
+        cfg = self.config.canary
+        reasons: list[str] = []
+
+        if not market.active or not market.accepting_orders:
+            reasons.append("market_not_live")
+        if cfg.require_reward_eligible and not market.reward_eligible:
+            reasons.append("not_reward_eligible")
+        if cfg.exclude_neg_risk and market.is_neg_risk:
+            reasons.append("neg_risk_excluded")
+        if cfg.require_clean_outcomes and market.has_placeholder_outcomes:
+            reasons.append("placeholder_outcomes")
+        if market.ambiguity_score > cfg.max_ambiguity_score:
+            reasons.append("ambiguity_above_limit")
+        if market.hours_to_resolution < cfg.min_hours_to_resolution:
+            reasons.append("too_close_to_resolution")
+        if market.volume_24h < cfg.min_volume_24h:
+            reasons.append("insufficient_volume_24h")
+        if market.liquidity < cfg.min_liquidity:
+            reasons.append("insufficient_liquidity")
+        if market.spread_cents <= 0.0 or market.spread_cents > cfg.max_spread_cents:
+            reasons.append("spread_outside_limit")
+
+        return (len(reasons) == 0, reasons)
+
+    def _summarize_canary_universe(
+        self,
+        markets: list[EnrichedMarket],
+    ) -> dict[str, Any]:
+        """Compute a stable operator-facing summary of live canary eligibility."""
+        if not markets:
+            return self._blank_canary_summary()
+
+        rejection_counts: Counter[str] = Counter()
+        eligible: list[EnrichedMarket] = []
+
+        for market in markets:
+            is_eligible, reasons = self._evaluate_canary_market(market)
+            if is_eligible:
+                eligible.append(market)
+                continue
+            rejection_counts.update(reasons)
+
+        preview = eligible[: self.config.canary.max_markets]
+        return {
+            "enabled": self.config.canary.enabled,
+            "stage": self.config.stage_name,
+            "controller": self.config.controller_label,
+            "evaluated_markets": len(markets),
+            "eligible_markets": len(eligible),
+            "selected_markets": len(preview) if self.config.is_canary_live else 0,
+            "rejected_markets": len(markets) - len(eligible),
+            "preview_condition_ids": [market.condition_id for market in preview],
+            "selected_condition_ids": [market.condition_id for market in preview]
+            if self.config.is_canary_live
+            else [],
+            "rejection_counts": dict(rejection_counts),
+        }
+
+    def _select_live_universe(
+        self,
+        candidate_universe: list[EnrichedMarket],
+    ) -> list[EnrichedMarket]:
+        """Apply live canary restrictions without changing shadow-mode analysis."""
+        if not self.config.is_canary_live:
+            return candidate_universe
+
+        filtered: list[EnrichedMarket] = []
+        for market in candidate_universe:
+            is_eligible, _ = self._evaluate_canary_market(market)
+            if is_eligible:
+                filtered.append(market)
+            if len(filtered) >= self.config.canary.max_markets:
+                break
+
+        logger.info(
+            "pmm2_canary_universe_applied",
+            stage=self.config.stage_name,
+            requested_max_markets=self.config.canary.max_markets,
+            selected_markets=len(filtered),
+            selected_condition_ids=[market.condition_id for market in filtered],
+        )
+        return filtered
+
+    def _get_live_market_orders(self, bot_state, condition_id: str) -> list[Any]:
+        if not hasattr(bot_state, "order_tracker"):
+            logger.warning("bot_state_missing_order_tracker")
+            return []
+        live = bot_state.order_tracker.get_active_orders(token_id=None)
+        return [
+            order
+            for order in live
+            if getattr(order, "condition_id", "") == condition_id
+        ]
+
+    def _is_pmm2_controlled_order(self, order: Any) -> bool:
+        strategy = str(getattr(order, "strategy", "") or "")
+        return strategy.startswith("pmm2_")
+
+    def _partition_controlled_orders(
+        self,
+        orders: list[Any],
+    ) -> tuple[list[Any], list[Any]]:
+        """Separate PMM-2-managed orders from foreign/V1 orders on a controlled market."""
+        pmm2_orders: list[Any] = []
+        foreign_orders: list[Any] = []
+        for order in orders:
+            if self._is_pmm2_controlled_order(order):
+                pmm2_orders.append(order)
+            else:
+                foreign_orders.append(order)
+        return pmm2_orders, foreign_orders
+
+    def _build_force_cancel_mutations(
+        self,
+        orders: list[Any],
+        *,
+        condition_id: str,
+        reason: str,
+    ) -> list[OrderMutation]:
+        mutations: list[OrderMutation] = []
+        for order in orders:
+            order_id = getattr(order, "order_id", "")
+            if not order_id:
+                continue
+            mutations.append(
+                OrderMutation(
+                    action="cancel",
+                    order_id=order_id,
+                    token_id=getattr(order, "token_id", ""),
+                    condition_id=condition_id,
+                    reason=reason,
+                )
+            )
+        return mutations
+
+    def get_controlled_markets(self) -> set[str]:
+        if not self.config.is_live:
+            return set()
+        return set(self.controlled_markets)
+
+    def should_v1_skip_market(self, condition_id: str) -> bool:
+        return condition_id in self.get_controlled_markets()
+
+    def get_status(self) -> dict[str, Any]:
+        """Return operator-facing PMM-2 runtime status for logs and ops snapshots."""
+        active_pmm2_orders = 0
+        if self.bot_state is not None and hasattr(self.bot_state, "order_tracker"):
+            try:
+                active_pmm2_orders = sum(
+                    1
+                    for order in self.bot_state.order_tracker.get_active_orders(token_id=None)
+                    if self._is_pmm2_controlled_order(order)
+                )
+            except Exception:
+                active_pmm2_orders = 0
+
+        return {
+            "enabled": self.config.enabled,
+            "shadow_mode": self.config.shadow_mode,
+            "live_enabled": self.config.live_enabled,
+            "is_live": self.config.is_live,
+            "is_canary_live": self.config.is_canary_live,
+            "controller": self.config.controller_label,
+            "strategy": self.config.controller_strategy,
+            "stage": self.config.stage_name,
+            "live_capital_pct": self.config.live_capital_pct,
+            "effective_active_cap_pct": self.config.effective_active_cap_pct,
+            "bridge_has_order_manager": getattr(self.bridge, "order_manager", None) is not None,
+            "controlled_market_count": len(self.controlled_markets),
+            "controlled_markets": sorted(self.controlled_markets),
+            "active_pmm2_orders": active_pmm2_orders,
+            "canary": dict(self.last_canary_summary),
+            "last_execution": dict(self.last_execution_summary),
+            "last_cycle": dict(self.last_cycle_summary),
+            "ready_for_live": self.counterfactual_engine.is_ready_for_live()
+            if self.config.shadow_mode
+            else None,
+        }
 
     def _find_market(self, condition_id: str) -> EnrichedMarket | None:
         """Find market in universe by condition_id.

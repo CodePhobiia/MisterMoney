@@ -313,6 +313,7 @@ class OpsMonitor:
         markets_quoted: int,
         cycle_lifecycle_counts: dict[str, int],
         cycle_duration_ms: float,
+        pmm2_status: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Update rolling operational state after a quote cycle."""
         now = self._clock()
@@ -452,5 +453,7 @@ class OpsMonitor:
                 },
             },
         }
+        if pmm2_status is not None:
+            snapshot["pmm2"] = pmm2_status
         self._status_writer.write(snapshot)
         return snapshot

@@ -53,11 +53,17 @@ async def maybe_init_pmm2(settings, db, bot_state) -> PMM2Runtime | None:
         # Create V1 bridge
         order_manager = getattr(bot_state, "order_manager", None)
         risk_limits = getattr(bot_state, "risk_limits", None)
+        if config.is_live and order_manager is None:
+            raise RuntimeError("pmm2 live mode requires bot_state.order_manager")
 
         bridge = V1Bridge(
             order_manager=order_manager,
             risk_limits=risk_limits,
             shadow_mode=config.shadow_mode,
+            controller_label=config.controller_label,
+            stage_name=config.stage_name,
+            live_capital_pct=config.live_capital_pct,
+            strategy_label=config.controller_strategy,
         )
 
         # Create runtime
@@ -69,6 +75,8 @@ async def maybe_init_pmm2(settings, db, bot_state) -> PMM2Runtime | None:
         logger.info(
             "pmm2_initialized",
             shadow=config.shadow_mode,
+            controller=config.controller_label,
+            stage=config.stage_name,
             live_pct=config.live_capital_pct,
             tasks=len(tasks),
         )

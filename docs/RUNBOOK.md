@@ -73,6 +73,10 @@ Before restarting the bot, verify:
 - [ ] **Dangerous toggles acknowledged explicitly**
   - If taker bootstrap is enabled in live mode: `export PMM1_ACK_TAKER_BOOTSTRAP=YES`
   - If PMM-2 live mode is enabled (`shadow_mode: false`): `export PMM1_ACK_PMM2_LIVE=YES`
+  - PMM-2 live rollout also requires explicit config gates:
+    - Any live PMM-2 control: `pmm2.live_enabled: true`
+    - Partial rollout (`live_capital_pct < 1.0`): `pmm2.canary.enabled: true`
+    - Allowed rollout stages only: `0.05`, `0.10`, `0.25`, `1.0`
 - [ ] **Check git status** — `git status` to ensure no uncommitted changes that could cause issues
 
 ### Start

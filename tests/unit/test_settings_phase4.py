@@ -52,9 +52,45 @@ def test_pmm2_live_mode_requires_explicit_ack(monkeypatch):
     monkeypatch.delenv("PMM1_ACK_PMM2_LIVE", raising=False)
 
     with pytest.raises(ValueError, match="PMM1_ACK_PMM2_LIVE=YES"):
-        PMM2Config(enabled=True, shadow_mode=False, live_capital_pct=0.1)
+        PMM2Config(
+            enabled=True,
+            shadow_mode=False,
+            live_enabled=True,
+            live_capital_pct=0.1,
+            canary={"enabled": True},
+        )
 
 
 def test_pmm2_shadow_mode_requires_zero_live_capital():
     with pytest.raises(ValueError, match="shadow mode requires live_capital_pct=0.0"):
         PMM2Config(enabled=True, shadow_mode=True, live_capital_pct=0.1)
+
+
+def test_pmm2_canary_live_requires_explicit_canary_gate(monkeypatch):
+    monkeypatch.setenv("PMM1_ACK_PMM2_LIVE", "YES")
+
+    with pytest.raises(ValueError, match="pmm2.canary.enabled=true"):
+        PMM2Config(
+            enabled=True,
+            shadow_mode=False,
+            live_enabled=True,
+            live_capital_pct=0.05,
+        )
+
+
+def test_pmm2_live_capital_pct_requires_explicit_rollout_stage():
+    with pytest.raises(ValueError, match="explicit rollout stages"):
+        PMM2Config(live_capital_pct=0.2)
+
+
+def test_pmm2_full_live_requires_canary_disabled(monkeypatch):
+    monkeypatch.setenv("PMM1_ACK_PMM2_LIVE", "YES")
+
+    with pytest.raises(ValueError, match="full live mode requires pmm2.canary.enabled=false"):
+        PMM2Config(
+            enabled=True,
+            shadow_mode=False,
+            live_enabled=True,
+            live_capital_pct=1.0,
+            canary={"enabled": True},
+        )

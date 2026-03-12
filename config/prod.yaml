@@ -33,3 +33,10 @@ ops:
   excessive_churn_ratio: 2.0
   excessive_churn_min_cancels: 25
   recent_failure_window_s: 900
+
+pmm2:
+  shadow_mode: true
+  live_enabled: false
+  live_capital_pct: 0.0
+  canary:
+    enabled: false

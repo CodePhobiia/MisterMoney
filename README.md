@@ -117,6 +117,8 @@ pmm2:
 
 Shadow mode captures V1 state snapshots, runs the full scoring/allocation pipeline, generates counterfactual comparisons, and reports via Telegram. Requires 10+ days of positive counterfactual EV before graduating to live.
 
+Live rollout stays off by default. To enable PMM-2 live control, operators must set `pmm2.live_enabled: true`, choose an explicit rollout stage in `pmm2.live_capital_pct` (`0.05`, `0.10`, `0.25`, or `1.0`), and export `PMM1_ACK_PMM2_LIVE=YES`. Partial rollout stages also require `pmm2.canary.enabled: true`.
+
 ## V3 — Resolution Intelligence (`v3/`)
 
 Multi-model AI pipeline that predicts market outcomes. Routes markets to specialized analysis chains based on market type.

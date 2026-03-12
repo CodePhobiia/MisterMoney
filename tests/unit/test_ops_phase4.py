@@ -130,6 +130,12 @@ def test_ops_monitor_marks_no_quotes_and_excessive_churn(tmp_path):
         "markets_quoted": 0,
         "cycle_lifecycle_counts": {"submitted": 1, "canceled": 3},
         "cycle_duration_ms": 10.0,
+        "pmm2_status": {
+            "enabled": True,
+            "controller": "pmm2_canary",
+            "stage": "canary_5pct",
+            "controlled_market_count": 1,
+        },
     }
 
     asyncio.run(monitor.observe_cycle(**kwargs))
@@ -140,6 +146,7 @@ def test_ops_monitor_marks_no_quotes_and_excessive_churn(tmp_path):
     assert snapshot is not None
     assert snapshot["ops"]["conditions"]["no_active_quotes"]["active"] is True
     assert snapshot["ops"]["conditions"]["excessive_churn"]["active"] is True
+    assert snapshot["pmm2"]["stage"] == "canary_5pct"
     assert any("NO ACTIVE QUOTES" in message for message in sent_messages)
     assert any("EXCESSIVE CHURN" in message for message in sent_messages)
 

@@ -2,13 +2,14 @@
 """Test script for Sprint 7 — Quote Planner + Runtime Integration."""
 
 import asyncio
+import os
 
 from pmm2.config import PMM2Config, load_pmm2_config
 from pmm2.planner import DiffEngine, QuotePlanner, TargetQuotePlan
 from pmm2.runtime import PMM2Runtime, V1Bridge, maybe_init_pmm2
 
 
-def test_config():
+def test_config(monkeypatch=None):
     """Test PMM2Config loading."""
     print("\n=== Testing PMM2Config ===")
 
@@ -23,14 +24,22 @@ def test_config():
         "pmm2": {
             "enabled": True,
             "shadow_mode": False,
-            "live_capital_pct": 0.5,
+            "live_enabled": True,
+            "live_capital_pct": 0.25,
+            "canary": {"enabled": True},
             "max_markets_active": 8,
         }
     }
+    if monkeypatch is not None:
+        monkeypatch.setenv("PMM1_ACK_PMM2_LIVE", "YES")
+    else:
+        os.environ["PMM1_ACK_PMM2_LIVE"] = "YES"
     config = load_pmm2_config(config_dict)
     assert config.enabled is True
     assert config.shadow_mode is False
-    assert config.live_capital_pct == 0.5
+    assert config.live_enabled is True
+    assert config.live_capital_pct == 0.25
+    assert config.stage_name == "canary_25pct"
     assert config.max_markets_active == 8
     print("✓ Config loaded from dict")
 

@@ -98,7 +98,19 @@ execution:
 pmm2:
   enabled: true  # Shadow mode enabled for validation
   shadow_mode: true  # True = log decisions, don't execute
-  live_capital_pct: 0.0  # Live mode requires shadow_mode=false and PMM1_ACK_PMM2_LIVE=YES
+  live_enabled: false  # Additional explicit gate; must be true before PMM-2 can control live capital
+  live_capital_pct: 0.0  # Allowed rollout stages: 0.05, 0.10, 0.25, 1.0. Live also requires PMM1_ACK_PMM2_LIVE=YES
+  canary:
+    enabled: false  # Must be true for any partial live rollout (< 1.0)
+    max_markets: 4
+    require_reward_eligible: true
+    exclude_neg_risk: true
+    require_clean_outcomes: true
+    max_ambiguity_score: 0.15
+    min_volume_24h: 50000.0
+    min_liquidity: 2500.0
+    max_spread_cents: 5.0
+    min_hours_to_resolution: 24.0
   
   # Loop cadences (seconds unless noted)
   allocator_interval_sec: 60.0

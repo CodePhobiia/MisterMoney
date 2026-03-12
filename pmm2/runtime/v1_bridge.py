@@ -37,6 +37,10 @@ class V1Bridge:
         order_manager=None,
         risk_limits=None,
         shadow_mode: bool = True,
+        controller_label: str = "pmm2_shadow",
+        stage_name: str = "shadow",
+        live_capital_pct: float = 0.0,
+        strategy_label: str = "pmm2_shadow",
     ):
         """Initialize V1 bridge.
 
@@ -48,11 +52,18 @@ class V1Bridge:
         self.order_manager = order_manager
         self.risk_limits = risk_limits
         self.shadow_mode = shadow_mode
+        self.controller_label = controller_label
+        self.stage_name = stage_name
+        self.live_capital_pct = live_capital_pct
+        self.strategy_label = strategy_label
         self.mutation_log: list[dict] = []
 
         logger.info(
             "v1_bridge_initialized",
             shadow_mode=shadow_mode,
+            controller=controller_label,
+            stage=stage_name,
+            strategy=strategy_label,
             has_order_manager=order_manager is not None,
         )
 
@@ -102,10 +113,16 @@ class V1Bridge:
             "execute_mutations_started",
             mutations=len(mutations),
             shadow=self.shadow_mode,
+            controller=self.controller_label,
+            stage=self.stage_name,
+            strategy=self.strategy_label,
         )
 
         for mutation in mutations:
             detail = {
+                "controller": self.controller_label,
+                "stage": self.stage_name,
+                "strategy": self.strategy_label,
                 "action": mutation.action,
                 "condition_id": mutation.condition_id,
                 "token_id": mutation.token_id,
@@ -121,6 +138,10 @@ class V1Bridge:
                 # Shadow mode: just log
                 logger.info(
                     "pmm2_shadow_mutation",
+                    controller=self.controller_label,
+                    stage=self.stage_name,
+                    strategy=self.strategy_label,
+                    live_capital_pct=self.live_capital_pct,
                     action=mutation.action,
                     condition_id=mutation.condition_id,
                     token_id=mutation.token_id,
@@ -173,6 +194,8 @@ class V1Bridge:
             executed=result["executed"],
             failed=result["failed"],
             shadow=self.shadow_mode,
+            controller=self.controller_label,
+            stage=self.stage_name,
         )
 
         return result
@@ -203,21 +226,29 @@ class V1Bridge:
                 order_type=OrderType.GTC,
                 neg_risk=False,
             )
-            # Use V1 order manager's _clob client for submission
-            clob = getattr(self.order_manager, "_clob", None)
-            if not clob:
-                logger.error("order_manager_missing_clob_client")
+            submit_order = getattr(self.order_manager, "submit_order", None)
+            if submit_order is None:
+                logger.error("order_manager_missing_submit_order")
                 return False
 
-            resp = await clob.create_order(req)
-            success = resp.success if resp else False
+            result = await submit_order(
+                req,
+                condition_id=mutation.condition_id,
+                strategy=self.strategy_label,
+            )
+            success = bool(result.get("success"))
 
             logger.info(
                 "v1_order_add",
+                controller=self.controller_label,
+                stage=self.stage_name,
+                strategy=self.strategy_label,
+                condition_id=mutation.condition_id,
                 token_id=mutation.token_id,
                 side=mutation.side,
                 price=mutation.price,
                 size=mutation.size,
+                order_id=result.get("order_id", ""),
                 success=success,
             )
             return success
@@ -242,17 +273,28 @@ class V1Bridge:
             return False
 
         try:
-            clob = getattr(self.order_manager, "_clob", None)
-            if not clob:
-                logger.error("order_manager_missing_clob_client")
+            client = getattr(self.order_manager, "_client", None)
+            tracker = getattr(self.order_manager, "_tracker", None)
+            if not client:
+                logger.error("order_manager_missing_client")
                 return False
+            tracked = tracker.get(mutation.order_id) if tracker else None
+            prior_strategy = getattr(tracked, "strategy", "")
 
-            result = await clob.cancel_order(mutation.order_id)
-            success = bool(result)
+            await client.cancel_orders([mutation.order_id])
+            if tracker is not None:
+                from pmm1.state.orders import OrderState
+
+                tracker.update_state(mutation.order_id, OrderState.CANCELED, source="pmm2_cancel")
+            success = True
 
             logger.info(
                 "v1_order_cancel",
+                controller=self.controller_label,
+                stage=self.stage_name,
+                strategy=self.strategy_label,
                 order_id=mutation.order_id,
+                prior_strategy=prior_strategy,
                 success=success,
             )
             return success
@@ -277,15 +319,24 @@ class V1Bridge:
             return False
 
         try:
-            clob = getattr(self.order_manager, "_clob", None)
-            if not clob:
-                logger.error("order_manager_missing_clob_client")
+            client = getattr(self.order_manager, "_client", None)
+            tracker = getattr(self.order_manager, "_tracker", None)
+            submit_order = getattr(self.order_manager, "submit_order", None)
+            if not client:
+                logger.error("order_manager_missing_client")
+                return False
+            if submit_order is None:
+                logger.error("order_manager_missing_submit_order")
                 return False
 
             # Step 1: Cancel existing order
             if mutation.order_id:
                 try:
-                    await clob.cancel_order(mutation.order_id)
+                    await client.cancel_orders([mutation.order_id])
+                    if tracker is not None:
+                        from pmm1.state.orders import OrderState
+
+                        tracker.update_state(mutation.order_id, OrderState.CANCELED, source="pmm2_amend")
                 except Exception as cancel_err:
                     logger.warning(
                         "v1_amend_cancel_failed",
@@ -306,14 +357,22 @@ class V1Bridge:
                 order_type=OrderType.GTC,
                 neg_risk=False,
             )
-            resp = await clob.create_order(req)
-            success = resp.success if resp else False
+            result = await submit_order(
+                req,
+                condition_id=mutation.condition_id,
+                strategy=self.strategy_label,
+            )
+            success = bool(result.get("success"))
 
             logger.info(
                 "v1_order_amend",
+                controller=self.controller_label,
+                stage=self.stage_name,
+                strategy=self.strategy_label,
                 order_id=mutation.order_id,
                 new_price=mutation.price,
                 new_size=mutation.size,
+                replacement_order_id=result.get("order_id", ""),
                 success=success,
             )
             return success
