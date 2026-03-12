@@ -64,6 +64,7 @@ class UserWebSocket:
         self._task: asyncio.Task | None = None
         self._last_message_ts: float = 0.0
         self._message_count: int = 0
+        self._connect_count: int = 0
         self._reconnect_count: int = 0
 
     def _ws_is_open(self) -> bool:
@@ -261,14 +262,15 @@ class UserWebSocket:
         while self._is_running:
             try:
                 await self.connect()
+                self._connect_count += 1
+                if self._connect_count > 1:
+                    self._reconnect_count += 1
                 delay = self._reconnect_delay
 
                 # Trigger reconciliation after reconnect
-                if self._reconnect_count > 0 and self._on_reconnect:
+                if self._connect_count > 1 and self._on_reconnect:
                     logger.info("user_ws_triggering_reconciliation")
                     await self._on_reconnect()
-
-                self._reconnect_count += 1
                 await self._listen_loop()
 
             except Exception as e:
@@ -304,6 +306,7 @@ class UserWebSocket:
         return {
             "is_connected": self.is_connected,
             "message_count": self._message_count,
+            "connect_count": self._connect_count,
             "reconnect_count": self._reconnect_count,
             "seconds_since_last_message": (
                 time.time() - self._last_message_ts if self._last_message_ts else float("inf")

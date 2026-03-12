@@ -5,6 +5,7 @@ Async SQLite using aiosqlite for storing fills, book snapshots, scoring history,
 
 from __future__ import annotations
 
+import inspect
 import os
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,22 @@ class Database:
         """
         self.db_path = Path(db_path)
         self._conn: aiosqlite.Connection | None = None
+        self._on_write_failure = None
+
+    def set_on_write_failure(self, callback) -> None:
+        """Register an optional callback for failed write operations."""
+        self._on_write_failure = callback
+
+    async def _emit_write_failure(self, operation: str, sql: str, error: Exception) -> None:
+        """Notify runtime ops hooks about a failed write."""
+        if not self._on_write_failure:
+            return
+        try:
+            maybe_coro = self._on_write_failure(operation, str(error), sql[:200])
+            if inspect.isawaitable(maybe_coro):
+                await maybe_coro
+        except Exception as callback_error:
+            logger.warning("db_write_failure_callback_failed", error=str(callback_error))
 
     async def init(self) -> None:
         """Initialize database connection and create tables from schema."""
@@ -130,6 +147,7 @@ class Database:
             await self._conn.commit()
         except Exception as e:
             logger.error("sql_execute_failed", sql=sql[:100], error=str(e))
+            await self._emit_write_failure("execute", sql, e)
             raise
 
     async def executemany(
@@ -159,6 +177,7 @@ class Database:
             await self._conn.commit()
         except Exception as e:
             logger.error("sql_executemany_failed", sql=sql[:100], error=str(e))
+            await self._emit_write_failure("execute_many", sql, e)
             raise
 
     async def fetch_all(

@@ -53,7 +53,7 @@ class KillSwitch:
         self,
         ws_stale_kill_s: float = 2.0,
         max_auth_failures: int = 3,
-        max_reconciliation_mismatches: int = 2,
+        max_reconciliation_mismatches: int = 3,
     ) -> None:
         self._ws_stale_kill_s = ws_stale_kill_s
         self._max_auth_failures = max_auth_failures
@@ -227,6 +227,14 @@ class KillSwitch:
         return {
             "is_triggered": self.is_triggered,
             "active_reasons": [r.value for r in self._active_reasons],
+            "events": {
+                reason.value: {
+                    "message": event.message,
+                    "timestamp": event.timestamp,
+                    "auto_clear_after_s": event.auto_clear_after_s,
+                }
+                for reason, event in self._active_reasons.items()
+            },
             "auth_failure_count": self._auth_failure_count,
             "reconciliation_mismatch_count": self._reconciliation_mismatch_count,
             "total_triggers": len(self._trigger_history),

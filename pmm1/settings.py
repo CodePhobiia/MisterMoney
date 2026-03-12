@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import structlog
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 _settings_logger = structlog.get_logger(__name__)
@@ -120,6 +120,20 @@ class ExecutionConfig(BaseModel):
     retry_backoff_initial_ms: int = 1000
     retry_backoff_max_ms: int = 30000
 
+    @field_validator(
+        "order_ttl_effective_s",
+        "heartbeat_s",
+        "ws_stale_kill_s",
+        "max_batch_orders",
+        "retry_backoff_initial_ms",
+        "retry_backoff_max_ms",
+    )
+    @classmethod
+    def _must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("execution values must be positive")
+        return value
+
 
 class ApiConfig(BaseModel):
     """API endpoints and credentials."""
@@ -180,6 +194,23 @@ class FlattenConfig(BaseModel):
     config_flag_path: str = "/tmp/pmm1_flatten"
     price_tolerance_pct: float = 0.05
 
+    @field_validator("config_flag_path")
+    @classmethod
+    def _validate_flag_path(cls, value: str) -> str:
+        path = Path(value)
+        if not path.is_absolute():
+            raise ValueError("flatten.config_flag_path must be an absolute path")
+        if path == Path("/"):
+            raise ValueError("flatten.config_flag_path cannot be '/'")
+        return value
+
+    @field_validator("price_tolerance_pct")
+    @classmethod
+    def _validate_price_tolerance(cls, value: float) -> float:
+        if value <= 0 or value > 0.25:
+            raise ValueError("flatten.price_tolerance_pct must be in (0, 0.25]")
+        return value
+
 
 class OrphanConfig(BaseModel):
     """Orphan position handling settings."""
@@ -209,6 +240,20 @@ class FillEscalationConfig(BaseModel):
     taker_trigger_secs: int = 20 * 60  # 20 min
     taker_min_shares: float = 5.0
 
+    @model_validator(mode="after")
+    def _validate_escalation(self) -> FillEscalationConfig:
+        if self.level_1_secs <= 0 or self.level_2_secs <= 0 or self.level_3_secs <= 0:
+            raise ValueError("fill escalation timers must be positive")
+        if self.taker_trigger_secs <= 0:
+            raise ValueError("fill escalation taker trigger must be positive")
+        if self.taker_min_shares <= 0:
+            raise ValueError("fill escalation taker_min_shares must be positive")
+        if self.taker_enabled and not self.enabled:
+            raise ValueError("taker bootstrap requires fill escalation to be enabled")
+        if self.taker_enabled and self.taker_trigger_secs < 300:
+            raise ValueError("taker bootstrap trigger must be at least 300 seconds")
+        return self
+
 
 class ExitConfig(BaseModel):
     """Root exit / sell-logic configuration."""
@@ -230,6 +275,53 @@ class V3Config(BaseModel):
     redis_url: str = "redis://localhost:6379"
     min_confidence: float = 0.70  # Minimum confidence to use V3 signal
     signal_max_age_seconds: float = 300.0  # Max age before falling back to midpoint
+
+
+class OpsConfig(BaseModel):
+    """Operational monitoring and health-check settings."""
+
+    runtime_status_path: str = "./data/runtime_status.json"
+    alert_cooldown_s: int = 300
+    status_stale_after_s: int = 45
+    no_active_quotes_after_s: int = 180
+    no_active_quotes_min_markets: int = 1
+    reconnect_storm_window_s: int = 300
+    reconnect_storm_threshold: int = 5
+    excessive_churn_window_s: int = 600
+    excessive_churn_ratio: float = 2.0
+    excessive_churn_min_cancels: int = 25
+    recent_failure_window_s: int = 900
+
+    @field_validator("runtime_status_path")
+    @classmethod
+    def _validate_status_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("ops.runtime_status_path cannot be blank")
+        return value
+
+    @field_validator(
+        "alert_cooldown_s",
+        "status_stale_after_s",
+        "no_active_quotes_after_s",
+        "no_active_quotes_min_markets",
+        "reconnect_storm_window_s",
+        "reconnect_storm_threshold",
+        "excessive_churn_window_s",
+        "excessive_churn_min_cancels",
+        "recent_failure_window_s",
+    )
+    @classmethod
+    def _validate_positive_ints(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("ops thresholds must be positive")
+        return value
+
+    @field_validator("excessive_churn_ratio")
+    @classmethod
+    def _validate_churn_ratio(cls, value: float) -> float:
+        if value < 1.0:
+            raise ValueError("ops.excessive_churn_ratio must be at least 1.0")
+        return value
 
 
 class UniverseWeights(BaseModel):
@@ -263,6 +355,7 @@ class Settings(BaseSettings):
     universe_weights: UniverseWeights = Field(default_factory=UniverseWeights)
     exit: ExitConfig = Field(default_factory=ExitConfig)
     v3: V3Config = Field(default_factory=V3Config)
+    ops: OpsConfig = Field(default_factory=OpsConfig)
     raw_config: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     model_config = {"env_prefix": "PMM1_", "env_nested_delimiter": "__"}
@@ -282,6 +375,8 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 def load_settings(
     config_path: str | Path | None = None,
     override_path: str | Path | None = None,
+    *,
+    enforce_runtime_guards: bool = True,
 ) -> Settings:
     """Load settings from YAML file(s) + environment variables.
 
@@ -361,7 +456,41 @@ def load_settings(
             del yaml_data[k]
     
     yaml_data["raw_config"] = raw_config
-    return Settings(**yaml_data)
+    settings = Settings(**yaml_data)
+    if enforce_runtime_guards:
+        _validate_runtime_guards(settings)
+    return settings
+
+
+def _validate_runtime_guards(settings: Settings) -> None:
+    """Fail closed on dangerous live-mode combinations."""
+    if settings.bot.paper_mode:
+        return
+
+    missing_fields: list[str] = []
+    if not settings.wallet.private_key:
+        missing_fields.append("wallet.private_key")
+    if not settings.wallet.address:
+        missing_fields.append("wallet.address")
+    if not settings.api.api_key:
+        missing_fields.append("api.api_key")
+    if not settings.api.api_secret:
+        missing_fields.append("api.api_secret")
+    if not settings.api.api_passphrase:
+        missing_fields.append("api.api_passphrase")
+
+    if missing_fields:
+        raise ValueError(
+            "live trading requires credentials for "
+            + ", ".join(missing_fields)
+        )
+
+    if settings.exit.fill_escalation.taker_enabled:
+        taker_ack = os.getenv("PMM1_ACK_TAKER_BOOTSTRAP", "").strip().upper()
+        if taker_ack != "YES":
+            raise ValueError(
+                "live taker bootstrap requires PMM1_ACK_TAKER_BOOTSTRAP=YES"
+            )
 
 
 class SettingsManager:

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from typing import Any
 
@@ -66,12 +67,55 @@ class Reconciler:
         self._is_running = False
         self._task: asyncio.Task | None = None
         self._reconcile_count: int = 0
-        self._mismatch_count: int = 0
+        self._order_mismatch_streak: int = 0
+        self._position_mismatch_streak: int = 0
+        self._total_mismatch_events: int = 0
+        self._last_mismatch_at: float = 0.0
+        self._last_mismatch_details: str = ""
         self._kill_switch = None  # Set via set_kill_switch()
+        self._on_mismatch = None
 
     def set_kill_switch(self, kill_switch) -> None:
         """Set the kill switch for escalation on persistent mismatches."""
         self._kill_switch = kill_switch
+
+    def set_on_mismatch(self, callback) -> None:
+        """Register an optional callback for mismatch events."""
+        self._on_mismatch = callback
+
+    async def _emit_mismatch(
+        self,
+        *,
+        kind: str,
+        count: int,
+        details: str,
+        streak: int,
+    ) -> None:
+        """Notify ops hooks about a reconciliation mismatch."""
+        self._last_mismatch_at = time.time()
+        self._last_mismatch_details = details
+        if not self._on_mismatch:
+            return
+        try:
+            maybe_coro = self._on_mismatch(
+                kind=kind,
+                count=count,
+                details=details,
+                streak=streak,
+            )
+            if inspect.isawaitable(maybe_coro):
+                await maybe_coro
+        except Exception as callback_error:
+            logger.warning("reconciliation_mismatch_callback_failed", error=str(callback_error))
+
+    def _maybe_clear_kill_switch(self) -> None:
+        """Clear reconciliation kill-switch state after clean cycles."""
+        if (
+            self._kill_switch
+            and self._order_mismatch_streak == 0
+            and self._position_mismatch_streak == 0
+        ):
+            self._kill_switch.report_reconciliation_clean()
 
     async def reconcile_orders(self) -> ReconciliationResult:
         """Reconcile local order state with exchange open orders."""
@@ -104,20 +148,27 @@ class Reconciler:
             missing = mismatches.get("missing_from_exchange", [])
 
             if unknown or missing:
-                self._mismatch_count += 1
+                self._order_mismatch_streak += 1
+                self._total_mismatch_events += 1
+                details = f"orders: {len(unknown)} unknown, {len(missing)} missing"
                 logger.warning(
                     "order_reconciliation_mismatches",
                     unknown_count=len(unknown),
                     imported_count=len(imported),
                     missing_count=len(missing),
-                    total_mismatches=self._mismatch_count,
+                    streak=self._order_mismatch_streak,
                 )
-                # Escalate to kill switch after 3+ consecutive mismatches
-                if self._mismatch_count >= 3 and self._kill_switch:
-                    self._kill_switch.report_reconciliation_mismatch(
-                        f"orders: {len(unknown)} unknown, {len(missing)} missing"
-                    )
+                if self._kill_switch:
+                    self._kill_switch.report_reconciliation_mismatch(details)
+                await self._emit_mismatch(
+                    kind="orders",
+                    count=len(unknown) + len(missing),
+                    details=details,
+                    streak=self._order_mismatch_streak,
+                )
             else:
+                self._order_mismatch_streak = 0
+                self._maybe_clear_kill_switch()
                 logger.debug(
                     "order_reconciliation_clean",
                     matched=mismatches.get("matched", 0),
@@ -159,12 +210,25 @@ class Reconciler:
 
             mismatch_count = mismatches.get("count", 0)
             if mismatch_count > 0:
-                self._mismatch_count += mismatch_count
+                self._position_mismatch_streak += 1
+                self._total_mismatch_events += 1
+                details = f"positions: {mismatch_count} mismatches"
                 logger.warning(
                     "position_reconciliation_mismatches",
                     count=mismatch_count,
+                    streak=self._position_mismatch_streak,
+                )
+                if self._kill_switch:
+                    self._kill_switch.report_reconciliation_mismatch(details)
+                await self._emit_mismatch(
+                    kind="positions",
+                    count=mismatch_count,
+                    details=details,
+                    streak=self._position_mismatch_streak,
                 )
             else:
+                self._position_mismatch_streak = 0
+                self._maybe_clear_kill_switch()
                 logger.debug("position_reconciliation_clean")
 
             self._last_position_reconcile = time.time()
@@ -244,9 +308,20 @@ class Reconciler:
         logger.info("reconcile_loop_stopped")
 
     def get_stats(self) -> dict[str, Any]:
+        """Return reconciliation health for status checks."""
+        now = time.time()
         return {
+            "order_mismatch_streak": self._order_mismatch_streak,
+            "position_mismatch_streak": self._position_mismatch_streak,
+            "total_mismatch_events": self._total_mismatch_events,
+            "last_mismatch_at": self._last_mismatch_at,
+            "last_mismatch_details": self._last_mismatch_details,
+            "seconds_since_order_reconcile": (
+                now - self._last_order_reconcile if self._last_order_reconcile else float("inf")
+            ),
+            "seconds_since_position_reconcile": (
+                now - self._last_position_reconcile if self._last_position_reconcile else float("inf")
+            ),
             "reconcile_count": self._reconcile_count,
-            "mismatch_count": self._mismatch_count,
-            "seconds_since_order_reconcile": time.time() - self._last_order_reconcile if self._last_order_reconcile else float("inf"),
-            "seconds_since_position_reconcile": time.time() - self._last_position_reconcile if self._last_position_reconcile else float("inf"),
+            "is_running": self._is_running,
         }

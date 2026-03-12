@@ -6,6 +6,7 @@ Records fill data to SQLite and schedules async markout calculations.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,36 @@ class FillRecorder:
         """
         self.db = db
         self.book_manager = book_manager
+        self._on_failure = None
+
+    def set_on_failure(self, callback) -> None:
+        """Register an optional callback for fill recorder failures."""
+        self._on_failure = callback
+
+    async def _emit_failure(
+        self,
+        *,
+        stage: str,
+        token_id: str,
+        order_id: str = "",
+        error: Exception,
+        delay_sec: int | None = None,
+    ) -> None:
+        """Notify runtime ops hooks about a recorder failure."""
+        if not self._on_failure:
+            return
+        try:
+            maybe_coro = self._on_failure(
+                stage=stage,
+                token_id=token_id,
+                order_id=order_id,
+                error=str(error),
+                delay_sec=delay_sec,
+            )
+            if inspect.isawaitable(maybe_coro):
+                await maybe_coro
+        except Exception as callback_error:
+            logger.warning("fill_recorder_failure_callback_failed", error=str(callback_error))
 
     async def record_fill(
         self,
@@ -120,6 +151,12 @@ class FillRecorder:
                 order_id=order_id[:16] if order_id else "?",
                 error=str(e),
             )
+            await self._emit_failure(
+                stage="record_fill",
+                token_id=token_id,
+                order_id=order_id,
+                error=e,
+            )
             return 0
 
     async def _schedule_markout(
@@ -193,4 +230,10 @@ class FillRecorder:
                 token_id=token_id[:16] if token_id else "?",
                 delay_sec=delay_sec,
                 error=str(e),
+            )
+            await self._emit_failure(
+                stage="markout",
+                token_id=token_id,
+                error=e,
+                delay_sec=delay_sec,
             )

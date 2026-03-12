@@ -80,9 +80,16 @@ from pmm1.ws.market_ws import MarketWebSocket
 from pmm1.ws.user_ws import UserWebSocket
 from pmm1.analytics.metrics import MetricsCollector
 from pmm1.analytics.pnl import PnLTracker
+from pmm1.notifications import (
+    AlertManager,
+    AlertSeverity,
+    format_exit_notification,
+    format_fill_notification,
+    send_telegram,
+)
+from pmm1.ops import OpsMonitor
 from pmm1.paper.engine import PaperEngine
 from pmm1.paper.logger import PaperLogger
-from pmm1.notifications import send_telegram, format_fill_notification, format_exit_notification
 from pmm1.storage.database import Database
 from pmm1.recorder.fill_recorder import FillRecorder
 from pmm1.recorder.book_recorder import BookRecorder
@@ -286,6 +293,14 @@ async def run(settings: Settings | None = None) -> None:
 
     # ── Initialize state ──
     state = BotState(settings)
+    alert_manager = AlertManager(default_cooldown_s=settings.ops.alert_cooldown_s)
+    ops_monitor = OpsMonitor(settings.ops, alert_manager=alert_manager)
+    ops_monitor.write_lifecycle_status(
+        mode=state.mode,
+        paper_mode=settings.bot.paper_mode,
+        note="startup",
+        kill_switch=state.kill_switch.get_status(),
+    )
 
     # ── 4. Fetch universe (ordered by 24h volume for best market selection) ──
     logger.info("fetching_universe")
@@ -646,6 +661,7 @@ async def run(settings: Settings | None = None) -> None:
             reconcile_positions_s=settings.bot.reconcile_positions_s,
         )
         reconciler.set_kill_switch(state.kill_switch)
+        reconciler.set_on_mismatch(ops_monitor.record_reconciliation_mismatch)
 
     # ── Initialize ExitManager ──
     exit_manager = ExitManager(
@@ -659,14 +675,33 @@ async def run(settings: Settings | None = None) -> None:
     recorder = LiveRecorder()
     parquet_writer = ParquetWriter(settings.storage.parquet_dir)
 
-    # ── Wire alert callbacks (T1-12 wiring) ──
-    from pmm1.notifications import send_critical_alert, send_warning_alert
-
     async def _on_kill_switch(reason: str, message: str) -> None:
-        await send_critical_alert("KILL SWITCH", f"{reason}: {message}")
+        await alert_manager.critical(
+            "KILL SWITCH",
+            f"{reason}: {message}",
+            dedupe_key=f"kill_switch:{reason}",
+        )
 
     async def _on_drawdown_tier(old_tier, new_tier, dd_pct: float) -> None:
-        await send_warning_alert("DRAWDOWN", f"{old_tier}→{new_tier}, DD: {dd_pct:.1f}%")
+        details = f"{old_tier}→{new_tier}, DD: {dd_pct:.1f}%"
+        if new_tier == "normal":
+            await alert_manager.info(
+                "DRAWDOWN",
+                details,
+                dedupe_key="drawdown:recovered",
+            )
+        elif new_tier == "tier3_flatten_only":
+            await alert_manager.critical(
+                "DRAWDOWN",
+                details,
+                dedupe_key="drawdown:tier3",
+            )
+        else:
+            await alert_manager.warning(
+                "DRAWDOWN",
+                details,
+                dedupe_key=f"drawdown:{new_tier}",
+            )
 
     state.kill_switch.set_on_trigger(_on_kill_switch)
     state.drawdown.set_on_tier_change(_on_drawdown_tier)
@@ -676,6 +711,9 @@ async def run(settings: Settings | None = None) -> None:
     await db.init()
     fill_recorder = FillRecorder(db, state.book_manager)
     book_recorder = BookRecorder(db)
+
+    db.set_on_write_failure(ops_monitor.record_db_write_failure)
+    fill_recorder.set_on_failure(ops_monitor.record_fill_recorder_failure)
 
     # ── Initialize PMM-2 runtime (Sprint 7) ──
     from pmm2.runtime.integration import (
@@ -1148,6 +1186,12 @@ async def run(settings: Settings | None = None) -> None:
 
     state.mode = "QUOTING"
     logger.info("pmm1_entering_quoting_mode", markets=len(state.active_markets))
+    ops_monitor.write_lifecycle_status(
+        mode=state.mode,
+        paper_mode=paper_mode,
+        note="quoting",
+        kill_switch=state.kill_switch.get_status(),
+    )
 
     # ── Main quote loop ──
     cycle_count = 0
@@ -1199,6 +1243,12 @@ async def run(settings: Settings | None = None) -> None:
                         if order_manager:
                             await order_manager.cancel_all()
                         state.mode = "FLATTEN_ONLY"
+                    ops_monitor.write_lifecycle_status(
+                        mode=state.mode,
+                        paper_mode=paper_mode,
+                        note="kill_switch_active",
+                        kill_switch=state.kill_switch.get_status(),
+                    )
                     await asyncio.sleep(1.0)
                     continue
                 else:
@@ -1231,6 +1281,12 @@ async def run(settings: Settings | None = None) -> None:
                         paper_engine.cancel_all_orders()
                     state.mode = "FLATTEN_ONLY"
                     state.kill_switch.trigger_drawdown()
+                ops_monitor.write_lifecycle_status(
+                    mode=state.mode,
+                    paper_mode=paper_mode,
+                    note="drawdown_flatten_only",
+                    kill_switch=state.kill_switch.get_status(),
+                )
                 await asyncio.sleep(1.0)
                 continue
 
@@ -2300,6 +2356,19 @@ async def run(settings: Settings | None = None) -> None:
             state.metrics.record_quote_cycle(
                 cycle_duration, markets_quoted, orders_submitted, orders_canceled
             )
+            await ops_monitor.observe_cycle(
+                state=state,
+                paper_mode=paper_mode,
+                nav=nav,
+                dd_state=dd_state,
+                market_ws=market_ws,
+                user_ws=user_ws,
+                heartbeat=heartbeat,
+                reconciler=reconciler,
+                markets_quoted=markets_quoted,
+                cycle_lifecycle_counts=cycle_lifecycle_counts,
+                cycle_duration_ms=cycle_duration,
+            )
 
             if cycle_count % 100 == 0:
                 if paper_mode and paper_engine and paper_logger:
@@ -2369,6 +2438,12 @@ async def run(settings: Settings | None = None) -> None:
         # ── Shutdown ──
         state.mode = "SHUTDOWN"
         logger.info("pmm1_shutting_down")
+        ops_monitor.write_lifecycle_status(
+            mode=state.mode,
+            paper_mode=paper_mode,
+            note="shutdown",
+            kill_switch=state.kill_switch.get_status(),
+        )
 
         # Cancel all orders
         if order_manager:
@@ -2413,6 +2488,7 @@ async def run(settings: Settings | None = None) -> None:
         await clob_public.close()
         await clob_private.close()
         await data_api.close()
+        await db.close()
 
         # Final metrics
         bot_metrics = state.metrics.get_bot_metrics()

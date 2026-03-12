@@ -40,6 +40,7 @@ dev = [
 
 [project.scripts]
 pmm1 = "pmm1.main:main"
+pmm1-health = "pmm1.tools.healthcheck:main"
 
 [tool.ruff]
 target-version = "py312"

@@ -1,11 +1,38 @@
 # MisterMoney Operational Runbook
 
-**Last Updated**: 2026-03-08
+**Last Updated**: 2026-03-12
 **Audience**: Bot operators (currently: Theyab)
 
 ---
 
-## 1. Emergency Stop
+## 1. One-Command Health Check
+
+### Primary command
+```bash
+python -m pmm1.tools.healthcheck
+# or, if installed via entry points:
+pmm1-health
+```
+
+### Exit codes
+- `0` = healthy / informational only
+- `1` = warning state (operator attention required)
+- `2` = critical state (treat as service down or risk event)
+
+### Optional paging command
+```bash
+python -m pmm1.tools.healthcheck --notify
+```
+
+Use `--notify` from cron or a systemd timer if you want Telegram paging for service-down detection. This is the low-friction path for the cases the bot cannot self-report after a crash.
+
+### Current health signals
+- `critical`: service down / stale runtime status, kill switch active, drawdown flatten-only, DB write failure
+- `warning`: reconciliation mismatch streak, drawdown tier 1/2, websocket reconnect storm, no active quotes, excessive churn, fill recorder failure
+
+---
+
+## 2. Emergency Stop
 
 ### Immediate shutdown
 ```bash
@@ -33,7 +60,7 @@ journalctl --user -u pmm1 -f | grep -i flatten
 
 ---
 
-## 2. Restart Checklist
+## 3. Restart Checklist
 
 Before restarting the bot, verify:
 
@@ -43,6 +70,9 @@ Before restarting the bot, verify:
 - [ ] **CTF approvals** — ERC-1155 approvals are set for the CLOB exchange contract
 - [ ] **No lingering flatten flag** — `rm -f /tmp/pmm1_flatten`
 - [ ] **Config is correct** — Review `config/default.yaml` and `config/prod.yaml`
+- [ ] **Dangerous toggles acknowledged explicitly**
+  - If taker bootstrap is enabled in live mode: `export PMM1_ACK_TAKER_BOOTSTRAP=YES`
+  - If PMM-2 live mode is enabled (`shadow_mode: false`): `export PMM1_ACK_PMM2_LIVE=YES`
 - [ ] **Check git status** — `git status` to ensure no uncommitted changes that could cause issues
 
 ### Start
@@ -63,11 +93,14 @@ journalctl --user -u pmm1 -f
 # - "user_ws_connected"
 # - "universe_built" with N markets
 # - "quoting_started"
+
+# Then run the one-command health check
+python -m pmm1.tools.healthcheck
 ```
 
 ---
 
-## 3. Exchange Restart (Every Tuesday)
+## 4. Exchange Restart (Every Tuesday)
 
 Polymarket CLOB restarts every Tuesday around ~14:00 UTC.
 
@@ -86,12 +119,12 @@ journalctl --user -u pmm1 -f | grep -E "kill_switch|reconnect|reconcil"
 
 ### If auto-recovery fails (>5 minutes):
 1. Check if WebSocket reconnected: look for `market_ws_connected` in logs
-2. If stuck, restart the bot manually (see §2)
+2. If stuck, restart the bot manually (see §3)
 3. After restart, verify all positions are reconciled
 
 ---
 
-## 4. Drawdown Investigation
+## 5. Drawdown Investigation
 
 ### Check current state:
 ```bash
@@ -120,7 +153,7 @@ journalctl --user -u pmm1 --since "1 hour ago" | grep -i drawdown
 
 ---
 
-## 5. Gas Refill
+## 6. Gas Refill
 
 The bot needs POL (formerly MATIC) for on-chain operations (approvals, conversions).
 
@@ -141,7 +174,7 @@ cast balance $WALLET_ADDRESS --rpc-url https://polygon-rpc.com
 
 ---
 
-## 6. Position Reconciliation Mismatch
+## 7. Position Reconciliation Mismatch
 
 ### What it means:
 The bot's local state disagrees with the exchange's view of open orders or positions.
@@ -168,7 +201,7 @@ journalctl --user -u pmm1 --since "30 min ago" | grep -i "reconcil\|mismatch"
 
 ---
 
-## 7. CLOB API Credential Refresh
+## 8. CLOB API Credential Refresh
 
 ### When needed:
 - API key expired or revoked
@@ -200,7 +233,7 @@ systemctl --user restart pmm1
 
 ---
 
-## 8. Log Analysis Quick Reference
+## 9. Log Analysis Quick Reference
 
 ```bash
 # Recent errors
@@ -220,11 +253,14 @@ journalctl --user -u pmm1 | grep drawdown_tier_changed
 
 # Reconciliation
 journalctl --user -u pmm1 | grep reconciliation
+
+# New ops alerts
+journalctl --user -u pmm1 | grep -E "ops_alert|DB WRITE FAILURE|FILL RECORDER FAILURE|NO ACTIVE QUOTES|EXCESSIVE CHURN|WS RECONNECT STORM"
 ```
 
 ---
 
-## 9. Key File Locations
+## 10. Key File Locations
 
 | File | Purpose |
 |------|---------|
@@ -233,11 +269,12 @@ journalctl --user -u pmm1 | grep reconciliation
 | `.env` | Secrets (API keys, wallet key) |
 | `data/pmm1.db` | SQLite database (fills, books, queue state) |
 | `data/parquet/` | Historical data (Parquet format) |
+| `data/runtime_status.json` | Runtime health/status snapshot used by `pmm1-health` |
 | `/tmp/pmm1_flatten` | Flatten flag (touch to trigger) |
 
 ---
 
-## 10. Emergency Contacts & Resources
+## 11. Emergency Contacts & Resources
 
 - **Polymarket Discord**: Server status announcements
 - **Polymarket Status**: https://status.polymarket.com

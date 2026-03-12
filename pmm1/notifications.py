@@ -1,9 +1,13 @@
-"""Telegram notification module for fills and exits."""
+"""Telegram notification module for fills, exits, and operational alerts."""
 
 from __future__ import annotations
 
 import asyncio
 import os
+import time
+from enum import Enum
+from typing import Awaitable, Callable
+
 import aiohttp
 import structlog
 
@@ -12,6 +16,21 @@ logger = structlog.get_logger(__name__)
 # Get token from env or use default from openclaw config
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+class AlertSeverity(str, Enum):
+    """Operational alert severities."""
+
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+_ALERT_PREFIX = {
+    AlertSeverity.INFO: ("INFO", "ℹ️"),
+    AlertSeverity.WARNING: ("WARNING", "⚠️"),
+    AlertSeverity.CRITICAL: ("CRITICAL", "🚨"),
+}
 
 
 async def send_telegram(message: str) -> None:
@@ -49,6 +68,86 @@ async def send_telegram(message: str) -> None:
         logger.warning("telegram_send_failed", error=str(e))
 
 
+def format_alert(
+    severity: AlertSeverity,
+    event_type: str,
+    details: str,
+) -> str:
+    """Format an operational alert message."""
+    label, icon = _ALERT_PREFIX[severity]
+    return f"{icon} *{label}: {event_type}*\n{details}"
+
+
+async def send_alert(
+    event_type: str,
+    details: str,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> None:
+    """Send an operational alert via Telegram."""
+    await send_telegram(format_alert(severity, event_type, details))
+
+
+class AlertManager:
+    """Cooldown-aware alert sender for operational signals."""
+
+    def __init__(
+        self,
+        *,
+        default_cooldown_s: float = 300.0,
+        sender: Callable[[str], Awaitable[None]] = send_telegram,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._default_cooldown_s = default_cooldown_s
+        self._sender = sender
+        self._clock = clock
+        self._last_sent: dict[tuple[str, str], float] = {}
+
+    async def notify(
+        self,
+        severity: AlertSeverity,
+        event_type: str,
+        details: str,
+        *,
+        dedupe_key: str | None = None,
+        cooldown_s: float | None = None,
+    ) -> bool:
+        """Send an alert if the cooldown for this key has elapsed."""
+        key = dedupe_key or event_type
+        cooldown = self._default_cooldown_s if cooldown_s is None else cooldown_s
+        now = self._clock()
+        bucket = (severity.value, key)
+        last_sent = self._last_sent.get(bucket, 0.0)
+
+        if cooldown > 0 and (now - last_sent) < cooldown:
+            logger.debug(
+                "ops_alert_suppressed",
+                severity=severity.value,
+                event_type=event_type,
+                dedupe_key=key,
+                cooldown_s=cooldown,
+            )
+            return False
+
+        self._last_sent[bucket] = now
+        await self._sender(format_alert(severity, event_type, details))
+        logger.info(
+            "ops_alert_sent",
+            severity=severity.value,
+            event_type=event_type,
+            dedupe_key=key,
+        )
+        return True
+
+    async def info(self, event_type: str, details: str, **kwargs: object) -> bool:
+        return await self.notify(AlertSeverity.INFO, event_type, details, **kwargs)
+
+    async def warning(self, event_type: str, details: str, **kwargs: object) -> bool:
+        return await self.notify(AlertSeverity.WARNING, event_type, details, **kwargs)
+
+    async def critical(self, event_type: str, details: str, **kwargs: object) -> bool:
+        return await self.notify(AlertSeverity.CRITICAL, event_type, details, **kwargs)
+
+
 def format_fill_notification(
     side: str,
     size: float,
@@ -81,14 +180,17 @@ Token: {token_id[:16]}..."""
 
 async def send_critical_alert(event_type: str, details: str) -> None:
     """Send a critical alert via Telegram."""
-    message = f"🚨 *CRITICAL: {event_type}*\n{details}"
-    await send_telegram(message)
+    await send_alert(event_type, details, AlertSeverity.CRITICAL)
 
 
 async def send_warning_alert(event_type: str, details: str) -> None:
     """Send a warning alert via Telegram."""
-    message = f"⚠️ *WARNING: {event_type}*\n{details}"
-    await send_telegram(message)
+    await send_alert(event_type, details, AlertSeverity.WARNING)
+
+
+async def send_info_alert(event_type: str, details: str) -> None:
+    """Send an informational alert via Telegram."""
+    await send_alert(event_type, details, AlertSeverity.INFO)
 
 
 def format_exit_notification(

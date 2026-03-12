@@ -64,6 +64,8 @@ class MarketWebSocket:
         self._task: asyncio.Task | None = None
         self._last_message_ts: float = 0.0
         self._message_count: int = 0
+        self._connect_count: int = 0
+        self._reconnect_count: int = 0
 
     @property
     def book_manager(self) -> BookManager:
@@ -289,6 +291,9 @@ class MarketWebSocket:
             try:
                 self._reconnecting = True
                 await self.connect()
+                self._connect_count += 1
+                if self._connect_count > 1:
+                    self._reconnect_count += 1
                 delay = self._reconnect_delay  # Reset on successful connect
 
                 # Resubscribe to all assets
@@ -346,6 +351,8 @@ class MarketWebSocket:
             "is_stale": self.is_stale,
             "subscribed_assets": len(self._subscribed_assets),
             "message_count": self._message_count,
+            "connect_count": self._connect_count,
+            "reconnect_count": self._reconnect_count,
             "seconds_since_last_message": self.seconds_since_last_message,
             "books_count": len(self._books),
         }

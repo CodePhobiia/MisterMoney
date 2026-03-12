@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
+
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 
 logger = structlog.get_logger(__name__)
 
@@ -47,6 +49,32 @@ class PMM2Config(BaseModel):
 
     model_config = {"frozen": False}
 
+    @field_validator("live_capital_pct")
+    @classmethod
+    def _validate_live_capital_pct(cls, value: float) -> float:
+        if value < 0.0 or value > 1.0:
+            raise ValueError("pmm2.live_capital_pct must be between 0.0 and 1.0")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_operational_mode(self) -> PMM2Config:
+        if not self.enabled:
+            return self
+
+        if self.shadow_mode:
+            if self.live_capital_pct != 0.0:
+                raise ValueError("pmm2 shadow mode requires live_capital_pct=0.0")
+            return self
+
+        if self.live_capital_pct <= 0.0:
+            raise ValueError("pmm2 live mode requires live_capital_pct > 0.0")
+
+        live_ack = os.getenv("PMM1_ACK_PMM2_LIVE", "").strip().upper()
+        if live_ack != "YES":
+            raise ValueError("pmm2 live mode requires PMM1_ACK_PMM2_LIVE=YES")
+
+        return self
+
 
 def load_pmm2_config(yaml_dict: dict) -> PMM2Config:
     """Load PMM2Config from the 'pmm2' key of config YAML.
@@ -65,15 +93,11 @@ def load_pmm2_config(yaml_dict: dict) -> PMM2Config:
         logger.info("pmm2_config_not_found_using_defaults")
         return PMM2Config()
 
-    try:
-        config = PMM2Config(**pmm2_section)
-        logger.info(
-            "pmm2_config_loaded",
-            enabled=config.enabled,
-            shadow_mode=config.shadow_mode,
-            live_pct=config.live_capital_pct,
-        )
-        return config
-    except Exception as e:
-        logger.error("pmm2_config_load_failed", error=str(e))
-        return PMM2Config()
+    config = PMM2Config(**pmm2_section)
+    logger.info(
+        "pmm2_config_loaded",
+        enabled=config.enabled,
+        shadow_mode=config.shadow_mode,
+        live_pct=config.live_capital_pct,
+    )
+    return config
