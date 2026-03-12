@@ -324,8 +324,10 @@ class PMM2Runtime:
                     bundles=len(all_bundles),
                 )
 
-                # 2. Run allocator
-                current_markets = set(self.current_plan.keys())
+                # 2. Run allocator against ACTUAL V1 live state, not PMM-2's
+                # previous shadow plan. Otherwise shadow scoring becomes
+                # self-referential and overstates market-selection divergence.
+                current_markets = set(v1_snapshot.get("markets", []))
                 event_clusters = {
                     m.condition_id: m.event_id for m in self.enriched_universe
                 }
@@ -333,6 +335,18 @@ class PMM2Runtime:
                     oid: qs.queue_uncertainty
                     for oid, qs in self.queue_estimator.states.items()
                 }
+                current_allocations = {}
+                for order in v1_snapshot.get("orders", []):
+                    cid = order.get("condition_id")
+                    if not cid:
+                        continue
+                    size = float(order.get("size", 0.0) or 0.0)
+                    price = float(order.get("price", 0.0) or 0.0)
+                    side = order.get("side", "")
+                    if size <= 0:
+                        continue
+                    capital = size * price if side == "BUY" else size * max(0.0, 1.0 - price)
+                    current_allocations[cid] = current_allocations.get(cid, 0.0) + capital
 
                 plan = await self.allocator.run_allocation_cycle(
                     scored_bundles=all_bundles,
@@ -340,6 +354,7 @@ class PMM2Runtime:
                     event_clusters=event_clusters,
                     queue_uncertainties=queue_uncertainties,
                     net_exposures={},
+                    current_allocations=current_allocations,
                 )
 
                 logger.info(

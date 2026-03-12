@@ -46,6 +46,9 @@ class QuoteBundle(BaseModel):
     total_value: float = 0.0
     marginal_return: float = 0.0  # V / Cap
 
+    # Market metadata needed downstream for shadow comparison / launch gates
+    is_reward_eligible: bool = False
+
     model_config = {"frozen": False}
 
 
@@ -114,6 +117,7 @@ def generate_bundles(
             bid_size=b1_bid_size,
             ask_price=market.best_ask,
             ask_size=b1_ask_size,
+            is_reward_eligible=market.reward_eligible,
         )
         bundles.append(b1)
         logger.debug(
@@ -166,6 +170,7 @@ def generate_bundles(
                     bid_size=b2_bid_size,
                     ask_price=b2_ask_price,
                     ask_size=b2_ask_size,
+                    is_reward_eligible=market.reward_eligible,
                 )
                 bundles.append(b2)
                 logger.debug(
@@ -216,6 +221,7 @@ def generate_bundles(
                 bid_size=b3_bid_size,
                 ask_price=b3_ask_price,
                 ask_size=b3_ask_size,
+                is_reward_eligible=market.reward_eligible,
             )
             bundles.append(b3)
             logger.debug(

@@ -69,14 +69,19 @@ class V1StateSnapshot:
 
                 for order in active_orders:
                     # Extract order details
+                    state = getattr(order, "state", "")
+                    status = state.value if hasattr(state, "value") else str(state)
+                    size = float(getattr(order, "remaining_size_float", 0.0))
+                    price = float(getattr(order, "price_float", 0.0))
+
                     order_dict = {
                         "order_id": getattr(order, "order_id", ""),
                         "token_id": getattr(order, "token_id", ""),
                         "condition_id": getattr(order, "condition_id", ""),
                         "side": getattr(order, "side", ""),
-                        "price": float(getattr(order, "price", 0.0)),
-                        "size": float(getattr(order, "size", 0.0)),
-                        "status": getattr(order, "status", ""),
+                        "price": price,
+                        "size": size,
+                        "status": status,
                         "is_scoring": getattr(order, "is_scoring", False),
                     }
 
@@ -97,7 +102,7 @@ class V1StateSnapshot:
                     if order_dict.get("side") == "BUY":
                         snapshot["total_capital_deployed"] += size * price
                     else:  # SELL
-                        snapshot["total_capital_deployed"] += size * (1 - price)
+                        snapshot["total_capital_deployed"] += size * max(0.0, 1 - price)
 
             # Get positions (list() creates immediate copy for atomic snapshot)
             if hasattr(bot_state, "position_tracker"):
@@ -114,11 +119,13 @@ class V1StateSnapshot:
 
                     snapshot["positions"].append(pos_dict)
 
-            # Estimate reward-eligible count
-            # Markets with scoring orders are likely reward-eligible
-            snapshot["reward_eligible_count"] = len(
-                [o for o in snapshot["orders"] if o.get("is_scoring", False)]
-            )
+            # Estimate reward-eligible count as unique markets with scoring orders.
+            scoring_markets = {
+                o.get("condition_id")
+                for o in snapshot["orders"]
+                if o.get("is_scoring", False) and o.get("condition_id")
+            }
+            snapshot["reward_eligible_count"] = len(scoring_markets)
 
             # Convert markets set to list for JSON serialization
             snapshot["markets"] = list(snapshot["markets"])
@@ -160,6 +167,8 @@ class V1StateSnapshot:
             return float(bot_state.wallet_balance)
         if hasattr(bot_state, "total_equity"):
             return float(bot_state.total_equity)
+        if hasattr(bot_state, "inventory_manager") and hasattr(bot_state.inventory_manager, "get_total_nav_estimate"):
+            return float(bot_state.inventory_manager.get_total_nav_estimate())
 
         # No fallback — return 0.0 and let callers mark the cycle invalid
         logger.warning("nav_not_available_returning_zero")

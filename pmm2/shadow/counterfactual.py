@@ -94,11 +94,14 @@ class CounterfactualEngine:
         pmm2_only = pmm2_markets - v1_markets
         v1_only = v1_markets - pmm2_markets
 
-        # Reward market comparison
+        # Reward market comparison (count unique markets, not bundles/orders)
         v1_reward_count = v1_state.get("reward_eligible_count", 0)
-        pmm2_reward_count = len(
-            [b for b in pmm2_plan.get("bundles", []) if b.get("is_reward_eligible", False)]
-        )
+        pmm2_reward_markets = {
+            b.get("market_condition_id")
+            for b in pmm2_plan.get("bundles", [])
+            if b.get("is_reward_eligible", False) and b.get("market_condition_id")
+        }
+        pmm2_reward_count = len(pmm2_reward_markets)
         reward_improvement = pmm2_reward_count - v1_reward_count
 
         # Churn comparison (mutations needed)
