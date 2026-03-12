@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import time
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 
 import structlog
 from pydantic import BaseModel, Field
@@ -43,12 +43,14 @@ from pmm1.strategy.quote_engine import QuoteIntent
 logger = structlog.get_logger(__name__)
 
 
-class OrderDiff(BaseModel):
-    """Diff between desired and live orders."""
+class OrderCancellation(BaseModel):
+    """Cancellation request plus replacement telemetry."""
 
-    to_cancel: list[str] = Field(default_factory=list)  # order_ids to cancel
-    to_submit: list[CreateOrderRequest] = Field(default_factory=list)  # new orders
-    unchanged: list[str] = Field(default_factory=list)  # order_ids left alone
+    order_id: str
+    token_id: str = ""
+    condition_id: str = ""
+    side: str = ""
+    reasons: list[str] = Field(default_factory=list)
 
 
 class OrderSubmission(BaseModel):
@@ -57,6 +59,17 @@ class OrderSubmission(BaseModel):
     request: CreateOrderRequest
     condition_id: str = ""
     strategy: str = ""
+    replacement_reasons: list[str] = Field(default_factory=list)
+    replaced_order_ids: list[str] = Field(default_factory=list)
+
+
+class OrderDiff(BaseModel):
+    """Diff between desired and live orders."""
+
+    to_cancel: list[OrderCancellation] = Field(default_factory=list)
+    to_submit: list[OrderSubmission] = Field(default_factory=list)
+    unchanged: list[str] = Field(default_factory=list)
+    replacement_reason_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class OrderManager:
@@ -93,38 +106,185 @@ class OrderManager:
     def _get_server_time(self) -> int:
         return int(time.time()) + self._server_time_offset
 
-    def _should_reprice(
+    def _dedupe_reasons(self, reasons: list[str]) -> list[str]:
+        deduped: list[str] = []
+        for reason in reasons:
+            if reason and reason not in deduped:
+                deduped.append(reason)
+        return deduped
+
+    def _build_order_request(
+        self,
+        *,
+        token_id: str,
+        side: OrderSide,
+        price: float,
+        size: float,
+        tick_size: Decimal,
+        neg_risk: bool,
+        post_only: bool | None = None,
+        order_type: OrderType | None = None,
+    ) -> CreateOrderRequest:
+        """Create a normalized order request for a desired quote."""
+        rounded_price = round_bid(price, tick_size) if side == OrderSide.BUY else round_ask(price, tick_size)
+        rounded_size = round_size(size)
+        expiration = 0
+        normalized_order_type = order_type or OrderType.GTC
+        if self._use_gtd and normalized_order_type in (OrderType.GTC, OrderType.GTD):
+            expiration = compute_gtd_expiration(
+                self._order_ttl_s,
+                self._get_server_time(),
+            )
+            normalized_order_type = OrderType.GTD
+
+        return CreateOrderRequest(
+            token_id=token_id,
+            price=price_to_string(rounded_price),
+            size=str(rounded_size),
+            side=side,
+            order_type=normalized_order_type,
+            expiration=expiration,
+            neg_risk=neg_risk,
+            post_only=self._post_only if post_only is None else post_only,
+            tick_size=str(tick_size),
+        )
+
+    def _replacement_reasons(
         self,
         live: TrackedOrder,
-        desired_price: float,
-        desired_size: float,
+        desired_request: CreateOrderRequest,
         tick_size: Decimal,
-    ) -> bool:
-        """Check if a live order should be repriced.
-
-        Reprice when:
-        - Price moved ≥ 1 tick
-        - Size changed ≥ 20%
-        - Order age > TTL
-        - Tick size changed (handled externally)
-        """
-        # Age check
+        extra_reasons: list[str] | None = None,
+    ) -> list[str]:
+        """Return explicit reasons a live order should be replaced."""
+        reasons = list(extra_reasons or [])
         if live.age_seconds > self._order_ttl_s:
-            return True
+            reasons.append("ttl_expired")
 
-        # Price check
         tick_float = float(tick_size)
+        desired_price = float(desired_request.price)
         price_diff = abs(live.price_float - desired_price)
         if price_diff >= tick_float * self._reprice_threshold_ticks:
-            return True
+            reasons.append("price_move")
 
-        # Size check
-        if live.remaining_size_float > 0:
-            size_ratio = abs(live.remaining_size_float - desired_size) / live.remaining_size_float
+        desired_size = float(desired_request.size)
+        live_remaining = live.remaining_size_float
+        if live_remaining > 0:
+            size_ratio = abs(live_remaining - desired_size) / live_remaining
             if size_ratio >= self._reprice_threshold_size_pct:
-                return True
+                reasons.append("size_move")
 
-        return False
+        return self._dedupe_reasons(reasons)
+
+    def _replacement_sort_key(
+        self,
+        live: TrackedOrder,
+        desired_request: CreateOrderRequest,
+        reasons: list[str],
+    ) -> tuple[float, float, float, float]:
+        desired_price = float(desired_request.price)
+        desired_size = float(desired_request.size)
+        live_size = live.remaining_size_float or live.original_size_float
+        size_ratio = (
+            abs(live_size - desired_size) / live_size
+            if live_size > 0
+            else float("inf")
+        )
+        return (
+            float(len(reasons)),
+            abs(live.price_float - desired_price),
+            size_ratio,
+            -live.created_at,
+        )
+
+    def _record_cancel(
+        self,
+        diff: OrderDiff,
+        live: TrackedOrder,
+        reasons: list[str],
+    ) -> None:
+        normalized_reasons = self._dedupe_reasons(reasons)
+        diff.to_cancel.append(OrderCancellation(
+            order_id=live.order_id,
+            token_id=live.token_id,
+            condition_id=live.condition_id,
+            side=live.side,
+            reasons=normalized_reasons,
+        ))
+        for reason in normalized_reasons:
+            diff.replacement_reason_counts[reason] = diff.replacement_reason_counts.get(reason, 0) + 1
+
+    def _plan_side(
+        self,
+        *,
+        diff: OrderDiff,
+        live_orders: list[TrackedOrder],
+        desired_request: CreateOrderRequest | None,
+        desired_strategy: str,
+        no_desired_reasons: list[str],
+        extra_reason_builder: Callable[[TrackedOrder], list[str]] | None = None,
+    ) -> None:
+        """Plan keep/cancel/submit actions for one token side."""
+        if desired_request is None:
+            for live in live_orders:
+                reasons = list(no_desired_reasons)
+                if live.origin in {"startup_sync", "reconcile_import"}:
+                    reasons.append("reconcile_mismatch")
+                self._record_cancel(diff, live, reasons)
+            return
+
+        if not live_orders:
+            diff.to_submit.append(OrderSubmission(
+                request=desired_request,
+                condition_id="",
+                strategy=desired_strategy,
+            ))
+            return
+
+        evaluations: list[tuple[TrackedOrder, list[str]]] = []
+        for live in live_orders:
+            extra_reasons = extra_reason_builder(live) if extra_reason_builder else []
+            reasons = self._replacement_reasons(
+                live,
+                desired_request,
+                Decimal(desired_request.tick_size),
+                extra_reasons=extra_reasons,
+            )
+            evaluations.append((live, reasons))
+
+        keeper, keeper_reasons = min(
+            evaluations,
+            key=lambda item: self._replacement_sort_key(item[0], desired_request, item[1]),
+        )
+
+        if not keeper_reasons:
+            diff.unchanged.append(keeper.order_id)
+            for live, _ in evaluations:
+                if live.order_id == keeper.order_id:
+                    continue
+                reasons = ["duplicate_live_order"]
+                if live.origin in {"startup_sync", "reconcile_import"}:
+                    reasons.append("reconcile_mismatch")
+                self._record_cancel(diff, live, reasons)
+            return
+
+        replaced_order_ids: list[str] = []
+        for live, reasons in evaluations:
+            effective_reasons = list(reasons)
+            if live.order_id != keeper.order_id:
+                effective_reasons.append("duplicate_live_order")
+                if live.origin in {"startup_sync", "reconcile_import"}:
+                    effective_reasons.append("reconcile_mismatch")
+            self._record_cancel(diff, live, effective_reasons)
+            replaced_order_ids.append(live.order_id)
+
+        diff.to_submit.append(OrderSubmission(
+            request=desired_request,
+            condition_id="",
+            strategy=desired_strategy,
+            replacement_reasons=keeper_reasons,
+            replaced_order_ids=replaced_order_ids,
+        ))
 
     def compute_diff(
         self,
@@ -137,99 +297,49 @@ class OrderManager:
             OrderDiff with lists of orders to cancel, submit, or leave.
         """
         diff = OrderDiff()
-
-        # Get current live orders for this token
         live_bids = self._tracker.get_active_by_side(intent.token_id, "BUY")
         live_asks = self._tracker.get_active_by_side(intent.token_id, "SELL")
 
-        # Process bid side
-        if intent.has_bid:
-            bid_price = round_bid(intent.bid_price, tick_size)
-            bid_size = round_size(intent.bid_size)
-            bid_price_str = price_to_string(bid_price)
-            bid_size_str = str(bid_size)
+        desired_bid = None
+        if intent.has_bid and intent.bid_price is not None and intent.bid_size is not None:
+            desired_bid = self._build_order_request(
+                token_id=intent.token_id,
+                side=OrderSide.BUY,
+                price=float(intent.bid_price),
+                size=float(intent.bid_size),
+                tick_size=tick_size,
+                neg_risk=intent.neg_risk,
+            )
 
-            # Check if any live bid matches
-            matched = False
-            for live in live_bids:
-                if not self._should_reprice(live, float(bid_price), float(bid_size), tick_size):
-                    diff.unchanged.append(live.order_id)
-                    matched = True
-                else:
-                    diff.to_cancel.append(live.order_id)
+        desired_ask = None
+        if intent.has_ask and intent.ask_price is not None and intent.ask_size is not None:
+            desired_ask = self._build_order_request(
+                token_id=intent.token_id,
+                side=OrderSide.SELL,
+                price=float(intent.ask_price),
+                size=float(intent.ask_size),
+                tick_size=tick_size,
+                neg_risk=intent.neg_risk,
+            )
 
-            if not matched:
-                # Cancel all live bids and submit new one
-                for live in live_bids:
-                    if live.order_id not in diff.to_cancel and live.order_id not in diff.unchanged:
-                        diff.to_cancel.append(live.order_id)
+        self._plan_side(
+            diff=diff,
+            live_orders=live_bids,
+            desired_request=desired_bid,
+            desired_strategy=intent.strategy,
+            no_desired_reasons=["quote_removed"],
+        )
+        self._plan_side(
+            diff=diff,
+            live_orders=live_asks,
+            desired_request=desired_ask,
+            desired_strategy=intent.strategy,
+            no_desired_reasons=["quote_removed"],
+        )
 
-                expiration = 0
-                order_type = OrderType.GTC
-                if self._use_gtd:
-                    expiration = compute_gtd_expiration(
-                        self._order_ttl_s, self._get_server_time()
-                    )
-                    order_type = OrderType.GTD
-
-                diff.to_submit.append(CreateOrderRequest(
-                    token_id=intent.token_id,
-                    price=bid_price_str,
-                    size=bid_size_str,
-                    side=OrderSide.BUY,
-                    order_type=order_type,
-                    expiration=expiration,
-                    neg_risk=intent.neg_risk,
-                    post_only=self._post_only,
-                    tick_size=str(tick_size),
-                ))
-        else:
-            # No desired bid → cancel all live bids
-            for live in live_bids:
-                diff.to_cancel.append(live.order_id)
-
-        # Process ask side
-        if intent.has_ask:
-            ask_price = round_ask(intent.ask_price, tick_size)
-            ask_size = round_size(intent.ask_size)
-            ask_price_str = price_to_string(ask_price)
-            ask_size_str = str(ask_size)
-
-            matched = False
-            for live in live_asks:
-                if not self._should_reprice(live, float(ask_price), float(ask_size), tick_size):
-                    diff.unchanged.append(live.order_id)
-                    matched = True
-                else:
-                    diff.to_cancel.append(live.order_id)
-
-            if not matched:
-                for live in live_asks:
-                    if live.order_id not in diff.to_cancel and live.order_id not in diff.unchanged:
-                        diff.to_cancel.append(live.order_id)
-
-                expiration = 0
-                order_type = OrderType.GTC
-                if self._use_gtd:
-                    expiration = compute_gtd_expiration(
-                        self._order_ttl_s, self._get_server_time()
-                    )
-                    order_type = OrderType.GTD
-
-                diff.to_submit.append(CreateOrderRequest(
-                    token_id=intent.token_id,
-                    price=ask_price_str,
-                    size=ask_size_str,
-                    side=OrderSide.SELL,
-                    order_type=order_type,
-                    expiration=expiration,
-                    neg_risk=intent.neg_risk,
-                    post_only=self._post_only,
-                    tick_size=str(tick_size),
-                ))
-        else:
-            for live in live_asks:
-                diff.to_cancel.append(live.order_id)
+        for submission in diff.to_submit:
+            if not submission.condition_id:
+                submission.condition_id = intent.condition_id
 
         return diff
 
@@ -254,6 +364,8 @@ class OrderManager:
                 strategy=submission.strategy or "?",
                 status=getattr(response, "status", ""),
                 error=error_msg or "missing_order_id",
+                replacement_reasons=submission.replacement_reasons,
+                replaced_order_ids=submission.replaced_order_ids,
             )
             return {
                 "order_id": order_id,
@@ -276,7 +388,20 @@ class OrderManager:
             strategy=submission.strategy,
             transaction_hashes=list(getattr(response, "transaction_hashes", [])),
         )
-        self._tracker.track_submitted(tracked, source=submission.strategy or "submit")
+        self._tracker.track_submitted(tracked, source="submit")
+        if submission.replacement_reasons:
+            logger.info(
+                "order_replacement_submitted",
+                token_id=req.token_id[:16],
+                condition_id=submission.condition_id[:16] if submission.condition_id else "?",
+                order_id=order_id[:16],
+                side=req.side.value,
+                strategy=submission.strategy or "?",
+                replacement_reasons=submission.replacement_reasons,
+                replaced_order_ids=submission.replaced_order_ids,
+                price=req.price,
+                size=req.size,
+            )
         return {"order_id": order_id, "success": True, "error": ""}
 
     async def _submit_orders(
@@ -338,17 +463,33 @@ class OrderManager:
             "submitted": 0,
             "rejected": 0,
             "unchanged": len(diff.unchanged),
+            "replacement_reason_counts": dict(diff.replacement_reason_counts),
             "errors": [],
         }
 
         # 1. Cancel stale orders
         if diff.to_cancel:
             try:
-                # Deduplicate
-                to_cancel = list(set(diff.to_cancel))
+                cancel_map: dict[str, OrderCancellation] = {}
+                for cancel in diff.to_cancel:
+                    existing = cancel_map.get(cancel.order_id)
+                    if existing is None:
+                        cancel_map[cancel.order_id] = cancel
+                        continue
+                    existing.reasons = self._dedupe_reasons(existing.reasons + cancel.reasons)
+
+                to_cancel = list(cancel_map)
                 await self._client.cancel_orders(to_cancel)
-                for oid in to_cancel:
-                    self._tracker.update_state(oid, OrderState.CANCELED, source="diff_cancel")
+                for cancel in cancel_map.values():
+                    self._tracker.update_state(cancel.order_id, OrderState.CANCELED, source="diff_cancel")
+                    logger.info(
+                        "order_replacement_canceled",
+                        token_id=cancel.token_id[:16] if cancel.token_id else "?",
+                        condition_id=cancel.condition_id[:16] if cancel.condition_id else "?",
+                        order_id=cancel.order_id[:16],
+                        side=cancel.side,
+                        reasons=cancel.reasons,
+                    )
                 results["canceled"] = len(to_cancel)
             except (ClobRestartError, ClobPausedError) as e:
                 results["errors"].append(f"cancel_error: {e}")
@@ -368,14 +509,7 @@ class OrderManager:
         # 2. Submit new orders
         if diff.to_submit:
             try:
-                submit_results = await self._submit_orders([
-                    OrderSubmission(
-                        request=req,
-                        condition_id=intent.condition_id,
-                        strategy=intent.strategy,
-                    )
-                    for req in diff.to_submit
-                ])
+                submit_results = await self._submit_orders(diff.to_submit)
                 results["submitted"] = sum(1 for result in submit_results if result["success"])
                 results["rejected"] = sum(1 for result in submit_results if not result["success"])
             except (ClobRestartError, ClobPausedError) as e:
@@ -441,7 +575,7 @@ class OrderManager:
         urgency: str = "high",
         neg_risk: bool = False,
     ) -> dict[str, Any]:
-        """Submit an exit (sell) order — cancel existing orders for the token first.
+        """Submit or maintain an exit (sell) order for a token.
 
         Used by ExitManager for stop-loss, take-profit, resolution, flatten, orphan exits.
 
@@ -451,22 +585,15 @@ class OrderManager:
         - medium: best_bid (join queue)
         - low: best_bid (passive)
         """
-        result: dict[str, Any] = {"submitted": False, "canceled": 0, "error": None}
+        result: dict[str, Any] = {
+            "submitted": False,
+            "kept": False,
+            "unchanged": 0,
+            "canceled": 0,
+            "replacement_reason_counts": {},
+            "error": None,
+        }
 
-        # 1. Cancel all existing orders for this token
-        try:
-            active = self._tracker.get_active_orders(token_id)
-            if active:
-                order_ids = [o.order_id for o in active if o.order_id]
-                if order_ids:
-                    await self._client.cancel_orders(order_ids)
-                    for oid in order_ids:
-                        self._tracker.update_state(oid, OrderState.CANCELED, source="exit_cancel")
-                    result["canceled"] = len(order_ids)
-        except Exception as e:
-            logger.warning("exit_cancel_failed", token_id=token_id[:16], error=str(e))
-
-        # 2. Adjust price by urgency
         tick_float = float(tick_size)
         if urgency == "critical":
             sell_price = price - 2 * tick_float
@@ -477,64 +604,114 @@ class OrderManager:
 
         sell_price = max(tick_float, sell_price)  # Don't go below min tick
 
-        # Round to valid tick — for normal/medium urgency round UP (better proceeds),
-        # for critical/high urgency round DOWN (fill speed priority)
         if urgency in ("critical", "high"):
             sell_price_d = round_bid(sell_price, tick_size)
         else:
             sell_price_d = round_ask(sell_price, tick_size)
-        sell_size_d = round_size(size)
-        sell_price_str = price_to_string(sell_price_d)
-        sell_size_str = str(sell_size_d)
+        desired_exit = self._build_order_request(
+            token_id=token_id,
+            side=OrderSide.SELL,
+            price=float(sell_price_d),
+            size=size,
+            tick_size=tick_size,
+            neg_risk=neg_risk,
+            post_only=False,
+        )
 
-        # 3. Submit sell order
-        try:
-            expiration = 0
-            order_type = OrderType.GTC
-            if self._use_gtd:
-                expiration = compute_gtd_expiration(
-                    self._order_ttl_s, self._get_server_time()
-                )
-                order_type = OrderType.GTD
+        diff = OrderDiff()
+        active = self._tracker.get_active_orders(token_id)
+        live_buys = [order for order in active if order.side == "BUY"]
+        live_sells = [order for order in active if order.side == "SELL"]
 
-            req = CreateOrderRequest(
-                token_id=token_id,
-                price=sell_price_str,
-                size=sell_size_str,
-                side=OrderSide.SELL,
-                order_type=order_type,
-                expiration=expiration,
-                neg_risk=neg_risk,
-                post_only=False,  # Exit orders may cross — not post-only
-                tick_size=str(tick_size),
+        for live_buy in live_buys:
+            self._record_cancel(diff, live_buy, ["exit_replace"])
+
+        def _exit_extra_reasons(live: TrackedOrder) -> list[str]:
+            reasons: list[str] = []
+            if live.strategy != "exit":
+                reasons.append("exit_replace")
+            if live.post_only:
+                reasons.append("exit_replace")
+            return reasons
+
+        self._plan_side(
+            diff=diff,
+            live_orders=live_sells,
+            desired_request=desired_exit,
+            desired_strategy="exit",
+            no_desired_reasons=["exit_replace"],
+            extra_reason_builder=_exit_extra_reasons,
+        )
+        for submission in diff.to_submit:
+            submission.condition_id = condition_id
+
+        result["replacement_reason_counts"] = dict(diff.replacement_reason_counts)
+        result["unchanged"] = len(diff.unchanged)
+        result["kept"] = bool(diff.unchanged) and not diff.to_submit
+
+        if diff.to_cancel:
+            try:
+                cancel_map: dict[str, OrderCancellation] = {}
+                for cancel in diff.to_cancel:
+                    existing = cancel_map.get(cancel.order_id)
+                    if existing is None:
+                        cancel_map[cancel.order_id] = cancel
+                        continue
+                    existing.reasons = self._dedupe_reasons(existing.reasons + cancel.reasons)
+
+                order_ids = list(cancel_map)
+                await self._client.cancel_orders(order_ids)
+                for cancel in cancel_map.values():
+                    self._tracker.update_state(cancel.order_id, OrderState.CANCELED, source="exit_cancel")
+                    logger.info(
+                        "exit_order_canceled_for_replace",
+                        token_id=cancel.token_id[:16] if cancel.token_id else "?",
+                        condition_id=cancel.condition_id[:16] if cancel.condition_id else "?",
+                        order_id=cancel.order_id[:16],
+                        side=cancel.side,
+                        reasons=cancel.reasons,
+                    )
+                result["canceled"] = len(order_ids)
+            except (ClobRestartError, ClobPausedError) as e:
+                result["error"] = f"cancel_error: {e}"
+                return result
+            except ClobRateLimitError:
+                result["error"] = "cancel_rate_limited"
+                return result
+            except ClobAuthError as e:
+                result["error"] = f"cancel_auth_error: {e}"
+                return result
+            except Exception as e:
+                result["error"] = f"cancel_unexpected: {e}"
+                logger.warning("exit_cancel_failed", token_id=token_id[:16], error=str(e))
+                return result
+
+        if diff.to_submit:
+            try:
+                submit_results = await self._submit_orders(diff.to_submit)
+                result["submitted"] = any(item["success"] for item in submit_results)
+                if not result["submitted"]:
+                    first_error = next((item["error"] for item in submit_results if item["error"]), "no_response")
+                    result["error"] = first_error
+            except (ClobRestartError, ClobPausedError) as e:
+                result["error"] = f"submit_error: {e}"
+            except ClobRateLimitError:
+                result["error"] = "submit_rate_limited"
+            except ClobAuthError as e:
+                result["error"] = f"submit_auth_error: {e}"
+            except Exception as e:
+                result["error"] = f"submit_unexpected: {e}"
+                logger.error("exit_order_submit_error", token_id=token_id[:16], error=str(e))
+        elif result["kept"]:
+            logger.info(
+                "exit_order_kept",
+                token_id=token_id[:16],
+                condition_id=condition_id[:16] if condition_id else "?",
+                order_id=diff.unchanged[0][:16],
+                urgency=urgency,
+                price=desired_exit.price,
+                size=desired_exit.size,
             )
-
-            submit_result = await self.submit_order(
-                req,
-                condition_id=condition_id,
-                strategy="exit",
-            )
-            result["submitted"] = submit_result["success"]
-            if submit_result["success"]:
-                logger.info(
-                    "exit_order_submitted",
-                    token_id=token_id[:16],
-                    price=sell_price_str,
-                    size=sell_size_str,
-                    urgency=urgency,
-                )
-            else:
-                result["error"] = submit_result["error"]
-
-        except (ClobRestartError, ClobPausedError) as e:
-            result["error"] = f"submit_error: {e}"
-        except ClobRateLimitError:
-            result["error"] = "submit_rate_limited"
-        except ClobAuthError as e:
-            result["error"] = f"submit_auth_error: {e}"
-        except Exception as e:
-            result["error"] = f"submit_unexpected: {e}"
-            logger.error("exit_order_submit_error", token_id=token_id[:16], error=str(e))
 
         return result
 

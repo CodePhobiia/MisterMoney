@@ -83,12 +83,15 @@ class Reconciler:
                 {
                     "orderID": o.order_id,
                     "id": o.id,
+                    "market": o.market,
                     "asset_id": o.asset_id,
                     "side": o.side,
                     "price": o.price,
                     "originalSize": o.original_size,
                     "sizeMatched": o.size_matched,
                     "status": o.status,
+                    "expiration": o.expiration,
+                    "createdAt": o.created_at,
                 }
                 for o in exchange_orders
             ]
@@ -97,6 +100,7 @@ class Reconciler:
             result.order_mismatches = mismatches
 
             unknown = mismatches.get("unknown_on_exchange", [])
+            imported = mismatches.get("imported_from_exchange", [])
             missing = mismatches.get("missing_from_exchange", [])
 
             if unknown or missing:
@@ -104,6 +108,7 @@ class Reconciler:
                 logger.warning(
                     "order_reconciliation_mismatches",
                     unknown_count=len(unknown),
+                    imported_count=len(imported),
                     missing_count=len(missing),
                     total_mismatches=self._mismatch_count,
                 )

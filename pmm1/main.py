@@ -77,7 +77,7 @@ from pmm1.notifications import send_telegram, format_fill_notification, format_e
 from pmm1.storage.database import Database
 from pmm1.recorder.fill_recorder import FillRecorder
 from pmm1.recorder.book_recorder import BookRecorder
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 
 logger: structlog.stdlib.BoundLogger = None  # type: ignore
 
@@ -500,6 +500,15 @@ async def run(settings: Settings | None = None) -> None:
         try:
             open_orders = await clob_private.get_open_orders()
             logger.info("open_orders_loaded", count=len(open_orders))
+            imported_open_orders = state.order_tracker.import_exchange_orders(
+                open_orders,
+                source="startup_sync",
+            )
+            if imported_open_orders:
+                logger.info(
+                    "open_orders_seeded_into_tracker",
+                    imported_count=len(imported_open_orders),
+                )
         except Exception as e:
             logger.warning("open_orders_load_failed", error=str(e))
     else:
@@ -986,6 +995,7 @@ async def run(settings: Settings | None = None) -> None:
     quote_interval = settings.bot.quote_cycle_ms / 1000.0
     last_rebate_check = 0.0  # S0-3: track last rebate check time
     summary_lifecycle_counts = zero_lifecycle_counts()
+    summary_replacement_reason_counts: dict[str, int] = defaultdict(int)
 
     try:
         while not shutdown_event.is_set():
@@ -1076,6 +1086,26 @@ async def run(settings: Settings | None = None) -> None:
                 for fill in new_fills:
                     paper_logger.log_fill(fill.to_dict())
 
+            exit_signals = []
+            tokens_under_exit: set[str] = set()
+            if not paper_mode and order_manager:
+                try:
+                    exit_signals = await exit_manager.evaluate_all(state.active_markets)
+                    tokens_under_exit = {
+                        signal.token_id
+                        for signal in exit_signals
+                        if signal.token_id
+                    }
+                    tokens_under_exit.update(
+                        order.token_id
+                        for order in state.order_tracker.get_orders_by_strategy("exit")
+                        if order.is_active and order.token_id
+                    )
+                except Exception as e:
+                    logger.error("exit_signal_scan_error", error=str(e), exc_info=True)
+                    exit_signals = []
+                    tokens_under_exit = set()
+
             # ── Pre-fetch stale REST books in parallel ──
             stale_threshold = 120.0 if paper_mode else 60.0
             stale_tokens = []
@@ -1116,6 +1146,7 @@ async def run(settings: Settings | None = None) -> None:
             markets_quoted = 0
             orders_submitted = 0
             orders_canceled = 0
+            cycle_replacement_reason_counts: dict[str, int] = defaultdict(int)
             cycle_lifecycle_baseline = (
                 state.order_tracker.snapshot_lifecycle_counts()
                 if not paper_mode
@@ -1423,6 +1454,12 @@ async def run(settings: Settings | None = None) -> None:
                         quote_intent.ask_price = None
 
                     # Execute
+                    if token_id in tokens_under_exit:
+                        quote_intent.bid_price = None
+                        quote_intent.bid_size = None
+                        quote_intent.ask_price = None
+                        quote_intent.ask_size = None
+
                     if quote_intent.has_bid or quote_intent.has_ask:
                         if paper_mode and paper_engine and paper_logger:
                             # Paper mode: submit to paper engine, log the quote
@@ -1452,9 +1489,11 @@ async def run(settings: Settings | None = None) -> None:
                             orders_submitted += (1 if quote_intent.has_bid else 0) + (1 if quote_intent.has_ask else 0)
                             markets_quoted += 1
                         elif order_manager:
-                            await order_manager.diff_and_apply(
+                            quote_result = await order_manager.diff_and_apply(
                                 quote_intent, tick_size
                             )
+                            for reason, count in quote_result.get("replacement_reason_counts", {}).items():
+                                cycle_replacement_reason_counts[reason] += count
                             markets_quoted += 1
 
                         # Record for backtest
@@ -1611,6 +1650,12 @@ async def run(settings: Settings | None = None) -> None:
                                     quote_intent_no.ask_price = None
 
                                 # Execute NO token quote
+                                if token_id_no in tokens_under_exit:
+                                    quote_intent_no.bid_price = None
+                                    quote_intent_no.bid_size = None
+                                    quote_intent_no.ask_price = None
+                                    quote_intent_no.ask_size = None
+
                                 if quote_intent_no.has_bid or quote_intent_no.has_ask:
                                     if paper_mode and paper_engine and paper_logger:
                                         paper_engine.cancel_all_orders(token_id_no)
@@ -1638,9 +1683,11 @@ async def run(settings: Settings | None = None) -> None:
                                         )
                                         orders_submitted += (1 if quote_intent_no.has_bid else 0) + (1 if quote_intent_no.has_ask else 0)
                                     elif order_manager:
-                                        await order_manager.diff_and_apply(
+                                        quote_result_no = await order_manager.diff_and_apply(
                                             quote_intent_no, tick_size_no
                                         )
+                                        for reason, count in quote_result_no.get("replacement_reason_counts", {}).items():
+                                            cycle_replacement_reason_counts[reason] += count
 
                                     # Record NO token quote
                                     recorder.record_quote_intent(
@@ -1663,7 +1710,6 @@ async def run(settings: Settings | None = None) -> None:
             # ── Exit Manager: evaluate all sell/exit signals ──
             if not paper_mode and order_manager:
                 try:
-                    exit_signals = await exit_manager.evaluate_all(state.active_markets)
                     for exit_sig in exit_signals:
                         # Determine tick size for the token
                         sig_tick = state.tick_sizes.get(
@@ -1683,6 +1729,8 @@ async def run(settings: Settings | None = None) -> None:
                                 urgency=exit_sig.urgency,
                                 neg_risk=sig_neg_risk,
                             )
+                            for reason, count in result.get("replacement_reason_counts", {}).items():
+                                cycle_replacement_reason_counts[reason] += count
                             if result.get("submitted"):
                                 logger.info(
                                     "exit_order_submitted",
@@ -1798,7 +1846,6 @@ async def run(settings: Settings | None = None) -> None:
                                                     order_id=submit_result["order_id"][:16] if submit_result["order_id"] else "?",
                                                     token_id=token_id_taker[:16],
                                                 )
-                                                state.fill_escalator.reset_taker_cycle()
                                             else:
                                                 logger.warning(
                                                     "taker_bootstrap_failed",
@@ -1822,6 +1869,8 @@ async def run(settings: Settings | None = None) -> None:
 
             for key, value in cycle_lifecycle_counts.items():
                 summary_lifecycle_counts[key] += value
+            for key, value in cycle_replacement_reason_counts.items():
+                summary_replacement_reason_counts[key] += value
 
             # ── Cycle metrics ──
             cycle_duration = (time.time() - cycle_start) * 1000
@@ -1874,8 +1923,10 @@ async def run(settings: Settings | None = None) -> None:
                         nav=f"{nav:.2f}",
                         dd_tier=dd_state.tier.value,
                         resolution_exits=resolution_markets,
+                        replacement_reasons=dict(summary_replacement_reason_counts),
                     )
                 summary_lifecycle_counts = zero_lifecycle_counts()
+                summary_replacement_reason_counts = defaultdict(int)
 
             # ── Sleep until next cycle ──
             elapsed = time.time() - cycle_start

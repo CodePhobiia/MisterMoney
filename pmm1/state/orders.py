@@ -7,6 +7,7 @@ Order State Machine:
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -146,6 +147,7 @@ class TrackedOrder(BaseModel):
     intent_tag: str = ""  # for matching intent → result
     # Rewards tracking
     is_scoring: bool = False  # Whether order is scoring for Polymarket rewards
+    origin: str = ""  # submit | startup_sync | reconcile_import | restored
 
     @property
     def price_float(self) -> float:
@@ -289,10 +291,158 @@ class OrderTracker:
         order.updated_at = now
         if order.submitted_at is None:
             order.submitted_at = now
+        if source:
+            order.origin = source
 
         self.track(order)
         self._record_lifecycle_state(order, OrderState.SUBMITTED)
         return True
+
+    def _parse_exchange_timestamp(self, raw_value: Any) -> float:
+        """Parse exchange timestamps from numeric or ISO-8601 formats."""
+        if raw_value in (None, ""):
+            return time.time()
+
+        if isinstance(raw_value, (int, float)):
+            ts = float(raw_value)
+            return ts / 1000.0 if ts > 1_000_000_000_000 else ts
+
+        value = str(raw_value).strip()
+        if not value:
+            return time.time()
+
+        try:
+            ts = float(value)
+            return ts / 1000.0 if ts > 1_000_000_000_000 else ts
+        except ValueError:
+            pass
+
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            return time.time()
+
+    def _exchange_status_to_state(self, status: str) -> OrderState:
+        return {
+            "LIVE": OrderState.LIVE,
+            "MATCHED": OrderState.MATCHED,
+            "DELAYED": OrderState.DELAYED,
+            "MINED": OrderState.MATCHED,
+            "CONFIRMED": OrderState.FILLED,
+            "FILLED": OrderState.FILLED,
+            "CANCELED": OrderState.CANCELED,
+            "CANCELLED": OrderState.CANCELED,
+            "EXPIRED": OrderState.EXPIRED,
+            "FAILED": OrderState.FAILED,
+            "RETRYING": OrderState.RETRYING,
+        }.get((status or "").upper(), OrderState.LIVE)
+
+    def sync_exchange_order(
+        self,
+        exchange_order: Any,
+        *,
+        source: str = "exchange_sync",
+        strategy: str = "restored",
+    ) -> tuple[TrackedOrder | None, bool]:
+        """Import or refresh a live order from exchange truth without touching counters."""
+        if hasattr(exchange_order, "model_dump"):
+            data = exchange_order.model_dump(by_alias=True)
+        elif isinstance(exchange_order, dict):
+            data = dict(exchange_order)
+        else:
+            logger.warning("sync_exchange_order_invalid_payload", payload_type=type(exchange_order).__name__)
+            return None, False
+
+        order_id = str(data.get("orderID") or data.get("order_id") or data.get("id") or "").strip()
+        if not order_id:
+            logger.warning("sync_exchange_order_missing_id", source=source)
+            return None, False
+
+        state = self._exchange_status_to_state(str(data.get("status", "")))
+        original_size = str(data.get("originalSize") or data.get("original_size") or data.get("size") or "0")
+        filled_size = str(data.get("sizeMatched") or data.get("size_matched") or "0")
+        try:
+            remaining_size = str(max(0.0, float(original_size) - float(filled_size)))
+        except (TypeError, ValueError):
+            remaining_size = original_size
+
+        created_at = self._parse_exchange_timestamp(
+            data.get("createdAt") or data.get("created_at")
+        )
+        token_id = str(data.get("asset_id") or data.get("assetId") or data.get("token_id") or "")
+        condition_id = str(
+            data.get("condition_id")
+            or data.get("conditionId")
+            or data.get("market")
+            or ""
+        )
+        side = str(data.get("side") or "").upper()
+        price = str(data.get("price") or "")
+        expiration_raw = data.get("expiration") or 0
+        try:
+            expiration = int(float(expiration_raw))
+        except (TypeError, ValueError):
+            expiration = 0
+
+        existing = self._orders.get(order_id)
+        if existing is not None:
+            existing.token_id = token_id or existing.token_id
+            existing.condition_id = condition_id or existing.condition_id
+            existing.side = side or existing.side
+            existing.price = price or existing.price
+            existing.original_size = original_size or existing.original_size
+            existing.filled_size = filled_size
+            existing.remaining_size = remaining_size
+            existing.expiration = expiration or existing.expiration
+            existing.origin = existing.origin or source
+            existing.updated_at = time.time()
+            if existing.created_at <= 0:
+                existing.created_at = created_at
+            if existing.state not in TERMINAL_STATES and state != existing.state:
+                existing.transition_to(state)
+            return existing, False
+
+        tracked = TrackedOrder(
+            order_id=order_id,
+            token_id=token_id,
+            condition_id=condition_id,
+            side=side,
+            price=price,
+            original_size=original_size,
+            filled_size=filled_size,
+            remaining_size=remaining_size,
+            state=state,
+            expiration=expiration,
+            created_at=created_at,
+            updated_at=time.time(),
+            submitted_at=created_at if state in ACTIVE_STATES else None,
+            strategy=strategy,
+            origin=source,
+        )
+        self.track(tracked)
+        return tracked, True
+
+    def import_exchange_orders(
+        self,
+        exchange_orders: list[Any],
+        *,
+        source: str = "exchange_sync",
+        strategy: str = "restored",
+    ) -> list[str]:
+        """Import all open orders from exchange truth and return newly tracked ids."""
+        imported_ids: list[str] = []
+        for exchange_order in exchange_orders:
+            tracked, created = self.sync_exchange_order(
+                exchange_order,
+                source=source,
+                strategy=strategy,
+            )
+            if tracked is not None and created:
+                imported_ids.append(tracked.order_id)
+        return imported_ids
 
     def get(self, order_id: str) -> TrackedOrder | None:
         """Get order by ID."""
@@ -382,7 +532,12 @@ class OrderTracker:
 
         Returns dict of mismatches found.
         """
-        exchange_ids = {o.get("orderID", o.get("id", "")) for o in exchange_orders}
+        exchange_by_id = {
+            str(o.get("orderID") or o.get("order_id") or o.get("id") or ""): o
+            for o in exchange_orders
+            if str(o.get("orderID") or o.get("order_id") or o.get("id") or "")
+        }
+        exchange_ids = set(exchange_by_id)
         local_active_ids = {o.order_id for o in self.get_active_orders()}
 
         # Orders on exchange but not tracked locally
@@ -390,14 +545,26 @@ class OrderTracker:
         # Orders we think are active but not on exchange
         missing_from_exchange = local_active_ids - exchange_ids
 
+        imported_from_exchange: list[str] = []
+        for oid in sorted(unknown_on_exchange):
+            tracked, created = self.sync_exchange_order(
+                exchange_by_id[oid],
+                source="reconcile_import",
+            )
+            if tracked is not None and created:
+                imported_from_exchange.append(oid)
+
         # Mark missing orders as canceled
         for oid in missing_from_exchange:
             self.update_state(oid, OrderState.CANCELED, source="reconcile")
 
+        matched_ids = exchange_ids & {o.order_id for o in self.get_active_orders()}
+
         result = {
             "unknown_on_exchange": list(unknown_on_exchange),
+            "imported_from_exchange": imported_from_exchange,
             "missing_from_exchange": list(missing_from_exchange),
-            "matched": len(exchange_ids & local_active_ids),
+            "matched": len(matched_ids),
         }
 
         if unknown_on_exchange or missing_from_exchange:

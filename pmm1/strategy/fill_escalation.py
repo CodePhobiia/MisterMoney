@@ -48,11 +48,11 @@ class FillEscalator:
         
         # In fill callback:
         escalator.record_fill()
-        
+
         # Taker bootstrap:
         if escalator.should_take_liquidity():
             submit_taker_order(...)
-            escalator.reset_taker_cycle()
+            # Do not reset here; a fill should clear the one-shot guard.
     """
 
     def __init__(self, config: FillEscalationConfig) -> None:
@@ -133,9 +133,9 @@ class FillEscalator:
         return False
 
     def reset_taker_cycle(self) -> None:
-        """Reset after a taker fill so we don't spam.
+        """Manually allow another taker attempt after a failed submission.
 
-        Call this after a successful taker order submission.
+        Successful taker submissions should stay latched until `record_fill()`.
         """
         self._has_taken_this_cycle = False
         logger.debug("taker_cycle_reset")
