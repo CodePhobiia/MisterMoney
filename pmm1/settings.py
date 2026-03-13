@@ -399,6 +399,11 @@ def load_settings(
         with open(config_path) as f:
             yaml_data = yaml.safe_load(f) or {}
 
+    if override_path is None:
+        env_override = os.environ.get("PMM1_CONFIG_OVERRIDE", "").strip()
+        if env_override:
+            override_path = env_override
+
     if override_path is not None:
         override_path = Path(override_path)
         if override_path.exists():

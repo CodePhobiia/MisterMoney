@@ -35,8 +35,17 @@ ops:
   recent_failure_window_s: 900
 
 pmm2:
-  shadow_mode: true
-  live_enabled: false
-  live_capital_pct: 0.0
+  shadow_mode: false
+  live_enabled: true
+  live_capital_pct: 0.05
   canary:
-    enabled: false
+    enabled: true
+    max_markets: 4
+    require_reward_eligible: true
+    exclude_neg_risk: true
+    require_clean_outcomes: true
+    max_ambiguity_score: 0.15
+    min_volume_24h: 50000.0
+    min_liquidity: 2500.0
+    max_spread_cents: 5.0
+    min_hours_to_resolution: 24.0

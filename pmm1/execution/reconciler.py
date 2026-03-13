@@ -158,7 +158,14 @@ class Reconciler:
                     missing_count=len(missing),
                     streak=self._order_mismatch_streak,
                 )
-                if self._kill_switch:
+                # Escalate only after persistent mismatches and never on the
+                # very first reconciliation window after startup/import, when
+                # exchange truth may still lag briefly.
+                if (
+                    self._kill_switch
+                    and self._last_order_reconcile > 0
+                    and self._order_mismatch_streak >= 3
+                ):
                     self._kill_switch.report_reconciliation_mismatch(details)
                 await self._emit_mismatch(
                     kind="orders",

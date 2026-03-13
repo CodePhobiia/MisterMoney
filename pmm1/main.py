@@ -73,7 +73,7 @@ from pmm1.strategy.market_sanity import (
     compute_concentration_suppressions,
     inventory_context_for_token,
 )
-from pmm1.strategy.quote_engine import QuoteEngine
+from pmm1.strategy.quote_engine import QuoteEngine, QuoteIntent
 from pmm1.strategy.rewards import RewardEstimator
 from pmm1.strategy.universe import MarketMetadata, select_universe
 from pmm1.ws.market_ws import MarketWebSocket

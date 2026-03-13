@@ -533,12 +533,12 @@ class OrderTracker:
         Returns dict of mismatches found.
         """
         exchange_by_id = {
-            str(o.get("orderID") or o.get("order_id") or o.get("id") or ""): o
+            oid: o
             for o in exchange_orders
-            if str(o.get("orderID") or o.get("order_id") or o.get("id") or "")
+            if (oid := str(o.get("orderID") or o.get("order_id") or o.get("id") or "").strip())
         }
         exchange_ids = set(exchange_by_id)
-        local_active_ids = {o.order_id for o in self.get_active_orders()}
+        local_active_ids = {o.order_id.strip() for o in self.get_active_orders() if o.order_id.strip()}
 
         # Orders on exchange but not tracked locally
         unknown_on_exchange = exchange_ids - local_active_ids
