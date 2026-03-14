@@ -994,6 +994,10 @@ async def run(settings: Settings | None = None) -> None:
     fv_calibrator = FairValueCalibrator(min_samples=100)
     resolution_recorder = ResolutionRecorder(edge_tracker, fv_calibrator)
 
+    # ── Ensure data directory exists for analytics persistence ──
+    import os
+    os.makedirs("data", exist_ok=True)
+
     # ── Phase 3-6 analytics wiring ──
     from pmm1.analytics.carry_tracker import InventoryCarryTracker
     from pmm1.analytics.market_profitability import MarketProfitabilityTracker
@@ -1003,6 +1007,7 @@ async def run(settings: Settings | None = None) -> None:
     from pmm1.analytics.spread_optimizer import SpreadOptimizer
     from pmm1.analytics.var_calculator import VaRReporter
     from pmm1.math.changepoint import BayesianChangePointDetector
+    from pmm1.math.kelly import shrinkage_factor as _kelly_shrinkage_factor
 
     carry_tracker = InventoryCarryTracker()
     spread_optimizer = SpreadOptimizer(
@@ -1025,6 +1030,10 @@ async def run(settings: Settings | None = None) -> None:
         "analytics_modules_initialized",
         edge_tracker_trades=len(edge_tracker.trades),
     )
+
+    # ── Attach analytics instances to state for cross-module access ──
+    state.market_profitability = market_profitability  # CL-02: LLM priority scoring
+    state._fv_calibrator = fv_calibrator  # CL-04: conditional calibration bias
 
     # ── Embedded Opus reasoner (OAuth, background loop) ──
     from pmm1.strategy.market_context import MarketContextBuilder
@@ -2064,6 +2073,12 @@ async def run(settings: Settings | None = None) -> None:
         except Exception as _learn_err:
             logger.warning("learning_module_fill_error", error=str(_learn_err))
 
+        # PM-10: Cancel opposing side to prevent stale quote exposure
+        if order_manager and not paper_mode:
+            asyncio.create_task(
+                order_manager.cancel_opposing_on_fill(token_id, side)
+            )
+
         pmm2_on_fill(
             pmm2_runtime,
             order_id,
@@ -2629,6 +2644,10 @@ async def run(settings: Settings | None = None) -> None:
                                         _cid,
                                         outcome=_prices[0],  # 1.0=YES, 0.0=NO
                                     )
+                                    # KP-03: Update theme correlation model
+                                    state.correlation.record_outcome(
+                                        _cid, outcome=_prices[0],
+                                    )
                     except Exception as _e:
                         logger.warning("resolution_check_error", error=str(_e))
 
@@ -2758,6 +2777,31 @@ async def run(settings: Settings | None = None) -> None:
                     logger.error("exit_signal_scan_error", error=str(e), exc_info=True)
                     exit_signals = []
                     tokens_under_exit = set()
+
+                # KP-07: Kelly-rational exit signals
+                try:
+                    if exit_manager and llm_reasoner:
+                        for _cid, _md in list(state.active_markets.items()):
+                            _pos = state.position_tracker.get(_cid)
+                            if not _pos or _pos.is_flat:
+                                continue
+                            _est = llm_reasoner.get_estimate(_cid)
+                            if not (_est and _est.is_fresh):
+                                continue
+                            _tid = getattr(_md, "token_id_yes", "")
+                            _bk = state.book_manager.get(_tid) if _tid else None
+                            _p_market = _bk.get_midpoint() if _bk else 0.5
+                            _signal = exit_manager.get_kelly_exit_signal(
+                                _cid, _est.p_calibrated, _p_market,
+                            )
+                            if _signal:
+                                logger.info(
+                                    "kelly_exit_signal",
+                                    cid=_cid[:16],
+                                    signal=_signal,
+                                )
+                except Exception as _kelly_exit_err:
+                    logger.debug("kelly_exit_check_error", error=str(_kelly_exit_err))
 
             # ── Pre-fetch stale REST books in parallel ──
             stale_threshold = 120.0 if paper_mode else 60.0
@@ -3204,6 +3248,18 @@ async def run(settings: Settings | None = None) -> None:
                         cluster_inventory=cluster_inv,
                     )
 
+                    # ── CL-01/KP-02/KP-04: Compute analytics-derived pricing params ──
+                    _optimal_spread = spread_optimizer.get_optimal_base_spread(
+                        md.condition_id,
+                    )
+                    _edge = abs(fv_estimate.fair_value - features.midpoint)
+                    _n_obs = len(edge_tracker.trades) if edge_tracker else 0
+                    _shrinkage = (
+                        _kelly_shrinkage_factor(_edge, sigma_p=0.05, n_obs=_n_obs)
+                        if _n_obs > 0 and _edge > 0 else None
+                    )
+                    _dd_cap = state.drawdown.get_proactive_size_cap()
+
                     # Quote
                     quote_intent = state.quote_engine.compute_quote(
                         token_id=token_id,
@@ -3222,6 +3278,9 @@ async def run(settings: Settings | None = None) -> None:
                         nav=nav,
                         edge_confidence=_edge_confidence,
                         n_active_positions=len(state.active_markets),
+                        optimal_base_spread=_optimal_spread,
+                        shrinkage=_shrinkage,
+                        dd_size_cap=_dd_cap,
                     )
                     apply_quote_book_guards(
                         quote_intent,
@@ -3229,6 +3288,27 @@ async def run(settings: Settings | None = None) -> None:
                         tick_size,
                         escalation_ticks=escalation_ticks,
                     )
+
+                    # MM-10: Suppress negative-EV quotes
+                    _as_cost = markout_tracker.get_as_cost(md.condition_id)
+                    if (
+                        _as_cost > 0
+                        and quote_intent.bid_price
+                        and quote_intent.ask_price
+                    ):
+                        _q_ev = state.quote_engine.compute_quote_ev(
+                            reservation_price=fv_estimate.fair_value,
+                            bid_price=quote_intent.bid_price,
+                            ask_price=quote_intent.ask_price,
+                            as_cost=_as_cost,
+                        )
+                        if state.quote_engine.should_suppress_quotes(_q_ev):
+                            quote_intent.bid_price = None
+                            quote_intent.bid_size = None
+                            quote_intent.ask_price = None
+                            quote_intent.ask_size = None
+                            _add_suppression_reason(quote_intent, "BUY", "negative_quote_ev")
+                            _add_suppression_reason(quote_intent, "SELL", "negative_quote_ev")
 
                     # SELL logic: only post asks when we hold inventory
                     if not paper_mode:
@@ -3565,6 +3645,7 @@ async def run(settings: Settings | None = None) -> None:
                             cluster_inventory=cluster_inv,
                         )
 
+                        # Reuse analytics params computed for YES token
                         quote_intent_no = state.quote_engine.compute_quote(
                             token_id=token_id_no,
                             features=features_no,
@@ -3586,6 +3667,9 @@ async def run(settings: Settings | None = None) -> None:
                             nav=nav,
                             edge_confidence=_edge_confidence,
                             n_active_positions=len(state.active_markets),
+                            optimal_base_spread=_optimal_spread,
+                            shrinkage=_shrinkage,
+                            dd_size_cap=_dd_cap,
                         )
                         apply_quote_book_guards(
                             quote_intent_no,
@@ -3593,6 +3677,31 @@ async def run(settings: Settings | None = None) -> None:
                             tick_size_no,
                             escalation_ticks=escalation_ticks,
                         )
+
+                        # MM-10: Suppress negative-EV quotes (NO token)
+                        _as_cost_no = markout_tracker.get_as_cost(md.condition_id)
+                        if (
+                            _as_cost_no > 0
+                            and quote_intent_no.bid_price
+                            and quote_intent_no.ask_price
+                        ):
+                            _q_ev_no = state.quote_engine.compute_quote_ev(
+                                reservation_price=no_fair_value,
+                                bid_price=quote_intent_no.bid_price,
+                                ask_price=quote_intent_no.ask_price,
+                                as_cost=_as_cost_no,
+                            )
+                            if state.quote_engine.should_suppress_quotes(_q_ev_no):
+                                quote_intent_no.bid_price = None
+                                quote_intent_no.bid_size = None
+                                quote_intent_no.ask_price = None
+                                quote_intent_no.ask_size = None
+                                _add_suppression_reason(
+                                    quote_intent_no, "BUY", "negative_quote_ev",
+                                )
+                                _add_suppression_reason(
+                                    quote_intent_no, "SELL", "negative_quote_ev",
+                                )
 
                         if not paper_mode:
                             if no_token_inventory <= 0:

@@ -48,3 +48,22 @@ class TestBOCPD:
         assert det.expected_run_length() == 0.0
         assert det.most_likely_run_length == 0
         assert det.change_probability() == 1.0  # all mass on rl=0
+
+    def test_single_observation(self):
+        """After 1 observation, detector has valid state."""
+        det = BayesianChangePointDetector()
+        det.update(1.0)
+        assert det._n_obs == 1
+        assert det.expected_run_length() >= 0.0
+        assert det.most_likely_run_length >= 0
+        # change_probability should be valid (not NaN or error)
+        cp = det.change_probability(within_k=1)
+        assert 0.0 <= cp <= 1.0
+
+    def test_high_hazard_rate_sensitive(self):
+        """Near-1 hazard rate detects changes very quickly."""
+        det = BayesianChangePointDetector(hazard_rate=0.9)
+        for _ in range(10):
+            det.update(1.0)
+        # With very high hazard, most mass on short run lengths
+        assert det.expected_run_length() < 5.0

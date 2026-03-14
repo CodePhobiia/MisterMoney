@@ -204,6 +204,25 @@ class TestComputeHalfSpread:
         delta = eng.compute_half_spread(feat, tick_size=tick, reward_ev=1.0)
         assert delta >= tick / 2.0
 
+    def test_zero_volatility_produces_valid_spread(self):
+        """A-S: sigma_eff=0 should still produce valid spread >= floor."""
+        eng = _engine()
+        feat = _default_features(sigma_eff=0.0)
+        tick = 0.01
+        delta = eng.compute_half_spread(feat, tick_size=tick)
+        assert delta >= tick / 2.0
+        import math
+        assert math.isfinite(delta)  # Must not be inf or nan
+
+    def test_very_small_kappa_produces_finite_spread(self):
+        """A-S: tiny kappa produces wide but finite spread (no div-by-zero)."""
+        eng = _engine()
+        feat = _default_features(kappa_estimate=0.001)
+        delta = eng.compute_half_spread(feat)
+        assert delta > 0
+        import math
+        assert math.isfinite(delta)  # Must be finite, not inf/nan
+
 
 # ===================================================================
 # compute_size
