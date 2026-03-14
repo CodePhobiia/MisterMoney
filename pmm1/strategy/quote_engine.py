@@ -529,6 +529,33 @@ class QuoteEngine:
 
         return layers
 
+    def compute_quote_ev(
+        self,
+        reservation_price: float,
+        bid_price: float,
+        ask_price: float,
+        fill_prob_bid: float = 0.3,
+        fill_prob_ask: float = 0.3,
+        as_cost: float = 0.0,
+    ) -> float:
+        """Expected value of quoting (MM-10).
+
+        EV = P_b*(r - bid - AS) + P_a*(ask - r - AS)
+
+        If EV < 0, quoting this market loses money in expectation.
+        """
+        ev_bid = fill_prob_bid * (reservation_price - bid_price - abs(as_cost))
+        ev_ask = fill_prob_ask * (ask_price - reservation_price - abs(as_cost))
+        return ev_bid + ev_ask
+
+    def should_suppress_quotes(
+        self,
+        quote_ev: float,
+        min_ev: float = 0.001,
+    ) -> bool:
+        """Whether to suppress quotes for negative EV (MM-10)."""
+        return quote_ev < min_ev
+
     def check_crossing_rule(
         self,
         fair_value: float,

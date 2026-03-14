@@ -11,6 +11,7 @@ Model haircut:
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import structlog
 from pydantic import BaseModel
@@ -238,6 +239,47 @@ class FairValueModel:
             return fair_value - execution_price - haircut
         else:
             return execution_price - fair_value - haircut
+
+    def calibrate_from_fills(
+        self, fills: list[dict[str, Any]],
+    ) -> dict[str, float]:
+        """Calibrate beta coefficients from fill data (MM-09).
+
+        Uses simple online regression: for each fill, compare
+        predicted fair value at fill time to the actual midpoint
+        5 minutes later.
+
+        Args:
+            fills: List of {features: FeatureVector, fill_price, mid_5min_later}
+
+        Returns:
+            Updated beta coefficients.
+        """
+        if len(fills) < 50:
+            return {}
+
+        # Compute prediction errors
+        errors = []
+        for f in fills:
+            predicted = f.get("predicted_fv", 0.5)
+            actual = f.get("mid_5min_later", 0.5)
+            errors.append(actual - predicted)
+
+        # Simple bias correction
+        mean_error = sum(errors) / len(errors)
+
+        # Update beta_0 (intercept) to correct systematic bias
+        new_beta_0 = self.config.beta_0 + mean_error * 0.1  # Slow learning rate
+
+        logger.info(
+            "fv_calibrated",
+            mean_error=round(mean_error, 4),
+            old_beta_0=round(self.config.beta_0, 4),
+            new_beta_0=round(new_beta_0, 4),
+            n_fills=len(fills),
+        )
+
+        return {"beta_0": new_beta_0, "mean_error": mean_error}
 
     def should_take(
         self,

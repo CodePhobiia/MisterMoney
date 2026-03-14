@@ -495,6 +495,57 @@ class ExitManager:
             reason="orphan",
         )
 
+    # ── TWAP Exit (PM-06) ──
+
+    def compute_twap_exit(
+        self,
+        condition_id: str,
+        total_size: float,
+        urgency: str = "medium",
+        n_slices: int = 5,
+        interval_minutes: float = 2.0,
+    ) -> list[dict]:
+        """TWAP-style exit: slice large exits over time (PM-06).
+
+        For non-critical exits with size > $10, distribute the exit
+        into N child orders spaced over time to reduce market impact.
+
+        Returns list of {size, delay_s, urgency} for each slice.
+        """
+        if urgency == "critical" or total_size < 10.0:
+            return [{"size": total_size, "delay_s": 0, "urgency": urgency}]
+
+        slices = []
+        remaining = total_size
+        for i in range(n_slices):
+            slice_size = total_size / n_slices
+            if i == n_slices - 1:
+                slice_size = remaining  # Last slice gets remainder
+            slices.append({
+                "size": round(slice_size, 2),
+                "delay_s": int(i * interval_minutes * 60),
+                "urgency": urgency,
+            })
+            remaining -= slice_size
+
+        return slices
+
+    # ── Kelly-rational exit (KP-07) ──
+
+    def get_kelly_exit_signal(
+        self, condition_id: str, p_true: float, p_market: float,
+        current_pnl_pct: float = 0.0,
+    ) -> str | None:
+        """Kelly-rational exit signal (KP-07)."""
+        from pmm1.math.kelly import kelly_fraction_auto, kelly_growth_rate
+        _, fraction = kelly_fraction_auto(p_true, p_market)
+        growth = kelly_growth_rate(p_true, p_market)
+        if growth < 0:
+            return "kelly_sl"
+        if fraction < 0.02:
+            return "kelly_tp"
+        return None
+
     # ── Helpers ──
 
     def _get_best_bid(self, token_id: str) -> float | None:

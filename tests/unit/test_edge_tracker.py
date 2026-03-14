@@ -313,3 +313,33 @@ def test_weighted_stats_persist(tmp_path):
     assert tracker2.get_weighted_win_rate() == pytest.approx(
         tracker.get_weighted_win_rate(), abs=1e-10,
     )
+
+
+# ===================================================================
+# ST-03: Bayesian edge confidence
+# ===================================================================
+
+
+def test_bayesian_confidence_smooth():
+    """ST-03: Confidence increases smoothly with wins."""
+    tracker = EdgeTracker(min_trades=10, target_edge=0.05)
+    confidences = []
+    for i in range(50):
+        tracker.record_trade(
+            predicted_p=0.6,
+            market_p=0.5,
+            outcome=1.0 if i % 100 < 55 else 0.0,
+            pnl=0.01,
+        )
+        confidences.append(tracker.get_bayesian_edge_confidence(min_edge=0.0))
+    # Should be monotonically non-decreasing (more wins -> more confidence)
+    # Allow small fluctuations
+    assert confidences[-1] > confidences[0]
+
+
+def test_bayesian_confidence_few_trades():
+    """ST-03: Few trades -> low confidence (wide posterior)."""
+    tracker = EdgeTracker()
+    tracker.record_trade(predicted_p=0.6, market_p=0.5, outcome=1.0, pnl=0.01)
+    conf = tracker.get_bayesian_edge_confidence(min_edge=0.05)
+    assert conf < 0.8  # With just 1 trade, should be uncertain

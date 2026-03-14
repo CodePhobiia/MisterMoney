@@ -263,6 +263,22 @@ class DrawdownGovernor:
         )
         return now.date() > day_start.date()
 
+    def get_proactive_size_cap(self, sigma_portfolio: float = 0.05) -> float:
+        """Proactive sizing cap from drawdown budget (KP-04)."""
+        from pmm1.math.kelly import drawdown_constrained_kelly
+        current_dd = self._state.drawdown_pct
+        thresholds = [
+            self.config.daily_pause_drawdown_nav,
+            self.config.daily_wider_drawdown_nav,
+            self.config.daily_flatten_drawdown_nav,
+        ]
+        next_threshold = 1.0
+        for t in thresholds:
+            if current_dd < t:
+                next_threshold = t
+                break
+        return drawdown_constrained_kelly(current_dd, next_threshold, sigma_portfolio)
+
     def get_adjustments(self) -> dict[str, float]:
         """Get current adjustments based on drawdown tier."""
         return {

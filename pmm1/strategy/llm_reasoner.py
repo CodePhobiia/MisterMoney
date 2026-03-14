@@ -121,6 +121,10 @@ class ReasonerConfig:
     signal_max_age_s: float = 1800.0
     decay_half_life_s: float = 900.0
     daily_cost_cap_usd: float = 50.0
+    blind_model_providers: list[str] = field(default_factory=lambda: ["anthropic"])
+    # LLM-08: Future support for cross-family model diversity
+    # When multiple providers are added, the blind pass loop will
+    # cycle through providers instead of calling the same model 3x
 
     @classmethod
     def from_env(cls) -> ReasonerConfig:

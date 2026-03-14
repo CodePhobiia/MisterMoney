@@ -492,6 +492,204 @@ def brier_decomposition(
     return (reliability, resolution, uncertainty)
 
 
+def beta_sf(x: float, a: float, b: float) -> float:
+    """Survival function of the Beta distribution: P(X > x).
+
+    Uses the regularized incomplete beta function approximation.
+    For ST-03 Bayesian edge confidence.
+    """
+    if x <= 0:
+        return 1.0
+    if x >= 1:
+        return 0.0
+    return 1.0 - _regularized_incomplete_beta(x, a, b)
+
+
+def _regularized_incomplete_beta(
+    x: float, a: float, b: float, max_iter: int = 300,
+) -> float:
+    """Regularized incomplete beta function I(x; a, b).
+
+    Uses the continued fraction representation (Numerical Recipes
+    ``betacf``, Press et al.) evaluated via the modified Lentz method.
+    """
+    if x < 0 or x > 1:
+        return 0.0
+    if x == 0:
+        return 0.0
+    if x == 1:
+        return 1.0
+
+    # Use symmetry relation when x > (a+1)/(a+b+2) for faster convergence
+    if x > (a + 1) / (a + b + 2):
+        return 1.0 - _regularized_incomplete_beta(1 - x, b, a, max_iter)
+
+    # Front factor: x^a * (1-x)^b / (a * B(a,b))
+    lbeta = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+    front = math.exp(
+        lbeta + a * math.log(max(1e-300, x)) + b * math.log(max(1e-300, 1 - x)),
+    ) / a
+
+    # Evaluate continued fraction by modified Lentz method.
+    # CF = 1 / (1 + d_1/(1 + d_2/(1 + ...)))
+    # d_{2m+1} = -(a+m)(a+b+m) x / ((a+2m)(a+2m+1))
+    # d_{2m}   = m(b-m) x / ((a+2m-1)(a+2m))
+    #
+    # NR's betacf evaluates this CF. The result I_x(a,b) = front * betacf.
+    #
+    # Modified Lentz: f = b_0 = 1, then for each a_j, b_j = 1:
+    #   C_j = b_j + a_j/C_{j-1}
+    #   D_j = 1/(b_j + a_j*D_{j-1})
+    #   delta_j = C_j * D_j
+    #   f = f * delta_j
+    eps = 1e-30
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+
+    # Start Lentz: b_0 = 1, so f = C_0 = 1, D_0 = 1/(1-0) = 1
+    # But if 1 - qab*x/qap == 0 we need the eps trick
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < eps:
+        d = eps
+    d = 1.0 / d
+    f = d
+
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+
+        # Even step: a_{2m} = m(b-m)x / ((a+2m-1)(a+2m))
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < eps:
+            d = eps
+        c = 1.0 + aa / c
+        if abs(c) < eps:
+            c = eps
+        d = 1.0 / d
+        f *= c * d
+
+        # Odd step: a_{2m+1} = -(a+m)(a+b+m)x / ((a+2m)(a+2m+1))
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < eps:
+            d = eps
+        c = 1.0 + aa / c
+        if abs(c) < eps:
+            c = eps
+        d = 1.0 / d
+        delta = c * d
+        f *= delta
+
+        if abs(delta - 1.0) < 1e-14:
+            break
+
+    return front * f
+
+
+def evalue_update(
+    e_prev: float,
+    outcome: float,
+    running_wins: int,
+    running_total: int,
+    p_null: float = 0.5,
+) -> tuple[float, str]:
+    """E-value sequential test with anytime-valid guarantees (ST-07).
+
+    E-process: product of likelihood ratios p_mle(x) / p_null(x).
+    Threshold: 1/alpha = 20 for alpha=0.05.
+
+    Returns (e_value, decision) where decision is 'edge_confirmed',
+    'no_edge', or 'undecided'.
+    """
+    if running_total < 1:
+        return (1.0, "undecided")
+
+    # MLE of win rate
+    p_mle = max(0.01, min(0.99, running_wins / running_total))
+    p_null = max(0.01, min(0.99, p_null))
+
+    # Likelihood ratio for this observation
+    if outcome > 0.5:
+        lr = p_mle / p_null
+    else:
+        lr = (1 - p_mle) / (1 - p_null)
+
+    e_new = e_prev * lr
+
+    # Anytime-valid threshold: 1/alpha = 20 for alpha=0.05
+    if e_new >= 20.0:
+        return (e_new, "edge_confirmed")
+    elif e_new <= 1 / 20.0:
+        return (e_new, "no_edge")
+
+    return (e_new, "undecided")
+
+
+def pav_calibrate(probs: list[float], outcomes: list[float]) -> list[float]:
+    """Pool Adjacent Violators for calibration (ST-10).
+
+    Returns calibrated probabilities (same length as input).
+    More robust than ECE at distribution tails.
+    """
+    n = len(probs)
+    if n == 0:
+        return []
+
+    # Sort by predicted probability
+    order = sorted(range(n), key=lambda i: probs[i])
+    sorted_outcomes = [outcomes[i] for i in order]
+
+    # PAV algorithm
+    result = list(sorted_outcomes)
+    weights = [1] * n
+    i = 0
+    while i < n - 1:
+        if result[i] > result[i + 1]:
+            w = weights[i] + weights[i + 1]
+            val = (weights[i] * result[i] + weights[i + 1] * result[i + 1]) / w
+            result[i] = val
+            result[i + 1] = val
+            weights[i] = w
+            weights[i + 1] = w
+            while i > 0 and result[i - 1] > result[i]:
+                w = weights[i - 1] + weights[i]
+                val = (weights[i - 1] * result[i - 1] + weights[i] * result[i]) / w
+                result[i - 1] = val
+                result[i] = val
+                weights[i - 1] = w
+                weights[i] = w
+                i -= 1
+        i += 1
+
+    # Unsort
+    calibrated = [0.0] * n
+    for idx, orig_idx in enumerate(order):
+        calibrated[orig_idx] = result[idx]
+
+    return calibrated
+
+
+def max_calibration_error(
+    probs: list[float], outcomes: list[float], n_bins: int = 15,
+) -> float:
+    """Maximum Calibration Error across bins (ST-10)."""
+    if not probs:
+        return 0.0
+    bins: dict[int, list[tuple[float, float]]] = {}
+    for p, o in zip(probs, outcomes):
+        b = min(int(p * n_bins), n_bins - 1)
+        bins.setdefault(b, []).append((p, o))
+
+    max_err = 0.0
+    for items in bins.values():
+        avg_p = sum(p for p, _ in items) / len(items)
+        avg_o = sum(o for _, o in items) / len(items)
+        max_err = max(max_err, abs(avg_p - avg_o))
+    return max_err
+
+
 def _z_score(percentile: float) -> float:
     """Approximate z-score for common percentiles.
 

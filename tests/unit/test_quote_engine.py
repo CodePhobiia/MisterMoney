@@ -966,3 +966,51 @@ class TestLayeredQuotes:
             assert layers[i].half_spread == pytest.approx(
                 layers[i - 1].half_spread + tick, abs=1e-9
             )
+
+
+# ===================================================================
+# MM-10: Quote EV suppression
+# ===================================================================
+
+
+class TestQuoteEV:
+    """MM-10: Quote expected value and suppression logic."""
+
+    def test_quote_ev_positive(self):
+        """Good spread around reservation price -> positive EV."""
+        eng = _engine()
+        ev = eng.compute_quote_ev(
+            reservation_price=0.50,
+            bid_price=0.48,
+            ask_price=0.52,
+            fill_prob_bid=0.3,
+            fill_prob_ask=0.3,
+            as_cost=0.0,
+        )
+        # EV = 0.3*(0.50-0.48-0) + 0.3*(0.52-0.50-0)
+        #    = 0.3*0.02 + 0.3*0.02 = 0.006 + 0.006 = 0.012
+        assert ev > 0
+        assert ev == pytest.approx(0.012)
+
+    def test_quote_ev_negative(self):
+        """High adverse selection cost -> negative EV."""
+        eng = _engine()
+        ev = eng.compute_quote_ev(
+            reservation_price=0.50,
+            bid_price=0.48,
+            ask_price=0.52,
+            fill_prob_bid=0.3,
+            fill_prob_ask=0.3,
+            as_cost=0.05,
+        )
+        # EV = 0.3*(0.50-0.48-0.05) + 0.3*(0.52-0.50-0.05)
+        #    = 0.3*(-0.03) + 0.3*(-0.03) = -0.009 + -0.009 = -0.018
+        assert ev < 0
+        assert ev == pytest.approx(-0.018)
+
+    def test_suppress_quotes(self):
+        """Negative EV -> should suppress quotes."""
+        eng = _engine()
+        assert eng.should_suppress_quotes(-0.01) is True
+        assert eng.should_suppress_quotes(0.0005) is True  # Below min_ev=0.001
+        assert eng.should_suppress_quotes(0.01) is False

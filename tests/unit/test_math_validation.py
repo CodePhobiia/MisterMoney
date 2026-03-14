@@ -3,15 +3,21 @@
 import json
 import math
 
+import pytest
+
 from pmm1.math.validation import (
     CusumDetector,
     annualized_sharpe,
+    beta_sf,
     brier_decomposition,
     brier_score,
+    evalue_update,
     expected_calibration_error,
     glr_to_pvalue,
     lo_corrected_sharpe,
     log_loss,
+    max_calibration_error,
+    pav_calibrate,
     per_trade_sharpe,
     required_sample_size,
     rolling_sharpe,
@@ -452,3 +458,69 @@ def test_brier_decomposition_perfect_calibration():
     assert rel < 0.005, f"Expected reliability ≈ 0, got {rel:.4f}"
     assert res > 0, "Resolution should be positive for a sharp forecaster"
     assert 0.0 < unc < 0.26, f"Unexpected uncertainty: {unc:.4f}"
+
+
+# ── ST-03: Beta survival function ─────────────────────────────────
+
+
+def test_beta_sf_boundaries():
+    assert beta_sf(0, 2, 3) == 1.0
+    assert beta_sf(1, 2, 3) == 0.0
+
+
+def test_beta_sf_uniform():
+    # Beta(1,1) = Uniform -> P(X > 0.5) = 0.5
+    assert beta_sf(0.5, 1, 1) == pytest.approx(0.5, abs=0.01)
+
+
+# ── ST-07: E-value sequential test ────────────────────────────────
+
+
+def test_evalue_confirms_edge():
+    e = 1.0
+    wins = 0
+    total = 0
+    for i in range(300):
+        outcome = 1.0 if i % 100 < 55 else 0.0
+        total += 1
+        if outcome > 0.5:
+            wins += 1
+        e, decision = evalue_update(e, outcome, wins, total, p_null=0.5)
+        if decision != "undecided":
+            break
+    # With 55% win rate, should eventually confirm or stay undecided
+    assert e > 1.0  # Evidence accumulating
+
+
+def test_evalue_null_stays_undecided():
+    e = 1.0
+    wins = 0
+    total = 0
+    for i in range(100):
+        outcome = 1.0 if i % 2 == 0 else 0.0
+        total += 1
+        if outcome > 0.5:
+            wins += 1
+        e, decision = evalue_update(e, outcome, wins, total)
+    assert decision == "undecided"
+
+
+# ── ST-10: PAV calibration + MCE ──────────────────────────────────
+
+
+def test_pav_monotonic():
+    probs = [0.1, 0.3, 0.5, 0.7, 0.9]
+    outcomes = [0.0, 0.5, 0.3, 0.8, 1.0]
+    calibrated = pav_calibrate(probs, outcomes)
+    # Sort by original probs and check monotonicity
+    pairs = sorted(zip(probs, calibrated))
+    for i in range(len(pairs) - 1):
+        assert pairs[i][1] <= pairs[i + 1][1] + 1e-10
+
+
+def test_max_calibration_error():
+    # Perfectly miscalibrated: predict 0.9 for all, half resolve YES
+    probs = [0.9] * 20
+    outcomes = [1.0] * 10 + [0.0] * 10
+    mce = max_calibration_error(probs, outcomes)
+    assert mce > 0.3  # 0.9 predicted, 0.5 actual = 0.4 error

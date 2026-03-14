@@ -153,6 +153,19 @@ class EdgeTracker:
             return 0.5
         return self._weighted_wins / self._weighted_total
 
+    def get_bayesian_edge_confidence(self, min_edge: float = 0.0) -> float:
+        """Bayesian edge confidence via Beta-Bernoulli (ST-03)."""
+        from pmm1.math.validation import beta_sf
+
+        wins = self._running_wins
+        total = self._running_total
+        losses = total - wins
+        a = 1 + wins
+        b = 1 + losses
+        p_null = self._running_market_p_sum / max(1, total) if total > 0 else 0.5
+        threshold = min(0.99, p_null + min_edge)
+        return beta_sf(threshold, a, b)
+
     def get_rolling_sharpe(self, window: int = 100) -> float:
         """Annualized Sharpe from recent trades.
 
@@ -462,6 +475,19 @@ class MultiMarketEdgeController:
     @property
     def tracked_count(self) -> int:
         return len(self._per_market_trackers)
+
+    def get_category_edge_summary(self) -> dict[str, dict]:
+        """Per-category edge status (ST-11)."""
+        total_trades = sum(t._running_total for t in self._per_market_trackers.values())
+        total_wins = sum(t._running_wins for t in self._per_market_trackers.values())
+        return {
+            "all": {
+                "markets": len(self._per_market_trackers),
+                "total_trades": total_trades,
+                "win_rate": round(total_wins / max(1, total_trades), 4),
+                "confirmed": self.confirmed_count,
+            },
+        }
 
     def remove_market(self, condition_id: str) -> None:
         """Remove a market from tracking."""

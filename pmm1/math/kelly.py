@@ -209,3 +209,49 @@ def multi_bet_kelly_adjustment(
     if n_positions <= 1 or rho <= 0:
         return f_star
     return f_star / (1.0 + (n_positions - 1) * max(0.0, rho))
+
+
+def shrinkage_factor(edge: float, sigma_p: float, n_obs: int) -> float:
+    """Baker-McHale (2013) shrinkage for estimated probabilities (KP-02)."""
+    if n_obs < 5 or edge <= 0 or sigma_p <= 0:
+        return 0.1
+    sigma_sq = sigma_p ** 2 / n_obs
+    return max(0.1, 1.0 / (1.0 + sigma_sq / (edge ** 2)))
+
+
+def drawdown_constrained_kelly(
+    current_dd: float, tier_threshold: float,
+    sigma_portfolio: float, beta: float = 0.10,
+) -> float:
+    """Max Kelly keeping P(DD > threshold) < beta (KP-04)."""
+    remaining = max(0.001, tier_threshold - current_dd)
+    if sigma_portfolio <= 0.001:
+        return 1.0
+    f_max = (2 * remaining * math.log(1 / beta)) / (sigma_portfolio ** 2)
+    return max(0.01, min(1.0, f_max))
+
+
+def diversity_discount(diversity: float, max_diversity: float = 0.15) -> float:
+    """Discount Kelly by ensemble diversity (KP-05)."""
+    ratio = min(1.0, diversity / max_diversity)
+    return max(0.2, 1.0 - ratio * 0.8)
+
+
+def information_advantage(
+    model_probs: list[float], market_probs: list[float], outcomes: list[float],
+) -> float:
+    """Log-score information advantage (KP-10). Positive = model better."""
+    if len(model_probs) < 10:
+        return 0.0
+    model_ll = market_ll = 0.0
+    n = len(model_probs)
+    for mp, mkp, o in zip(model_probs, market_probs, outcomes):
+        mp = max(0.01, min(0.99, mp))
+        mkp = max(0.01, min(0.99, mkp))
+        if o > 0.5:
+            model_ll -= math.log(mp)
+            market_ll -= math.log(mkp)
+        else:
+            model_ll -= math.log(1 - mp)
+            market_ll -= math.log(1 - mkp)
+    return (market_ll - model_ll) / n

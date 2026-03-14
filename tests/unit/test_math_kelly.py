@@ -1,13 +1,17 @@
 """Tests for Kelly criterion module — Paper 2 §1 worked examples."""
 
 from pmm1.math.kelly import (
+    diversity_discount,
+    drawdown_constrained_kelly,
     fractional_kelly,
     fractional_kelly_growth_rate,
+    information_advantage,
     kelly_bet_dollars,
     kelly_fraction_auto,
     kelly_fraction_no,
     kelly_fraction_yes,
     kelly_growth_rate,
+    shrinkage_factor,
 )
 
 
@@ -189,3 +193,96 @@ def test_multi_bet_kelly_adjustment():
     assert adj2 < adj
     # Zero correlation: no change
     assert multi_bet_kelly_adjustment(f, 10, rho=0.0) == f
+
+
+# ── KP-02: Baker-McHale shrinkage ──
+
+
+def test_shrinkage_low_data():
+    """Low data: n=5, sigma=0.3, edge=0.05 -> shrinkage < 0.5 (low confidence)."""
+    s = shrinkage_factor(edge=0.05, sigma_p=0.3, n_obs=5)
+    assert s < 0.5
+
+
+def test_shrinkage_high_data():
+    """n=500, sigma=0.05, edge=0.05 -> shrinkage > 0.8 (high confidence)."""
+    s = shrinkage_factor(edge=0.05, sigma_p=0.05, n_obs=500)
+    assert s > 0.8
+
+
+def test_shrinkage_edge_zero():
+    """Zero edge -> floor of 0.1."""
+    s = shrinkage_factor(edge=0.0, sigma_p=0.1, n_obs=100)
+    assert s == 0.1
+
+
+def test_shrinkage_too_few_obs():
+    """n < 5 -> floor of 0.1."""
+    s = shrinkage_factor(edge=0.05, sigma_p=0.1, n_obs=3)
+    assert s == 0.1
+
+
+# ── KP-04: Drawdown-constrained Kelly ──
+
+
+def test_drawdown_constrained_basic():
+    """dd=0.01, threshold=0.025, sigma=0.30 -> f_max in (0, 1)."""
+    f = drawdown_constrained_kelly(current_dd=0.01, tier_threshold=0.025, sigma_portfolio=0.30)
+    assert 0.0 < f < 1.0
+
+
+def test_drawdown_no_budget():
+    """dd=0.024, threshold=0.025, sigma=0.30 -> very small f_max (budget nearly exhausted)."""
+    f = drawdown_constrained_kelly(current_dd=0.024, tier_threshold=0.025, sigma_portfolio=0.30)
+    assert f < 0.2
+
+
+# ── KP-05: Diversity discount ──
+
+
+def test_diversity_discount_high():
+    """diversity=0.15 (max) -> discount=0.2 (most discounted)."""
+    d = diversity_discount(0.15)
+    assert abs(d - 0.2) < 0.001
+
+
+def test_diversity_discount_zero():
+    """diversity=0 -> discount=1.0 (no discount)."""
+    d = diversity_discount(0.0)
+    assert abs(d - 1.0) < 0.001
+
+
+def test_diversity_discount_half():
+    """diversity = 0.075 (half of max) -> discount = 0.6."""
+    d = diversity_discount(0.075)
+    assert abs(d - 0.6) < 0.001
+
+
+# ── KP-10: Information advantage ──
+
+
+def test_information_advantage_positive():
+    """Model better than market -> positive advantage."""
+
+    # Model predicts 0.8, market 0.5, outcome YES (1.0) — model is better
+    n = 20
+    model_probs = [0.8] * n
+    market_probs = [0.5] * n
+    outcomes = [1.0] * n
+    ia = information_advantage(model_probs, market_probs, outcomes)
+    assert ia > 0
+
+
+def test_information_advantage_even():
+    """Same predictions -> near zero."""
+    n = 20
+    probs = [0.6] * n
+    outcomes = [1.0] * n
+    ia = information_advantage(probs, probs, outcomes)
+    assert abs(ia) < 0.001
+
+
+def test_information_advantage_too_few():
+    """Fewer than 10 observations -> 0.0."""
+    ia = information_advantage([0.8] * 5, [0.5] * 5, [1.0] * 5)
+    assert ia == 0.0
