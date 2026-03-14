@@ -994,7 +994,9 @@ async def run(settings: Settings | None = None) -> None:
 
     # ── Embedded Opus reasoner (OAuth, background loop) ──
     llm_reasoner_config = ReasonerConfig.from_env()
-    llm_reasoner = LLMReasoner(llm_reasoner_config)
+    llm_reasoner = LLMReasoner(
+        llm_reasoner_config, bot_state=state,
+    )
     if llm_reasoner_config.enabled:
         await llm_reasoner.start()
 
