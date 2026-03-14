@@ -138,6 +138,7 @@ class QuoteEngine:
         features: FeatureVector,
         tick_size: float = 0.01,
         reward_ev: float = 0.0,
+        optimal_base_spread: float | None = None,  # CL-01
     ) -> float:
         """Avellaneda-Stoikov optimal half-spread.
 
@@ -166,6 +167,10 @@ class QuoteEngine:
         # A-S optimal half-spread
         delta_as = (gamma * sigma_eff ** 2 * t_eff) / 2 + (1 / gamma) * math.log(1 + gamma / kappa)
 
+        # CL-01: Blend with learned optimal spread if available
+        if optimal_base_spread is not None and optimal_base_spread > 0:
+            delta_as = 0.7 * delta_as + 0.3 * optimal_base_spread
+
         # Latency component (keep from original)
         delta_lat = 0.003 if features.is_stale else 0.0
 
@@ -184,6 +189,19 @@ class QuoteEngine:
         half_spread = delta_as + delta_lat - delta_reward
         min_half_spread = tick_size / 2.0
 
+        # MM-04+PM-04: VPIN toxicity widening
+        if features.vpin > 0.3:
+            vpin_mult = 1.0 + (features.vpin - 0.3) * 1.5
+            half_spread *= vpin_mult
+
+        # PM-03: Time-of-day adjustment
+        if features.tod_spread_mult != 1.0:
+            half_spread *= features.tod_spread_mult
+
+        # PM-07: Maker rebate tightening
+        if features.rebate_spread_discount > 0:
+            half_spread = max(min_half_spread, half_spread - features.rebate_spread_discount)
+
         return max(min_half_spread, half_spread)
 
     def compute_size(
@@ -198,6 +216,9 @@ class QuoteEngine:
         nav: float = 0.0,
         edge_confidence: float = 1.0,
         n_active_positions: int = 1,
+        shrinkage: float | None = None,        # KP-02
+        dd_size_cap: float | None = None,      # KP-04
+        diversity_disc: float | None = None,   # KP-05
     ) -> float:
         """Compute quote size in SHARES.
 
@@ -228,6 +249,18 @@ class QuoteEngine:
                 cfg.kelly_base_lambda
                 + (cfg.kelly_max_lambda - cfg.kelly_base_lambda) * edge_confidence
             )
+
+            # KP-02: Baker-McHale shrinkage for estimation uncertainty
+            if shrinkage is not None:
+                effective_lambda *= shrinkage
+
+            # KP-04: Drawdown-constrained cap
+            if dd_size_cap is not None and dd_size_cap < effective_lambda:
+                effective_lambda = dd_size_cap
+
+            # KP-05: Ensemble diversity discount
+            if diversity_disc is not None:
+                effective_lambda *= diversity_disc
 
             _, dollar_size = kelly_bet_dollars(
                 p_true=fair_value,
@@ -310,6 +343,10 @@ class QuoteEngine:
         nav: float = 0.0,
         edge_confidence: float = 1.0,
         n_active_positions: int = 1,
+        optimal_base_spread: float | None = None,  # CL-01
+        shrinkage: float | None = None,        # KP-02
+        dd_size_cap: float | None = None,      # KP-04
+        diversity_disc: float | None = None,   # KP-05
     ) -> QuoteIntent:
         """Compute full two-sided quote intent.
 
@@ -336,7 +373,7 @@ class QuoteEngine:
         )
 
         # 2. Half spread
-        delta_t = self.compute_half_spread(features, tick_size, reward_ev)
+        delta_t = self.compute_half_spread(features, tick_size, reward_ev, optimal_base_spread)
 
         # MM-07: Asymmetric spread skew
         # When long: wider bid (don't accumulate), tighter ask (eager to sell)
@@ -390,6 +427,9 @@ class QuoteEngine:
             nav=nav,
             edge_confidence=edge_confidence,
             n_active_positions=n_active_positions,
+            shrinkage=shrinkage,
+            dd_size_cap=dd_size_cap,
+            diversity_disc=diversity_disc,
         )
 
         # Asymmetric sizing to encourage position flattening:
@@ -475,6 +515,10 @@ class QuoteEngine:
         edge_confidence: float = 1.0,
         n_active_positions: int = 1,
         n_layers: int = 3,
+        optimal_base_spread: float | None = None,  # CL-01
+        shrinkage: float | None = None,        # KP-02
+        dd_size_cap: float | None = None,      # KP-04
+        diversity_disc: float | None = None,   # KP-05
     ) -> list[QuoteIntent]:
         """Generate layered quotes at multiple price levels.
 
@@ -491,6 +535,10 @@ class QuoteEngine:
             position_age_hours=position_age_hours, market_price=market_price,
             nav=nav, edge_confidence=edge_confidence,
             n_active_positions=n_active_positions,
+            optimal_base_spread=optimal_base_spread,
+            shrinkage=shrinkage,
+            dd_size_cap=dd_size_cap,
+            diversity_disc=diversity_disc,
         )
 
         if n_layers <= 1:

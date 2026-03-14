@@ -994,6 +994,38 @@ async def run(settings: Settings | None = None) -> None:
     fv_calibrator = FairValueCalibrator(min_samples=100)
     resolution_recorder = ResolutionRecorder(edge_tracker, fv_calibrator)
 
+    # ── Phase 3-6 analytics wiring ──
+    from pmm1.analytics.carry_tracker import InventoryCarryTracker
+    from pmm1.analytics.market_profitability import MarketProfitabilityTracker
+    from pmm1.analytics.markout_tracker import MarkoutTracker
+    from pmm1.analytics.post_mortem import TradePostMortem
+    from pmm1.analytics.signal_value import SignalValueTracker
+    from pmm1.analytics.spread_optimizer import SpreadOptimizer
+    from pmm1.analytics.var_calculator import VaRReporter
+    from pmm1.math.changepoint import BayesianChangePointDetector
+
+    carry_tracker = InventoryCarryTracker()
+    spread_optimizer = SpreadOptimizer(
+        default_spread=settings.pricing.base_half_spread_cents / 100.0,
+    )
+    spread_optimizer.load("data/spread_optimizer_state.json")
+    market_profitability = MarketProfitabilityTracker()
+    market_profitability.load("data/market_profitability.json")
+    signal_value_tracker = SignalValueTracker()
+    signal_value_tracker.load("data/signal_value.json")
+    post_mortem = TradePostMortem()
+    post_mortem.load("data/post_mortem.json")
+    markout_tracker = MarkoutTracker()
+    var_reporter = VaRReporter()
+    changepoint_detector = BayesianChangePointDetector()
+
+    # CL-03: Load edge tracker state from disk
+    edge_tracker.load(settings.analytics.edge_tracker_persist_path)
+    logger.info(
+        "analytics_modules_initialized",
+        edge_tracker_trades=len(edge_tracker.trades),
+    )
+
     # ── Embedded Opus reasoner (OAuth, background loop) ──
     from pmm1.strategy.market_context import MarketContextBuilder
     from pmm1.strategy.news_fetcher import NewsFetcher
@@ -1976,6 +2008,62 @@ async def run(settings: Settings | None = None) -> None:
         if hasattr(state, "pnl_tracker"):
             state.pnl_tracker.record_fill(pnl_fill)
 
+        # ── Learning module fill recording ──
+        try:
+            # CL-02: Market profitability
+            if condition_id:
+                _fill_vol = price * size
+                _fill_pnl = realized_spread_capture or 0.0
+                market_profitability.record_fill(
+                    condition_id, pnl=_fill_pnl, volume=_fill_vol,
+                )
+
+            # CL-06: Signal value tracking
+            if condition_id:
+                _market_mid = mid_at_fill or price
+                _llm_active = bool(_llm_est and _llm_est.is_fresh)
+                _blended_fv = _llm_est.p_calibrated if _llm_active else _market_mid
+                signal_value_tracker.record_fill(
+                    blended_fv=_blended_fv,
+                    market_mid=_market_mid,
+                    fill_price=price,
+                    side=side,
+                    pnl=realized_spread_capture or 0.0,
+                    llm_used=_llm_active,
+                )
+
+            # MM-05: Markout tracking
+            if condition_id:
+                markout_tracker.record_fill(
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    fill_price=price,
+                    fill_side=side,
+                    fv_at_fill=mid_at_fill or price,
+                )
+
+            # CL-01: Spread optimizer
+            if condition_id:
+                spread_optimizer.record_fill(
+                    condition_id=condition_id,
+                    spread_at_fill=settings.pricing.base_half_spread_cents / 100.0,
+                    spread_capture=realized_spread_capture or 0.0,
+                    adverse_selection_5s=adverse_selection_estimate or 0.0,
+                )
+
+            # CL-05: Post-mortem classification
+            post_mortem.classify_fill(
+                pnl=realized_spread_capture or 0.0,
+                spread_capture=realized_spread_capture or 0.0,
+                adverse_selection_5s=adverse_selection_estimate or 0.0,
+            )
+
+            # ST-06: Change-point detection
+            _cp_outcome = 1.0 if (realized_spread_capture or 0) > 0 else 0.0
+            changepoint_detector.update(_cp_outcome)
+        except Exception as _learn_err:
+            logger.warning("learning_module_fill_error", error=str(_learn_err))
+
         pmm2_on_fill(
             pmm2_runtime,
             order_id,
@@ -2704,6 +2792,33 @@ async def run(settings: Settings | None = None) -> None:
 
             # ── Per-cycle Paper 2 edge confidence ──
             _edge_confidence = edge_tracker.get_edge_confidence() if edge_tracker else 1.0
+
+            # CL-07: Inventory carry snapshot (~every 60s = 240 cycles at 250ms)
+            if cycle_count % 240 == 0:
+                try:
+                    def _get_mid_for_carry(cid: str) -> float | None:
+                        _md = state.active_markets.get(cid)
+                        if not _md:
+                            return None
+                        _tid = getattr(_md, "token_id_yes", "")
+                        _bk = state.book_manager.get(_tid)
+                        return _bk.get_midpoint() if _bk else None
+
+                    carry_tracker.snapshot(
+                        state.position_tracker.get_active_positions(),
+                        _get_mid_for_carry,
+                    )
+                    state.pnl_tracker.set_inventory_carry(carry_tracker.total_carry)
+                except Exception as _carry_err:
+                    logger.warning("carry_snapshot_error", error=str(_carry_err))
+
+            # ST-06: Check for regime change
+            if changepoint_detector and changepoint_detector.should_reset_sprt():
+                logger.warning(
+                    "regime_change_detected",
+                    change_prob=round(changepoint_detector.change_probability(within_k=5), 3),
+                    run_length=round(changepoint_detector.expected_run_length(), 1),
+                )
 
             # ── Quote each market ──
             markets_quoted = 0
@@ -3926,6 +4041,34 @@ async def run(settings: Settings | None = None) -> None:
                 if hasattr(state, 'order_tracker'):
                     state.order_tracker.cleanup_terminal()
 
+                # ── Periodic analytics saves ──
+                try:
+                    edge_tracker.save(settings.analytics.edge_tracker_persist_path)
+                    spread_optimizer.save("data/spread_optimizer_state.json")
+                    market_profitability.save("data/market_profitability.json")
+                    signal_value_tracker.save("data/signal_value.json")
+                    post_mortem.save("data/post_mortem.json")
+                except Exception as _save_err:
+                    logger.warning("periodic_analytics_save_error", error=str(_save_err))
+
+                # CL-06: Update LLM cost tracking
+                if llm_reasoner:
+                    signal_value_tracker.set_daily_cost(llm_reasoner._daily_cost_usd)
+
+                # KP-08: VaR reporting
+                try:
+                    _var_positions = []
+                    for _pos in state.position_tracker.get_active_positions():
+                        _md = state.active_markets.get(_pos.condition_id)
+                        _tid = getattr(_md, "token_id_yes", "") if _md else ""
+                        _bk = state.book_manager.get(_tid) if _tid else None
+                        _mid = _bk.get_midpoint() if _bk else 0.5
+                        _var_positions.append({"size": _pos.net_exposure, "price": _mid})
+                    _var_report = var_reporter.compute_report(_var_positions)
+                    logger.info("portfolio_var", **_var_report)
+                except Exception as _var_err:
+                    logger.warning("var_report_error", error=str(_var_err))
+
                 # S-H4: Evict stale REST book cache entries
                 stale_keys = [
                     k for k, ts in state.rest_book_cache_ts.items()
@@ -4017,6 +4160,17 @@ async def run(settings: Settings | None = None) -> None:
                 await order_manager.cancel_all()
             except Exception:
                 pass
+
+        # ── Persist all analytics state on shutdown ──
+        try:
+            edge_tracker.save(settings.analytics.edge_tracker_persist_path)
+            spread_optimizer.save("data/spread_optimizer_state.json")
+            market_profitability.save("data/market_profitability.json")
+            signal_value_tracker.save("data/signal_value.json")
+            post_mortem.save("data/post_mortem.json")
+            logger.info("analytics_state_saved_on_shutdown")
+        except Exception as _shutdown_save_err:
+            logger.error("analytics_shutdown_save_failed", error=str(_shutdown_save_err))
 
         # Paper mode final summary
         if paper_mode and paper_engine and paper_logger:

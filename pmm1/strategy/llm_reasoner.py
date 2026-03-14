@@ -442,6 +442,18 @@ class LLMReasoner:
             weights=[1.0 - eff_blend, eff_blend],
         )
 
+        # CL-04: Conditional calibration bias correction
+        if self.bot_state and hasattr(self.bot_state, '_fv_calibrator'):
+            _fv_cal = self.bot_state._fv_calibrator
+            if _fv_cal and hasattr(_fv_cal, 'get_conditional_bias'):
+                from pmm1.analytics.fv_calibrator import FairValueCalibrator
+                _bias_features = {
+                    "prob_bin": FairValueCalibrator.bin_probability(blended),
+                }
+                _bias = _fv_cal.get_conditional_bias(_bias_features)
+                if abs(_bias) > 0.005:
+                    blended = max(0.01, min(0.99, blended - _bias))
+
         meta.update({
             "llm_used": True,
             "p_blind": round(est.p_blind, 4),
@@ -1082,6 +1094,11 @@ class LLMReasoner:
                     hours_left = (end_date - now).total_seconds() / 3600
                     if hours_left < 24 and staleness > 300:
                         priority += 3.0  # Boost for near-resolution
+
+            # CL-02: Profitability-based priority adjustment
+            if self.bot_state and hasattr(self.bot_state, 'market_profitability'):
+                _prof = self.bot_state.market_profitability.profitability_score(cid)
+                priority += _prof * 1.5
 
             markets.append({
                 "condition_id": cid,
