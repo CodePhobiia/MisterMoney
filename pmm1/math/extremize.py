@@ -33,14 +33,18 @@ def extremize(p: float, alpha: float = 1.73) -> float:
     Returns:
         Extremized probability.
     """
-    p = max(1e-8, min(1.0 - 1e-8, p))
-    pa = p ** alpha
-    qa = (1.0 - p) ** alpha
-    denom = pa + qa
-    if denom <= 0:
-        return 0.5
-    result = pa / denom
-    return float(max(1e-8, min(1.0 - 1e-8, result)))
+    p = max(1e-10, min(1.0 - 1e-10, p))
+    log_pa = alpha * math.log(p)
+    log_qa = alpha * math.log(1.0 - p)
+    # Use log-sum-exp trick: result = 1 / (1 + exp(log_qa - log_pa))
+    diff = log_qa - log_pa
+    if diff > 500:
+        result = 0.0  # qa dominates, p is near 0
+    elif diff < -500:
+        result = 1.0  # pa dominates, p is near 1
+    else:
+        result = 1.0 / (1.0 + math.exp(diff))
+    return float(max(1e-10, min(1.0 - 1e-10, result)))
 
 
 def extremize_batch(

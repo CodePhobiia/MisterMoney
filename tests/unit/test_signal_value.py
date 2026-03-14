@@ -6,16 +6,16 @@ from pmm1.analytics.signal_value import SignalValueTracker
 
 
 def test_ic_positive_correlation():
-    """LLM correctly predicts direction -> IC > 0."""
+    """LLM correctly predicts direction with varying magnitude -> IC > 0."""
     tracker = SignalValueTracker(window=200)
 
-    # LLM consistently shifts FV in the direction the market moves
+    # LLM shifts FV in the direction the market moves, with varying magnitudes
     for i in range(30):
         market_mid = 0.50
-        # LLM says price will go up -> blended_fv > market_mid
-        blended_fv = 0.52
-        # And price does go up
-        mid_5s_after = 0.53
+        # Varying deviations — larger LLM shift correlates with larger move
+        shift = 0.01 * (i + 1)
+        blended_fv = market_mid + shift
+        mid_5s_after = market_mid + shift * 1.5
 
         tracker.record_fill(
             blended_fv=blended_fv,
@@ -28,8 +28,7 @@ def test_ic_positive_correlation():
         tracker.update_post_fill(i, mid_5s_after)
 
     ic = tracker.compute_ic()
-    # All deviations are positive (0.02) and all outcomes are positive (0.03)
-    # Perfect rank correlation
+    # Varying deviations with correlated outcomes -> positive IC
     assert ic > 0.0
 
 

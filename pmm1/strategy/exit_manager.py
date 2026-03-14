@@ -279,6 +279,9 @@ class ExitManager:
     ) -> SellSignal | None:
         cfg = self.config.stop_loss
 
+        if avg_price <= 0:
+            return None
+
         unrealized_pct = (current_price - avg_price) / avg_price
         unrealized_usd = size * (current_price - avg_price)
 
@@ -408,6 +411,9 @@ class ExitManager:
         now: float,
     ) -> SellSignal | None:
         cfg = self.config.take_profit
+
+        if avg_price <= 0:
+            return None
 
         # Minimum hold time check
         hold_seconds = now - getattr(pos, 'created_at', pos.last_update)

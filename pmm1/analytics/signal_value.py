@@ -100,6 +100,9 @@ class SignalValueTracker:
         # Outcome: did the market move in the LLM's direction?
         outcomes = [o.mid_5s_after - o.market_mid for o in valid]
 
+        if len(set(deviations)) <= 1 or len(set(outcomes)) <= 1:
+            return 0.0
+
         return self._spearman(deviations, outcomes)
 
     def compute_value_add(self) -> float:

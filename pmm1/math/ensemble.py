@@ -152,9 +152,9 @@ def update_weights_mwu(
     if round_number is not None and round_number > 0:
         n_models = len(weights)
         if n_models >= 2:
-            eta = math.sqrt(
+            eta = min(1.0, math.sqrt(
                 2 * math.log(n_models) / round_number
-            )
+            ))
 
     n = len(weights)
     updated = []

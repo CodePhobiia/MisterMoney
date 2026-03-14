@@ -527,7 +527,7 @@ def _regularized_incomplete_beta(
     # Front factor: x^a * (1-x)^b / (a * B(a,b))
     lbeta = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
     front = math.exp(
-        lbeta + a * math.log(max(1e-300, x)) + b * math.log(max(1e-300, 1 - x)),
+        lbeta + a * math.log(max(1e-100, x)) + b * math.log(max(1e-100, 1 - x)),
     ) / a
 
     # Evaluate continued fraction by modified Lentz method.

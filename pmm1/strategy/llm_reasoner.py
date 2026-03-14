@@ -537,9 +537,14 @@ class LLMReasoner:
                 if blind_parsed is None:
                     continue
 
-                blind_samples.append(
-                    float(blind_parsed.get("p_hat", 0.5)),
-                )
+                _p_val = float(blind_parsed.get("p_hat", 0.5))
+                if not math.isfinite(_p_val) or _p_val <= 0 or _p_val >= 1:
+                    logger.warning(
+                        "llm_invalid_p_hat",
+                        value=_p_val, cid=condition_id[:16],
+                    )
+                    continue
+                blind_samples.append(_p_val)
                 blind_uncertainties.append(
                     float(blind_parsed.get("uncertainty", 0.25)),
                 )
@@ -705,11 +710,19 @@ class LLMReasoner:
                 p_challenged = float(
                     challenge_parsed.get("p_hat_final", p_blind),
                 )
+                if not math.isfinite(p_challenged) or p_challenged <= 0 or p_challenged >= 1:
+                    logger.warning(
+                        "llm_invalid_p_challenged",
+                        value=p_challenged, cid=condition_id[:16],
+                    )
+                    p_challenged = p_blind
                 uncertainty = float(
                     challenge_parsed.get(
                         "uncertainty", blind_uncertainty,
                     ),
                 )
+                if not math.isfinite(uncertainty):
+                    uncertainty = blind_uncertainty
 
             logger.info(
                 "llm_challenge_pass",

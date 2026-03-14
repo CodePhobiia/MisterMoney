@@ -39,8 +39,12 @@ class BayesianChangePointDetector:
             new_probs = new_probs[: self.max_rl]
             new_stats = new_stats[: self.max_rl]
         total = sum(new_probs)
-        if total > 0:
+        if total > 1e-100:
             new_probs = [p / total for p in new_probs]
+        else:
+            # Run-length distribution has underflowed — reset to change-point
+            new_probs = [1.0]
+            new_stats = [(0.0, 0)]
         self._rl_probs = new_probs
         self._rl_stats = new_stats
 

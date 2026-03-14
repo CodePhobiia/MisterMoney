@@ -2055,7 +2055,7 @@ async def run(settings: Settings | None = None) -> None:
             if condition_id:
                 spread_optimizer.record_fill(
                     condition_id=condition_id,
-                    spread_at_fill=settings.pricing.base_half_spread_cents / 100.0,
+                    spread_at_fill=spread_optimizer.get_optimal_base_spread(condition_id),
                     spread_capture=realized_spread_capture or 0.0,
                     adverse_selection_5s=adverse_selection_estimate or 0.0,
                 )
@@ -2462,7 +2462,7 @@ async def run(settings: Settings | None = None) -> None:
                 if not tid:
                     continue
                 book = state.book_manager.get(tid)
-                if book:
+                if book and book.age_seconds <= 120:
                     bb = book.get_best_bid()
                     ba = book.get_best_ask()
                     if bb and ba:
@@ -4371,6 +4371,27 @@ async def run(settings: Settings | None = None) -> None:
             print(f"  Arbs detected: {log_stats['arbs_logged']}")
             print("=" * 50)
             print()
+
+        # Stop LLM reasoner background task + close session
+        if llm_reasoner:
+            try:
+                await llm_reasoner.stop()
+            except Exception:
+                pass
+
+        # Close v3 integrator Redis connection
+        if v3_integrator:
+            try:
+                await v3_integrator.close()
+            except Exception:
+                pass
+
+        # Close news fetcher HTTP session
+        if llm_news_fetcher:
+            try:
+                await llm_news_fetcher.close()
+            except Exception:
+                pass
 
         # Stop all tasks
         if heartbeat:
