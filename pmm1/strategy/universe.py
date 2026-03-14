@@ -37,6 +37,7 @@ class MarketMetadata(BaseModel):
     best_bid: float = 0.0
     best_ask: float = 0.0
     depth_within_2c: float = 0.0
+    created_at: datetime | None = None
     is_sports: bool = False
     is_crypto_intraday: bool = False
     has_clear_rules: bool = True
@@ -183,6 +184,15 @@ def compute_universe_score(
         + weights.w6_reward_ev * market.reward_ev
         + weights.w7_arb_ev * market.arb_ev
     )
+
+    # PM-05: New market bonus — freshly created markets with rewards have less competition
+    if market.created_at is not None:
+        age_hours = (
+            datetime.now(UTC) - market.created_at
+        ).total_seconds() / 3600
+        if age_hours < 24 and market.reward_eligible:
+            score += 2.0  # Significant bonus for new reward markets
+
     return score
 
 
@@ -314,3 +324,18 @@ def estimate_resolution_risk(
         risk += 0.15
 
     return min(1.0, risk)
+
+
+def should_rotate_market(
+    market: MarketMetadata,
+    profitability_score: float,
+    median_score: float,
+    consecutive_below: int = 0,
+) -> bool:
+    """PM-12: Check if a market should be rotated out.
+
+    Exit if: score < 50% of median for 3 consecutive checks.
+    """
+    if consecutive_below >= 3 and market.universe_score < median_score * 0.5:
+        return True
+    return False

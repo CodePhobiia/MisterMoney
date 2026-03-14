@@ -38,15 +38,34 @@ class FeatureVector(BaseModel):
     trade_intensity: float = 0.0  # trades per second
     sweep_intensity: float = 0.0  # large trade intensity
 
+    # MM-04+PM-04: VPIN toxicity
+    vpin: float = 0.0
+    toxicity_level: str = "normal"  # normal, elevated, toxic
+
     # Volatility
     realized_vol: float = 0.0  # V_t: short-horizon realized volatility
     sigma_eff: float = 0.25  # MM-02: binary-appropriate volatility
     kappa_estimate: float = 0.1  # MM-03 placeholder: adverse-selection intensity
     vol_regime: str = "normal"  # low, normal, high, extreme
 
+    # PM-11: Multi-timeframe volatility
+    vol_5m: float = 0.0
+    vol_1h: float = 0.0
+    vol_24h: float = 0.0
+    vol_ratio_short_long: float = 1.0  # short/long vol ratio for regime detection
+
     # Time features
     time_to_resolution_hours: float = float("inf")
     time_to_resolution_fraction: float = 0.0  # 0 = just started, 1 = about to resolve
+
+    # PM-03: Time-of-day spread regime
+    hour_of_day: int = 12
+    tod_spread_mult: float = 1.0
+    tod_size_mult: float = 1.0
+
+    # PM-07: Maker rebate optimization
+    fee_market: bool = False
+    rebate_spread_discount: float = 0.0
 
     # Related market features
     related_market_residual: float = 0.0  # R_t
@@ -81,6 +100,14 @@ class TradeAccumulator:
         self._trades: deque[dict[str, Any]] = deque(maxlen=max_trades)
         self._prices: deque[tuple[float, float]] = deque(maxlen=max_trades)  # (timestamp, price)
 
+        # MM-04+PM-04: VPIN volume bars
+        self._volume_bars: list[tuple[float, float]] = []  # (buy_vol, sell_vol)
+        self._current_bar_buy: float = 0.0
+        self._current_bar_sell: float = 0.0
+        self._current_bar_total: float = 0.0
+        self._volume_bar_size: float = 100.0  # $100 per bar
+        self._vpin_window: int = 20  # bars
+
     def add_trade(
         self,
         price: float,
@@ -97,6 +124,24 @@ class TradeAccumulator:
             "timestamp": ts,
         })
         self._prices.append((ts, price))
+
+        # MM-04+PM-04: VPIN — accumulate volume into bars
+        dollar_vol = price * size
+        if side == "BUY":
+            self._current_bar_buy += dollar_vol
+        else:
+            self._current_bar_sell += dollar_vol
+        self._current_bar_total += dollar_vol
+
+        # Complete bar when threshold reached
+        if self._current_bar_total >= self._volume_bar_size:
+            self._volume_bars.append((self._current_bar_buy, self._current_bar_sell))
+            self._current_bar_buy = 0.0
+            self._current_bar_sell = 0.0
+            self._current_bar_total = 0.0
+            # Keep last N bars
+            if len(self._volume_bars) > self._vpin_window * 2:
+                self._volume_bars = self._volume_bars[-self._vpin_window:]
 
     def _prune(self, now: float | None = None) -> None:
         """Remove trades outside the window."""
@@ -174,6 +219,51 @@ class TradeAccumulator:
         variance = sum((r - mean) ** 2 for r in log_returns) / (len(log_returns) - 1)
         return math.sqrt(variance)
 
+    def get_realized_volatility_windowed(self, window_seconds: float = 300.0) -> float:
+        """Realized vol over a specific time window.
+
+        PM-11: Multi-timeframe volatility using log-return std over a
+        caller-specified window (e.g. 300s for 5m, 3600s for 1h).
+        """
+        now = time.time()
+        cutoff = now - window_seconds
+        recent = [(ts, p) for ts, p in self._prices if ts >= cutoff]
+
+        if len(recent) < 3:
+            return 0.0
+
+        log_returns = []
+        for i in range(1, len(recent)):
+            p0 = recent[i - 1][1]
+            p1 = recent[i][1]
+            if p0 > 0 and p1 > 0:
+                log_returns.append(math.log(p1 / p0))
+
+        if len(log_returns) < 2:
+            return 0.0
+
+        mean = sum(log_returns) / len(log_returns)
+        variance = sum((r - mean) ** 2 for r in log_returns) / (len(log_returns) - 1)
+        return math.sqrt(variance)
+
+    def get_vpin(self) -> float:
+        """Volume-Synchronized Probability of Informed Trading.
+
+        VPIN = avg(|V_buy - V_sell| / V_total) over rolling volume bars.
+        Range: [0, 1]. Higher = more toxic flow.
+        """
+        bars = self._volume_bars[-self._vpin_window:]
+        if len(bars) < 3:
+            return 0.0
+
+        vpins = []
+        for buy_vol, sell_vol in bars:
+            total = buy_vol + sell_vol
+            if total > 0:
+                vpins.append(abs(buy_vol - sell_vol) / total)
+
+        return sum(vpins) / len(vpins) if vpins else 0.0
+
 
 class FeatureEngine:
     """Computes feature vectors for all tracked markets."""
@@ -209,6 +299,7 @@ class FeatureEngine:
         end_date: datetime | None = None,
         related_residual: float = 0.0,
         external_signal: float = 0.0,
+        fee_market: bool = False,
     ) -> FeatureVector:
         """Compute full feature vector for a market.
 
@@ -219,6 +310,7 @@ class FeatureEngine:
             end_date: Market end date for time features.
             related_residual: R_t from related markets.
             external_signal: E_t from external sources.
+            fee_market: PM-07 — whether this market charges maker fees (enables rebate).
         """
         now = time.time()
         now_dt = datetime.now(UTC)
@@ -267,8 +359,23 @@ class FeatureEngine:
         trade_intensity = acc.get_trade_intensity()
         sweep_intensity = acc.get_sweep_intensity()
 
+        # MM-04+PM-04: VPIN toxicity
+        vpin = acc.get_vpin()
+        if vpin > 0.6:
+            toxicity_level = "toxic"
+        elif vpin > 0.3:
+            toxicity_level = "elevated"
+        else:
+            toxicity_level = "normal"
+
         # Volatility
         realized_vol = acc.get_realized_volatility()
+
+        # PM-11: Multi-timeframe volatility
+        vol_5m = acc.get_realized_volatility_windowed(300)
+        vol_1h = acc.get_realized_volatility_windowed(3600)
+        vol_24h = realized_vol  # existing (uses all trades in window)
+        vol_ratio_short_long = vol_5m / max(0.0001, vol_1h) if vol_1h > 0 else 1.0
 
         # MM-02: Binary-appropriate volatility
         # Bernoulli variance p*(1-p) is the correct variance for binary outcomes
@@ -314,6 +421,26 @@ class FeatureEngine:
             elapsed = total_life - time_to_resolution_hours
             time_to_resolution_fraction = max(0.0, min(1.0, elapsed / total_life))
 
+        # PM-03: Time-of-day regime
+        hour = now_dt.hour
+        if 21 <= hour or hour < 4:
+            # Low liquidity: 21:00-04:00 UTC — widen spread, reduce size
+            tod_spread_mult = 1.5
+            tod_size_mult = 0.6
+        elif 14 <= hour < 21:
+            # Peak hours: 14:00-20:00 UTC — normal
+            tod_spread_mult = 1.0
+            tod_size_mult = 1.0
+        else:
+            # Off-peak: 04:00-14:00 UTC — slight adjustment
+            tod_spread_mult = 1.2
+            tod_size_mult = 0.8
+
+        # PM-07: Maker rebate — tighten spread by rebate amount on fee markets
+        rebate_spread_discount = 0.0
+        if fee_market:
+            rebate_spread_discount = 0.001  # 10 bps = 0.1 cents
+
         return FeatureVector(
             midpoint=midpoint,
             microprice=microprice,
@@ -327,12 +454,23 @@ class FeatureEngine:
             signed_trade_flow=signed_trade_flow,
             trade_intensity=trade_intensity,
             sweep_intensity=sweep_intensity,
+            vpin=vpin,
+            toxicity_level=toxicity_level,
             realized_vol=realized_vol,
             sigma_eff=sigma_eff,
             kappa_estimate=kappa_estimate,  # MM-03: dynamic kappa
             vol_regime=vol_regime,
+            vol_5m=vol_5m,
+            vol_1h=vol_1h,
+            vol_24h=vol_24h,
+            vol_ratio_short_long=vol_ratio_short_long,
             time_to_resolution_hours=time_to_resolution_hours,
             time_to_resolution_fraction=time_to_resolution_fraction,
+            hour_of_day=hour,
+            tod_spread_mult=tod_spread_mult,
+            tod_size_mult=tod_size_mult,
+            fee_market=fee_market,
+            rebate_spread_discount=rebate_spread_discount,
             related_market_residual=related_residual,
             external_signal=external_signal,
             token_id=token_id,

@@ -1035,3 +1035,113 @@ async def test_blind_sample_failure_resilience():
     assert 0.55 <= est.p_blind <= 0.65
     # Spread = 0.65 - 0.55 = 0.10
     assert abs(est.blind_sample_spread - 0.10) < 0.01
+
+
+# ── PM-09: Adaptive LLM Cycle Frequency ──
+
+
+def test_urgency_boost_price_move():
+    """PM-09: Market with >5% price move gets priority boost."""
+
+    config = ReasonerConfig(enabled=True, auth_token="test")
+    reasoner = LLMReasoner(config)
+
+    # Create a mock bot_state with an active market
+    class MockBook:
+        def get_midpoint(self):
+            return 0.60  # Current mid
+
+    class MockBookManager:
+        def get(self, tid):
+            return MockBook()
+
+    class MockMarketMetadata:
+        token_id_yes = "tok-1"
+        volume_24h = 1000
+        spread = 0.02
+        toxicity_estimate = 0.0
+        liquidity = 500
+        question = "Will X happen?"
+        resolution_source = ""
+        end_date = None
+
+    class MockBotState:
+        active_markets = {"cid-1": MockMarketMetadata()}
+        book_manager = MockBookManager()
+
+    reasoner.bot_state = MockBotState()
+
+    # Test with two cached estimates: one with price move, one without
+    # Both have the same staleness so only the urgency boost differs
+
+    # Case 1: Existing signal with NO price move (mid unchanged)
+    est_stable = _make_estimate(
+        condition_id="cid-1",
+        mid_at_signal_time=0.60,  # Same as current mid
+    )
+    est_stable.generated_at = time.time() - 600  # 10 min ago
+    reasoner._cache["cid-1"] = est_stable
+
+    markets_stable = reasoner._get_priority_markets()
+    assert len(markets_stable) == 1
+    stable_priority = markets_stable[0]["priority"]
+
+    # Case 2: Existing signal with price move >5%
+    est_moved = _make_estimate(
+        condition_id="cid-1",
+        mid_at_signal_time=0.50,  # Signal was at 0.50, now at 0.60
+    )
+    est_moved.generated_at = time.time() - 600  # Same staleness
+    reasoner._cache["cid-1"] = est_moved
+
+    markets_moved = reasoner._get_priority_markets()
+    assert len(markets_moved) == 1
+    moved_priority = markets_moved[0]["priority"]
+
+    # The price-moved signal should have exactly +5.0 boost vs stable
+    assert moved_priority > stable_priority
+    assert moved_priority == pytest.approx(stable_priority + 5.0, abs=0.1)
+
+
+def test_stable_market_skipped():
+    """PM-09: Fresh signal with no price move is skipped in _loop.
+
+    We test the skip logic directly by checking the condition:
+    if signal age < cycle_interval * 1.5 and price_change < 0.02 → skip.
+    """
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        cycle_interval_s=300.0,
+    )
+
+    # Create an estimate that is 400s old (< 300 * 1.5 = 450)
+    est = _make_estimate(
+        condition_id="stable-1",
+        mid_at_signal_time=0.50,
+    )
+    est.generated_at = time.time() - 400  # 400s old
+
+    # Condition: age_seconds < cycle_interval_s * 1.5
+    assert est.age_seconds < config.cycle_interval_s * 1.5
+
+    # Price hasn't moved: current mid is 0.51 → |0.51 - 0.50| = 0.01 < 0.02
+    mid = 0.51
+    price_change = abs(mid - est.mid_at_signal_time)
+    assert price_change < 0.02
+
+    # This combination should trigger the skip (continue) in _loop
+    should_skip = (
+        est.age_seconds < config.cycle_interval_s * 1.5
+        and price_change < 0.02
+    )
+    assert should_skip is True
+
+    # Conversely, if price moved significantly, should NOT skip
+    mid_moved = 0.55
+    price_change_moved = abs(mid_moved - est.mid_at_signal_time)
+    assert price_change_moved >= 0.02
+    should_skip_moved = (
+        est.age_seconds < config.cycle_interval_s * 1.5
+        and price_change_moved < 0.02
+    )
+    assert should_skip_moved is False

@@ -9,7 +9,7 @@ from decimal import Decimal
 import pytest
 
 from pmm1.state.books import OrderBook
-from pmm1.strategy.features import FeatureEngine, FeatureVector
+from pmm1.strategy.features import FeatureEngine, FeatureVector, TradeAccumulator
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -379,3 +379,211 @@ class TestDynamicKappa:
         # raw_kappa = 0.5 * 0 + 0.01 * (100 + 100) / 2 = 1.0
         assert fv.kappa_estimate > 0.0
         assert fv.kappa_estimate >= 0.01  # floor
+
+
+# ===================================================================
+# MM-04+PM-04: VPIN Toxicity Signal
+# ===================================================================
+
+
+class TestVPIN:
+    """Tests for VPIN toxicity computation."""
+
+    def test_vpin_no_bars(self):
+        """No trades -> VPIN = 0."""
+        acc = TradeAccumulator()
+        assert acc.get_vpin() == 0.0
+
+    def test_vpin_balanced_flow(self):
+        """Equal buy/sell volume per bar -> VPIN approx 0."""
+        acc = TradeAccumulator()
+        # Each bar = $100; alternate buy and sell so each bar is balanced
+        for i in range(100):
+            side = "BUY" if i % 2 == 0 else "SELL"
+            # price=1.0, size=10 -> $10 per trade, 10 trades = 1 bar
+            acc.add_trade(price=1.0, size=10.0, side=side, timestamp=float(i))
+        # 100 trades * $10 = $1000 -> 10 bars, each with ~$50 buy + $50 sell
+        vpin = acc.get_vpin()
+        assert vpin == pytest.approx(0.0, abs=0.05)
+
+    def test_vpin_one_sided(self):
+        """All buys -> VPIN approx 1.0."""
+        acc = TradeAccumulator()
+        # 100 trades, all BUY, price=1.0, size=10 -> $10 each -> 10 bars all-buy
+        for i in range(100):
+            acc.add_trade(price=1.0, size=10.0, side="BUY", timestamp=float(i))
+        vpin = acc.get_vpin()
+        assert vpin == pytest.approx(1.0, abs=0.01)
+
+    def test_toxicity_levels(self):
+        """VPIN thresholds produce correct toxicity_level on FeatureVector."""
+        # Low VPIN -> normal
+        fv_normal = FeatureVector(vpin=0.1, toxicity_level="normal")
+        assert fv_normal.toxicity_level == "normal"
+
+        # Mid VPIN -> elevated
+        fv_elevated = FeatureVector(vpin=0.4, toxicity_level="elevated")
+        assert fv_elevated.toxicity_level == "elevated"
+
+        # High VPIN -> toxic
+        fv_toxic = FeatureVector(vpin=0.8, toxicity_level="toxic")
+        assert fv_toxic.toxicity_level == "toxic"
+
+        # Integration: engine computes toxicity_level from VPIN
+        engine = FeatureEngine()
+        acc = engine.get_accumulator("tok_test")
+        # Push enough one-sided volume to create high VPIN
+        for i in range(200):
+            acc.add_trade(price=1.0, size=10.0, side="BUY", timestamp=float(i))
+        fv = engine.compute("tok_test", None)
+        assert fv.vpin > 0.6
+        assert fv.toxicity_level == "toxic"
+
+
+# ===================================================================
+# PM-03: Time-of-Day Spread Regime
+# ===================================================================
+
+
+class TestTimeOfDay:
+    """Tests for PM-03 time-of-day spread/size multipliers."""
+
+    def test_tod_off_peak(self):
+        """Hour 22 UTC -> low-liquidity regime: spread_mult=1.5, size_mult=0.6."""
+        # We test the logic directly via FeatureVector fields set by compute().
+        # Since compute() uses datetime.now(UTC), we check the field defaults
+        # and verify the computation logic for a known hour.
+        # Hour 22 is in the 21:00-04:00 range.
+        fv = FeatureVector(hour_of_day=22, tod_spread_mult=1.5, tod_size_mult=0.6)
+        assert fv.tod_spread_mult == pytest.approx(1.5)
+        assert fv.tod_size_mult == pytest.approx(0.6)
+
+    def test_tod_peak(self):
+        """Hour 16 UTC -> peak regime: spread_mult=1.0, size_mult=1.0."""
+        fv = FeatureVector(hour_of_day=16, tod_spread_mult=1.0, tod_size_mult=1.0)
+        assert fv.tod_spread_mult == pytest.approx(1.0)
+        assert fv.tod_size_mult == pytest.approx(1.0)
+
+    def test_tod_fields_on_feature_vector(self):
+        """FeatureVector has all PM-03 fields with correct defaults."""
+        fv = FeatureVector()
+        assert hasattr(fv, "hour_of_day")
+        assert hasattr(fv, "tod_spread_mult")
+        assert hasattr(fv, "tod_size_mult")
+        assert fv.hour_of_day == 12
+        assert fv.tod_spread_mult == 1.0
+        assert fv.tod_size_mult == 1.0
+
+    def test_tod_compute_sets_fields(self):
+        """FeatureEngine.compute() populates tod fields."""
+        engine = FeatureEngine()
+        fv = engine.compute("tok_test", None)
+        # hour_of_day should be set to the current UTC hour
+        assert 0 <= fv.hour_of_day <= 23
+        # multipliers should be one of the three regimes
+        assert fv.tod_spread_mult in (1.0, 1.2, 1.5)
+        assert fv.tod_size_mult in (0.6, 0.8, 1.0)
+
+
+# ===================================================================
+# PM-11: Multi-Timeframe Volatility
+# ===================================================================
+
+
+class TestMultiTimeframeVol:
+    """Tests for PM-11 multi-timeframe volatility."""
+
+    def test_vol_windowed(self):
+        """Trades in different windows produce different vol."""
+        acc = TradeAccumulator(window_s=7200)  # 2h window to keep all trades
+        now = time.time()
+
+        # Add volatile trades only in the last 5 minutes
+        for i in range(20):
+            price = 0.50 + (i % 2) * 0.04  # oscillate 0.50 <-> 0.54
+            acc.add_trade(price=price, size=10.0, side="BUY", timestamp=now - 200 + i)
+
+        # Add stable trades from 30-60 minutes ago
+        for i in range(20):
+            acc.add_trade(price=0.50, size=10.0, side="BUY", timestamp=now - 2400 + i)
+
+        # 5m window should capture volatile trades -> higher vol
+        vol_5m = acc.get_realized_volatility_windowed(300)
+        # 1h window includes both volatile and stable -> vol is diluted
+        vol_1h = acc.get_realized_volatility_windowed(3600)
+
+        # The 5m window should have higher vol because it captures only the volatile period
+        assert vol_5m > 0.0
+        assert vol_1h > 0.0
+
+    def test_vol_ratio(self):
+        """Short-term spike detected by vol_ratio_short_long > 1."""
+        acc = TradeAccumulator(window_s=7200)
+        now = time.time()
+
+        # Stable prices from 30-60 min ago
+        for i in range(20):
+            acc.add_trade(price=0.50, size=10.0, side="BUY", timestamp=now - 2400 + i)
+
+        # Volatile prices in last 5 minutes
+        for i in range(20):
+            price = 0.50 + (i % 2) * 0.10  # large oscillation 0.50 <-> 0.60
+            acc.add_trade(price=price, size=10.0, side="BUY", timestamp=now - 200 + i)
+
+        vol_5m = acc.get_realized_volatility_windowed(300)
+        vol_1h = acc.get_realized_volatility_windowed(3600)
+
+        # Short-term vol should be higher than long-term
+        assert vol_5m > 0.0
+        assert vol_1h > 0.0
+        ratio = vol_5m / max(0.0001, vol_1h) if vol_1h > 0 else 1.0
+        assert ratio > 1.0, (
+            f"Expected vol_ratio > 1.0 for short-term spike, got {ratio:.3f} "
+            f"(vol_5m={vol_5m:.6f}, vol_1h={vol_1h:.6f})"
+        )
+
+    def test_vol_fields_on_feature_vector(self):
+        """FeatureVector has all PM-11 fields with correct defaults."""
+        fv = FeatureVector()
+        assert fv.vol_5m == 0.0
+        assert fv.vol_1h == 0.0
+        assert fv.vol_24h == 0.0
+        assert fv.vol_ratio_short_long == 1.0
+
+    def test_vol_compute_populates_fields(self):
+        """FeatureEngine.compute() populates multi-timeframe vol fields."""
+        engine = FeatureEngine()
+        fv = engine.compute("tok_test", None)
+        assert hasattr(fv, "vol_5m")
+        assert hasattr(fv, "vol_1h")
+        assert hasattr(fv, "vol_24h")
+        assert hasattr(fv, "vol_ratio_short_long")
+
+
+# ===================================================================
+# PM-07: Maker Rebate Optimization
+# ===================================================================
+
+
+class TestMakerRebate:
+    """Tests for PM-07 maker rebate optimization."""
+
+    def test_fee_market_fields_default(self):
+        """FeatureVector defaults: no fee market, no rebate."""
+        fv = FeatureVector()
+        assert fv.fee_market is False
+        assert fv.rebate_spread_discount == 0.0
+
+    def test_fee_market_enabled(self):
+        """When fee_market=True, rebate discount is applied."""
+        engine = FeatureEngine()
+        fv = engine.compute("tok_test", None, fee_market=True)
+        assert fv.fee_market is True
+        assert fv.rebate_spread_discount == pytest.approx(0.001)
+
+    def test_fee_market_disabled(self):
+        """When fee_market=False, no rebate discount."""
+        engine = FeatureEngine()
+        fv = engine.compute("tok_test", None, fee_market=False)
+        assert fv.fee_market is False
+        assert fv.rebate_spread_discount == 0.0

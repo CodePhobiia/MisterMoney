@@ -310,3 +310,77 @@ class TestNavZeroBlocks:
         r4 = limits.check_total_arb_gross(proposed_additional=1.0)
         assert r4.passed is False
         assert any("nav_unavailable" in b for b in r4.breaches)
+
+
+# ── KP-03: Dynamic Theme Correlation ──
+
+
+class TestDynamicThemeCorrelation:
+    def test_theme_rho_defaults(self):
+        """KP-03: Default rho values for each theme."""
+        tc = ThematicCorrelation()
+        tc.classify("c1", "Will Trump win the election?")
+        tc.classify("c2", "Bitcoin above $100k?")
+        tc.classify("c3", "Ethereum merge success?")
+        tc.classify("c4", "Solana TPS record?")
+        tc.classify("c5", "Crypto market cap?")
+        tc.classify("c6", "Russia Ukraine war?")
+        tc.classify("c7", "Fed rate cut?")
+        tc.classify("c8", "OpenAI AGI?")
+
+        assert tc.get_theme_rho("c1") == 0.30  # US_ELECTION
+        assert tc.get_theme_rho("c2") == 0.25  # CRYPTO_BTC
+        assert tc.get_theme_rho("c3") == 0.25  # CRYPTO_ETH
+        assert tc.get_theme_rho("c4") == 0.25  # CRYPTO_SOL
+        assert tc.get_theme_rho("c5") == 0.20  # CRYPTO_GENERAL
+        assert tc.get_theme_rho("c6") == 0.20  # GEOPOLITICS
+        assert tc.get_theme_rho("c7") == 0.15  # FED_RATES
+        assert tc.get_theme_rho("c8") == 0.10  # AI_TECH
+
+    def test_record_outcome_updates_rho(self):
+        """KP-03: After 20+ outcomes, rho changes from its prior."""
+        tc = ThematicCorrelation()
+        tc.classify("c1", "Will Trump win?")
+
+        prior_rho = tc.get_theme_rho("c1")
+        assert prior_rho == 0.30
+
+        # Record 25 correlated outcomes (alternating high/low to
+        # create positive lag-1 autocorrelation)
+        for i in range(25):
+            # Pattern: 0.8, 0.8, 0.2, 0.2, ... creates lag-1 correlation
+            if (i // 2) % 2 == 0:
+                tc.record_outcome("c1", 0.8)
+            else:
+                tc.record_outcome("c1", 0.2)
+
+        updated_rho = tc.get_theme_rho("c1")
+        # Rho should have moved from the prior (blended 70/30)
+        assert updated_rho != prior_rho
+
+    def test_get_theme_rho_uncorrelated(self):
+        """KP-03: Uncorrelated theme returns default_rho."""
+        tc = ThematicCorrelation()
+        tc.classify("c_random", "Will it rain tomorrow?")
+
+        rho = tc.get_theme_rho("c_random")
+        assert rho == tc._default_rho
+        assert rho == 0.03
+
+    def test_record_outcome_uncorrelated_ignored(self):
+        """KP-03: Recording outcome for uncorrelated market is a no-op."""
+        tc = ThematicCorrelation()
+        tc.classify("c_random", "Will it rain?")
+
+        tc.record_outcome("c_random", 1.0)
+        assert "uncorrelated" not in tc._theme_outcomes
+
+    def test_outcome_buffer_capped_at_200(self):
+        """KP-03: Outcome buffer is capped at 200 entries."""
+        tc = ThematicCorrelation()
+        tc.classify("c1", "Bitcoin price above $50k?")
+
+        for i in range(250):
+            tc.record_outcome("c1", float(i % 2))
+
+        assert len(tc._theme_outcomes["CRYPTO_BTC"]) == 200

@@ -879,6 +879,19 @@ class LLMReasoner:
                     ):
                         continue
 
+                    # PM-09: Skip re-analysis for stable markets with fresh signals
+                    if existing and existing.age_seconds < (
+                        self.config.cycle_interval_s * 1.5
+                    ):
+                        _mid = market.get("midpoint", 0.5)
+                        price_change = (
+                            abs(_mid - existing.mid_at_signal_time)
+                            if existing.mid_at_signal_time
+                            else 0
+                        )
+                        if price_change < 0.02:
+                            continue
+
                     tid = market.get("token_id", "")
                     md = market.get("_metadata")
                     book = None
@@ -1045,6 +1058,26 @@ class LLMReasoner:
                 + liq_score
                 - tox_penalty
             )
+
+            # PM-09: Urgency-based priority boost
+            if existing:
+                price_change = (
+                    abs(mid - existing.mid_at_signal_time)
+                    if existing.mid_at_signal_time
+                    else 0
+                )
+                # Urgent: price moved >5% since last signal
+                if price_change > 0.05:
+                    priority += 5.0  # Big boost for stale-after-move
+                # Urgent: approaching resolution
+                end_date = getattr(md, "end_date", None)
+                if end_date:
+                    import datetime as dt
+
+                    now = dt.datetime.now(dt.UTC)
+                    hours_left = (end_date - now).total_seconds() / 3600
+                    if hours_left < 24 and staleness > 300:
+                        priority += 3.0  # Boost for near-resolution
 
             markets.append({
                 "condition_id": cid,

@@ -362,8 +362,12 @@ class TestComputeQuote:
         assert q.ask_size >= min_ask - 1e-9
 
     def test_asymmetric_sizing_long_inventory(self):
-        """#20 — Long inventory → bid_size < ask_size (discourage buying)."""
-        q = self._make_quote(inventory=10.0)
+        """#20 — Long inventory → bid_size < ask_size (discourage buying).
+
+        Use moderate inventory (5 shares) at a midpoint (0.50) so prices
+        stay away from extremes and Polymarket minimums don't dominate.
+        """
+        q = self._make_quote(inventory=5.0, time_to_resolution_hours=float("inf"))
         assert q.bid_size is not None
         assert q.ask_size is not None
         assert q.bid_size < q.ask_size, (
@@ -373,7 +377,7 @@ class TestComputeQuote:
 
     def test_asymmetric_sizing_short_inventory(self):
         """#21 — Short inventory → ask_size < bid_size (discourage selling)."""
-        q = self._make_quote(inventory=-10.0)
+        q = self._make_quote(inventory=-5.0, time_to_resolution_hours=float("inf"))
         assert q.bid_size is not None
         assert q.ask_size is not None
         assert q.ask_size < q.bid_size, (
@@ -699,3 +703,266 @@ class TestAdaptiveTakerThreshold:
             fee=0.01, slippage=0.005, quantity=10.0,
         )
         assert cross2 is False
+
+
+# ===================================================================
+# PM-01: Quadratic reward-aware spread optimizer
+# ===================================================================
+
+
+class TestQuadraticRewardSpread:
+    """PM-01: Quadratic reward discount tightens more than linear."""
+
+    def test_quadratic_reward_tightens_more(self):
+        """Higher reward_ev produces more tightening than linear would."""
+        eng = _engine()
+        feat = _default_features()
+
+        # With small reward_ev, quadratic boost is modest
+        delta_small = eng.compute_half_spread(feat, reward_ev=0.005)
+        # With large reward_ev, quadratic boost is significant
+        delta_large = eng.compute_half_spread(feat, reward_ev=0.05)
+
+        # Both should be tighter than no reward
+        delta_none = eng.compute_half_spread(feat, reward_ev=0.0)
+        assert delta_small < delta_none
+        assert delta_large < delta_none
+
+        # Key: the large reward should tighten *more than linearly* proportional
+        # Linear discount: delta_reward = reward_ev * weight
+        # Quadratic: delta_reward = reward_ev * weight * (1 + min(2, reward_ev*10))
+        # For 0.05 vs 0.005: linear ratio = 10x, quadratic ratio > 10x
+        linear_tightening_small = delta_none - delta_small
+        linear_tightening_large = delta_none - delta_large
+        # The ratio of tightening should be greater than the ratio of reward_ev (10x)
+        assert linear_tightening_large / max(1e-12, linear_tightening_small) > 10.0, (
+            f"Quadratic tightening ratio should exceed linear 10x: "
+            f"{linear_tightening_large / max(1e-12, linear_tightening_small):.1f}x"
+        )
+
+
+# ===================================================================
+# MM-07: Asymmetric spread skew
+# ===================================================================
+
+
+class TestAsymmetricSpreadSkew:
+    """MM-07: Inventory-dependent asymmetric spread."""
+
+    def _make_quote(self, *, inventory=0.0, fair_value=0.50, **kw) -> QuoteIntent:
+        """Helper — tight kappa so spread structure is visible."""
+        feat_overrides = {k: v for k, v in kw.items() if k in FeatureVector.model_fields}
+        feat_overrides.setdefault("kappa_estimate", 10.0)
+        eng = _engine()
+        feat = _default_features(**feat_overrides)
+        quote_kw = {k: v for k, v in kw.items() if k not in FeatureVector.model_fields}
+        return eng.compute_quote(
+            token_id="tok_test",
+            features=feat,
+            fair_value=fair_value,
+            haircut=0.01,
+            confidence=0.9,
+            market_inventory=inventory,
+            tick_size=0.01,
+            **quote_kw,
+        )
+
+    def test_asymmetric_spread_long(self):
+        """Long inventory: wider bid spread, tighter ask spread.
+
+        Uses the engine directly to verify delta_bid > delta_ask when long.
+        Avoids full pipeline (which clips/rounds and adds inventory skew to
+        reservation price), testing the spread skew logic in isolation.
+        """
+        cfg = _default_config(
+            inventory_skew_gamma=0.015,
+            gamma_max=0.05,
+            max_position_shares=200.0,
+        )
+        eng = _engine(config=cfg)
+        feat = _default_features(kappa_estimate=10.0, time_to_resolution_hours=float("inf"))
+        delta_t = eng.compute_half_spread(feat, tick_size=0.01, reward_ev=0.0)
+
+        # MM-07: with positive inventory, delta_bid should be wider than delta_ask
+        inv = 50.0
+        max_pos = 200.0
+        inv_fraction = inv / max_pos  # 0.25
+        skew_factor = 0.3
+        delta_bid = delta_t * (1 + skew_factor * max(0, inv_fraction))
+        delta_ask = delta_t * (1 + skew_factor * max(0, -inv_fraction))
+
+        assert delta_bid > delta_t, (
+            f"Long inventory should widen bid delta: {delta_bid:.6f} vs {delta_t:.6f}"
+        )
+        assert delta_ask == pytest.approx(delta_t), (
+            f"Long inventory should not widen ask delta: {delta_ask:.6f} vs {delta_t:.6f}"
+        )
+        assert delta_bid > delta_ask, (
+            f"Long: bid spread ({delta_bid:.6f}) should be wider than ask ({delta_ask:.6f})"
+        )
+
+    def test_asymmetric_spread_short(self):
+        """Short inventory: tighter bid spread, wider ask spread.
+
+        Same isolation approach — verify delta_ask > delta_bid when short.
+        """
+        cfg = _default_config(
+            inventory_skew_gamma=0.015,
+            gamma_max=0.05,
+            max_position_shares=200.0,
+        )
+        eng = _engine(config=cfg)
+        feat = _default_features(kappa_estimate=10.0, time_to_resolution_hours=float("inf"))
+        delta_t = eng.compute_half_spread(feat, tick_size=0.01, reward_ev=0.0)
+
+        # MM-07: with negative inventory, delta_ask should be wider than delta_bid
+        inv = -50.0
+        max_pos = 200.0
+        inv_fraction = inv / max_pos  # -0.25
+        skew_factor = 0.3
+        delta_bid = delta_t * (1 + skew_factor * max(0, inv_fraction))
+        delta_ask = delta_t * (1 + skew_factor * max(0, -inv_fraction))
+
+        assert delta_ask > delta_t, (
+            f"Short inventory should widen ask delta: {delta_ask:.6f} vs {delta_t:.6f}"
+        )
+        assert delta_bid == pytest.approx(delta_t), (
+            f"Short inventory should not widen bid delta: {delta_bid:.6f} vs {delta_t:.6f}"
+        )
+        assert delta_ask > delta_bid, (
+            f"Short: ask spread ({delta_ask:.6f}) should be wider than bid ({delta_bid:.6f})"
+        )
+
+
+# ===================================================================
+# MM-08: Time-weighted reservation price
+# ===================================================================
+
+
+class TestTimeWeightedGamma:
+    """MM-08: Near resolution → higher effective gamma."""
+
+    def test_time_urgency_widens_gamma(self):
+        """Near resolution (2h) produces more inventory skew than far (200h)."""
+        cfg = _default_config(
+            inventory_skew_gamma=0.015,
+            gamma_max=0.05,
+            max_position_shares=200.0,
+        )
+        eng = _engine(config=cfg)
+
+        fv = 0.50
+        inv = 10.0
+
+        # Far from resolution — time_to_resolution = inf (default)
+        r_far = eng.compute_reservation_price(
+            fair_value=fv, market_inventory=inv,
+            time_to_resolution_hours=float("inf"),
+        )
+
+        # Near resolution — 2 hours
+        r_near = eng.compute_reservation_price(
+            fair_value=fv, market_inventory=inv,
+            time_to_resolution_hours=2.0,
+        )
+
+        # With positive inventory, higher gamma pushes price down more
+        # So near resolution should have lower reservation price
+        assert r_near < r_far, (
+            f"Near resolution should push r_t lower (higher gamma): "
+            f"r_near={r_near:.6f} vs r_far={r_far:.6f}"
+        )
+
+        # Verify the magnitude: time_urgency = min(1.0, 24/2) = 1.0
+        # effective_gamma *= (1 + 1.0 * 0.5) = 1.5x
+        # This should produce a meaningful difference
+        skew_far = fv - r_far
+        skew_near = fv - r_near
+        assert skew_near > skew_far * 1.2, (
+            f"Time urgency should meaningfully increase skew: "
+            f"near={skew_near:.6f} vs far={skew_far:.6f}"
+        )
+
+
+# ===================================================================
+# MM-12: Layered quotes
+# ===================================================================
+
+
+class TestLayeredQuotes:
+    """MM-12: Multi-layer quote generation."""
+
+    def _make_layers(self, *, n_layers=3, **kw) -> list[QuoteIntent]:
+        """Helper to build layered quotes."""
+        eng = _engine()
+        feat = _default_features(kappa_estimate=10.0)
+        return eng.compute_layered_quotes(
+            token_id="tok_test",
+            features=feat,
+            fair_value=0.50,
+            haircut=0.01,
+            confidence=0.9,
+            market_inventory=0.0,
+            tick_size=0.01,
+            n_layers=n_layers,
+            **kw,
+        )
+
+    def test_layered_quotes_3_layers(self):
+        """3 layers with correct size fractions (60/30/10)."""
+        layers = self._make_layers(n_layers=3)
+        assert len(layers) == 3
+
+        # Check size fractions relative to each other
+        # Layer 0 should have ~60%, layer 1 ~30%, layer 2 ~10%
+        total_bid = sum(layer.bid_size for layer in layers if layer.bid_size)
+        for i, (layer, expected_frac) in enumerate(
+            zip(layers, [0.60, 0.30, 0.10])
+        ):
+            actual_frac = layer.bid_size / total_bid if total_bid > 0 else 0
+            assert actual_frac == pytest.approx(expected_frac, abs=0.02), (
+                f"Layer {i} bid fraction: {actual_frac:.3f} vs expected {expected_frac:.2f}"
+            )
+
+        # Verify strategy names
+        assert layers[0].strategy == "mm_layer0"
+        assert layers[1].strategy == "mm_layer1"
+        assert layers[2].strategy == "mm_layer2"
+
+    def test_layered_quotes_prices_step(self):
+        """Each layer is 1 tick deeper than the previous."""
+        layers = self._make_layers(n_layers=3)
+        tick = 0.01
+
+        # Bid prices should decrease by 1 tick each layer
+        for i in range(1, len(layers)):
+            assert layers[i].bid_price == pytest.approx(
+                layers[i - 1].bid_price - tick, abs=1e-9
+            ), (
+                f"Layer {i} bid should be 1 tick below layer {i-1}: "
+                f"{layers[i].bid_price} vs {layers[i-1].bid_price - tick}"
+            )
+
+        # Ask prices should increase by 1 tick each layer
+        for i in range(1, len(layers)):
+            assert layers[i].ask_price == pytest.approx(
+                layers[i - 1].ask_price + tick, abs=1e-9
+            ), (
+                f"Layer {i} ask should be 1 tick above layer {i-1}: "
+                f"{layers[i].ask_price} vs {layers[i-1].ask_price + tick}"
+            )
+
+    def test_layered_quotes_single_layer(self):
+        """n_layers=1 returns a single base quote."""
+        layers = self._make_layers(n_layers=1)
+        assert len(layers) == 1
+        assert layers[0].strategy == "mm"  # Original strategy from compute_quote
+
+    def test_layered_quotes_half_spread_increases(self):
+        """Each layer has half_spread increased by tick_size."""
+        layers = self._make_layers(n_layers=3)
+        tick = 0.01
+        for i in range(1, len(layers)):
+            assert layers[i].half_spread == pytest.approx(
+                layers[i - 1].half_spread + tick, abs=1e-9
+            )

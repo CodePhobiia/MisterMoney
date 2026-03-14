@@ -83,6 +83,7 @@ class QuoteEngine:
         market_inventory: float,
         cluster_inventory: float = 0.0,
         position_age_hours: float = 0.0,
+        time_to_resolution_hours: float = float("inf"),  # MM-08
     ) -> float:
         """Compute reservation price with inventory skew from §7.
 
@@ -96,6 +97,7 @@ class QuoteEngine:
             market_inventory: q_t signed inventory (positive = long YES).
             cluster_inventory: q_t^cluster correlated exposure.
             position_age_hours: How long the current position has been held.
+            time_to_resolution_hours: Hours until market resolves (MM-08).
 
         Returns:
             Reservation price clipped to (ε, 1-ε).
@@ -119,6 +121,14 @@ class QuoteEngine:
 
         # Use whichever is stronger: age or inventory urgency
         effective_gamma = gamma_base + (gamma_max - gamma_base) * max(age_factor, inv_urgency)
+
+        # MM-08: Time-to-resolution urgency
+        # As resolution approaches, gamma increases to flatten inventory faster
+        time_to_res = max(0.1, time_to_resolution_hours)
+        if time_to_res < float('inf'):
+            time_urgency = min(1.0, 24.0 / time_to_res)
+            urgency_multiplier = 0.5
+            effective_gamma *= (1 + time_urgency * urgency_multiplier)
 
         r_t = fair_value - effective_gamma * market_inventory - eta * cluster_inventory
         return max(epsilon, min(1.0 - epsilon, r_t))
@@ -159,8 +169,17 @@ class QuoteEngine:
         # Latency component (keep from original)
         delta_lat = 0.003 if features.is_stale else 0.0
 
-        # Reward discount
-        delta_reward = reward_ev * self.config.reward_capture_weight
+        # PM-01: Quadratic reward-aware spread discount
+        # Polymarket scores quadratically: being 2x tighter ≈ 4x reward share
+        # Optimize: tighten spread until marginal reward gain < marginal AS risk
+        if reward_ev > 0:
+            # Quadratic bonus: aggressive tightening for high-reward markets
+            # reward_discount = base_discount * (1 + reward_ev * quadratic_boost)
+            base_discount = reward_ev * self.config.reward_capture_weight
+            quadratic_boost = min(2.0, reward_ev * 10.0)  # Cap at 3x tightening
+            delta_reward = base_discount * (1 + quadratic_boost)
+        else:
+            delta_reward = 0.0
 
         half_spread = delta_as + delta_lat - delta_reward
         min_half_spread = tick_size / 2.0
@@ -312,16 +331,27 @@ class QuoteEngine:
         """
         # 1. Reservation price (with dynamic γ based on position age)
         r_t = self.compute_reservation_price(
-            fair_value, market_inventory, cluster_inventory, position_age_hours
+            fair_value, market_inventory, cluster_inventory, position_age_hours,
+            time_to_resolution_hours=features.time_to_resolution_hours,  # MM-08
         )
 
         # 2. Half spread
         delta_t = self.compute_half_spread(features, tick_size, reward_ev)
 
-        # 3. Tick-round bid and ask
+        # MM-07: Asymmetric spread skew
+        # When long: wider bid (don't accumulate), tighter ask (eager to sell)
+        # When short: tighter bid (eager to buy), wider ask (don't accumulate)
+        max_pos = getattr(self.config, 'max_position_shares', 200.0)
+        inv_fraction = market_inventory / max(1.0, max_pos)
+        skew_factor = 0.3  # How aggressively to skew
+
+        delta_bid = delta_t * (1 + skew_factor * max(0, inv_fraction))
+        delta_ask = delta_t * (1 + skew_factor * max(0, -inv_fraction))
+
+        # 3. Tick-round bid and ask (using asymmetric deltas)
         tick = Decimal(str(tick_size))
-        raw_bid = r_t - delta_t
-        raw_ask = r_t + delta_t
+        raw_bid = r_t - delta_bid
+        raw_ask = r_t + delta_ask
 
         # Floor bid to tick, ceil ask to tick
         bid_price = float(
@@ -425,6 +455,79 @@ class QuoteEngine:
         )
 
         return intent
+
+    def compute_layered_quotes(
+        self,
+        token_id: str,
+        features: FeatureVector,
+        fair_value: float,
+        haircut: float,
+        confidence: float,
+        market_inventory: float,
+        cluster_inventory: float = 0.0,
+        tick_size: float = 0.01,
+        reward_ev: float = 0.0,
+        neg_risk: bool = False,
+        condition_id: str = "",
+        position_age_hours: float = 0.0,
+        market_price: float = 0.0,
+        nav: float = 0.0,
+        edge_confidence: float = 1.0,
+        n_active_positions: int = 1,
+        n_layers: int = 3,
+    ) -> list[QuoteIntent]:
+        """Generate layered quotes at multiple price levels.
+
+        MM-12: Layer 1 (60% size) at bid/ask
+               Layer 2 (30% size) at bid-1tick/ask+1tick
+               Layer 3 (10% size) at bid-2ticks/ask+2ticks
+        """
+        base = self.compute_quote(
+            token_id=token_id, features=features, fair_value=fair_value,
+            haircut=haircut, confidence=confidence,
+            market_inventory=market_inventory,
+            cluster_inventory=cluster_inventory, tick_size=tick_size,
+            reward_ev=reward_ev, neg_risk=neg_risk, condition_id=condition_id,
+            position_age_hours=position_age_hours, market_price=market_price,
+            nav=nav, edge_confidence=edge_confidence,
+            n_active_positions=n_active_positions,
+        )
+
+        if n_layers <= 1:
+            return [base]
+
+        layers = []
+        size_fractions = [0.60, 0.30, 0.10][:n_layers]
+
+        for i, frac in enumerate(size_fractions):
+            layer = QuoteIntent(
+                token_id=token_id,
+                condition_id=condition_id,
+                bid_price=(
+                    max(tick_size, (base.bid_price or 0) - i * tick_size)
+                    if base.bid_price else None
+                ),
+                bid_size=(
+                    round((base.bid_size or 0) * frac, 2)
+                    if base.bid_size else None
+                ),
+                ask_price=(
+                    min(1 - tick_size, (base.ask_price or 0) + i * tick_size)
+                    if base.ask_price else None
+                ),
+                ask_size=(
+                    round((base.ask_size or 0) * frac, 2)
+                    if base.ask_size else None
+                ),
+                reservation_price=base.reservation_price,
+                half_spread=base.half_spread + i * tick_size,
+                strategy=f"mm_layer{i}",
+                confidence=base.confidence,
+                neg_risk=neg_risk,
+            )
+            layers.append(layer)
+
+        return layers
 
     def check_crossing_rule(
         self,

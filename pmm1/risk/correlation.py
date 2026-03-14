@@ -48,6 +48,19 @@ class ThematicCorrelation:
         self.themes = themes or DEFAULT_THEMES
         self.per_theme_nav = per_theme_nav
         self._market_themes: dict[str, str] = {}  # condition_id → theme
+        # KP-03: Dynamic correlation estimation by theme
+        self._theme_outcomes: dict[str, list[float]] = {}  # theme → list of outcomes
+        self._theme_rho: dict[str, float] = {
+            "US_ELECTION": 0.30,
+            "CRYPTO_BTC": 0.25,
+            "CRYPTO_ETH": 0.25,
+            "CRYPTO_SOL": 0.25,
+            "CRYPTO_GENERAL": 0.20,
+            "GEOPOLITICS": 0.20,
+            "FED_RATES": 0.15,
+            "AI_TECH": 0.10,
+        }
+        self._default_rho: float = 0.03
 
     def classify(self, condition_id: str, market_title: str) -> str:
         """Classify a market into a theme based on title keywords."""
@@ -61,6 +74,45 @@ class ThematicCorrelation:
 
     def get_theme(self, condition_id: str) -> str:
         return self._market_themes.get(condition_id, "uncorrelated")
+
+    def record_outcome(self, condition_id: str, outcome: float) -> None:
+        """Record a market resolution for correlation estimation."""
+        theme = self.get_theme(condition_id)
+        if theme == "uncorrelated":
+            return
+        self._theme_outcomes.setdefault(theme, []).append(outcome)
+        # Keep last 200 outcomes per theme
+        if len(self._theme_outcomes[theme]) > 200:
+            self._theme_outcomes[theme] = self._theme_outcomes[theme][-200:]
+        # Update empirical rho if enough data
+        if len(self._theme_outcomes[theme]) >= 20:
+            self._update_theme_rho(theme)
+
+    def _update_theme_rho(self, theme: str) -> None:
+        """Estimate pairwise correlation from outcome data."""
+        outcomes = self._theme_outcomes[theme]
+        n = len(outcomes)
+        if n < 20:
+            return
+        mean = sum(outcomes) / n
+        var = sum((o - mean) ** 2 for o in outcomes) / n
+        if var < 0.01:
+            return
+        # Use lag-1 autocorrelation as proxy for pairwise correlation
+        # (markets in same theme resolve at similar times)
+        cov = sum(
+            (outcomes[i] - mean) * (outcomes[i - 1] - mean)
+            for i in range(1, n)
+        ) / (n - 1)
+        rho = max(0.0, min(0.8, cov / var))
+        # Blend with prior
+        prior = self._theme_rho.get(theme, self._default_rho)
+        self._theme_rho[theme] = 0.7 * prior + 0.3 * rho
+
+    def get_theme_rho(self, condition_id: str) -> float:
+        """Get estimated pairwise correlation for this market's theme."""
+        theme = self.get_theme(condition_id)
+        return self._theme_rho.get(theme, self._default_rho)
 
     def get_theme_exposure(self, theme: str, position_tracker: Any) -> float:
         """Get total gross exposure for a theme across all markets."""
