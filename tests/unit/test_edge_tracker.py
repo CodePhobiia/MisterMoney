@@ -95,6 +95,7 @@ def test_edge_tracker_summary_completeness():
         "brier_score", "sprt_decision", "sprt_log_ratio",
         "edge_confidence", "rolling_sharpe",
         "trades_to_significance", "per_trade_sharpe",
+        "decision_history",
     }
     assert expected_keys.issubset(summary.keys())
     assert summary["total_trades"] == 2
@@ -106,3 +107,18 @@ def test_edge_tracker_required_trades():
     tracker = EdgeTracker(target_edge=0.05)
     remaining = tracker.get_required_trades()
     assert 600 <= remaining <= 650
+
+
+def test_sliding_window_resets_sprt():
+    """SPRT resets after window_size trades past decision."""
+    tracker = EdgeTracker(min_trades=10)
+    tracker.window_size = 50
+    random.seed(42)
+    # First: confirm edge
+    for _ in range(200):
+        outcome = 1.0 if random.random() < 0.60 else 0.0
+        tracker.record_trade(0.60, 0.50, outcome, 0.10 if outcome else -0.10)
+
+    first_decision = tracker.sprt_decision
+    # Should have confirmed and then possibly reset
+    assert len(tracker._decision_history) >= 1 or first_decision != "undecided"

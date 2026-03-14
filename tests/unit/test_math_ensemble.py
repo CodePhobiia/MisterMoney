@@ -153,3 +153,15 @@ def test_log_pool_symmetric():
     assert abs(r1 - r2) < 1e-6
     # Equal weights → should be near 50% (log-odds of 30% and 70% cancel)
     assert abs(r1 - 0.50) < 1e-6
+
+
+def test_mwu_adaptive_eta():
+    """MWU with round_number uses optimal eta."""
+    weights = [0.5, 0.5]
+    losses = [0.1, 0.5]
+    # With round_number, eta is computed optimally
+    updated = update_weights_mwu(
+        weights, losses, round_number=100,
+    )
+    assert updated[0] > updated[1]
+    assert abs(sum(updated) - 1.0) < 1e-6

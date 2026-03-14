@@ -31,6 +31,7 @@ class ModelWeightTracker:
         self.eta = eta
         self.weights = {m: 1.0 / len(models) for m in models}
         self.history: list[dict[str, Any]] = []
+        self._round = 0
 
     def update(self, losses: dict[str, float]) -> None:
         """Update weights after a market resolves.
@@ -38,11 +39,13 @@ class ModelWeightTracker:
         Args:
             losses: {model_name: brier_loss} for this observation.
         """
+        self._round += 1
         current = [self.weights[m] for m in self.models]
         loss_list = [losses.get(m, 0.25) for m in self.models]
         updated = update_weights_mwu(
             current, loss_list,
             eta=self.eta, min_weight=self.min_weight,
+            round_number=self._round,
         )
         for m, w in zip(self.models, updated):
             self.weights[m] = w

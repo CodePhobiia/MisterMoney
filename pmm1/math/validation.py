@@ -149,6 +149,48 @@ def sprt_update(
         return (log_ratio, "undecided")
 
 
+def sprt_update_glr(
+    log_ratio: float,
+    outcome: float,
+    running_wins: int,
+    running_total: int,
+    p_null: float,
+    upper_bound: float = 2.77,
+    lower_bound: float = -1.56,
+) -> tuple[float, str]:
+    """SPRT with running MLE as adaptive alternative.
+
+    Solves the composite hypothesis problem: instead of testing
+    against a fixed p_true, uses the running MLE (empirical win
+    rate) as H1. This correctly detects edges of any size.
+
+    Args:
+        log_ratio: Current cumulative log-likelihood ratio.
+        outcome: Observed outcome (0 or 1).
+        running_wins: Total wins so far.
+        running_total: Total trades so far.
+        p_null: Probability under H0 (no edge = market price).
+        upper_bound: Accept H1 boundary.
+        lower_bound: Accept H0 boundary.
+
+    Returns:
+        (updated_log_ratio, decision).
+    """
+    if running_total < 2:
+        return (log_ratio, "undecided")
+
+    p_mle = max(0.01, min(0.99, running_wins / running_total))
+
+    # If MLE is very close to null, not enough evidence
+    if abs(p_mle - p_null) < 0.005:
+        return (log_ratio, "undecided")
+
+    return sprt_update(
+        log_ratio, outcome, p_true=p_mle, p_null=p_null,
+        upper_bound=upper_bound, lower_bound=lower_bound,
+    )
+
+
 def brier_score(probs: list[float], outcomes: list[float]) -> float:
     """Brier score: mean squared error of probability forecasts.
 

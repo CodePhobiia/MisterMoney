@@ -11,6 +11,7 @@ from pmm1.math.validation import (
     required_sample_size,
     rolling_sharpe,
     sprt_update,
+    sprt_update_glr,
 )
 
 
@@ -226,3 +227,25 @@ def test_paper2_worked_example_200_trades():
     sr_trade = per_trade_sharpe(edge, p_market)
     sr_annual = annualized_sharpe(sr_trade, n)
     assert abs(sr_annual - 2.26) < 0.1
+
+
+def test_sprt_glr_detects_small_edge():
+    """GLR test detects edges smaller than hypothesized."""
+    import random
+
+    random.seed(42)
+    log_ratio = 0.0
+    wins = 0
+    total = 0
+    decision = "undecided"
+    for _ in range(500):
+        outcome = 1.0 if random.random() < 0.55 else 0.0
+        total += 1
+        if outcome > 0.5:
+            wins += 1
+        log_ratio, decision = sprt_update_glr(
+            log_ratio, outcome, wins, total, p_null=0.50,
+        )
+        if decision != "undecided":
+            break
+    assert decision == "edge_confirmed"

@@ -1231,6 +1231,7 @@ async def run(settings: Settings | None = None) -> None:
 
     # Track notified fills to prevent duplicate notifications (LRU dedup)
     _fill_dedup = _LRUDedup(maxsize=2000)
+    _llm_fill_count = 0
     _pending_fill_events: dict[str, dict[str, Any]] = {}
     _pending_fill_drain_task: asyncio.Task[Any] | None = None
 
@@ -1730,6 +1731,7 @@ async def run(settings: Settings | None = None) -> None:
         existing_fill_id: int | None = None,
         send_fill_notification: bool = True,
     ) -> None:
+        nonlocal _llm_fill_count
         order_id = str(fill_msg.get("order_id") or "")
         token_id = str(fill_msg.get("token_id") or tracked.token_id or "")
         condition_id = str(fill_msg.get("condition_id") or tracked.condition_id or "")
@@ -1881,6 +1883,22 @@ async def run(settings: Settings | None = None) -> None:
                 "adverse_selection_estimate": adverse_selection_estimate,
             },
         )
+
+        # Signal attribution: tag fill with LLM state (H5)
+        _llm_est = (
+            llm_reasoner.get_estimate(condition_id)
+            if llm_reasoner else None
+        )
+        if _llm_est and _llm_est.is_fresh:
+            _llm_fill_count += 1
+            logger.info(
+                "fill_llm_attribution",
+                condition_id=condition_id[:16],
+                llm_p_calibrated=round(_llm_est.p_calibrated, 4),
+                llm_age_s=round(_llm_est.age_seconds, 1),
+                fill_price=price,
+                side=side,
+            )
 
         # Paper 2 §5: record fill for edge validation
         if edge_tracker and mid_at_fill is not None:
@@ -3068,6 +3086,7 @@ async def run(settings: Settings | None = None) -> None:
                         market_price=features.midpoint,
                         nav=nav,
                         edge_confidence=_edge_confidence,
+                        n_active_positions=len(state.active_markets),
                     )
                     apply_quote_book_guards(
                         quote_intent,
@@ -3431,6 +3450,7 @@ async def run(settings: Settings | None = None) -> None:
                             ),
                             nav=nav,
                             edge_confidence=_edge_confidence,
+                            n_active_positions=len(state.active_markets),
                         )
                         apply_quote_book_guards(
                             quote_intent_no,
@@ -3873,6 +3893,12 @@ async def run(settings: Settings | None = None) -> None:
                     fv_calibrator.get_calibration_metrics()
                     if fv_calibrator else None
                 ),
+                pnl_attribution={
+                    "daily_pnl": dd_state.daily_pnl,
+                    "session_peak_nav": dd_state.session_peak_nav,
+                    "llm_influenced_fills": _llm_fill_count,
+                },
+                llm_reasoner_status=llm_reasoner.get_status() if llm_reasoner else None,
             )
 
             if cycle_count % 100 == 0:

@@ -196,6 +196,32 @@ def evaluate_runtime_health(
                or 'awaiting clean reconciliation'),
         )
 
+    # LLM reasoner health (H10)
+    llm_status = snapshot.get("llm_reasoner", {})
+    if llm_status.get("enabled"):
+        if llm_status.get("circuit_open"):
+            add_issue(
+                AlertSeverity.CRITICAL,
+                "llm_circuit_open",
+                "LLM reasoner circuit breaker is open",
+            )
+        if (
+            llm_status.get("fresh_estimates", 0) == 0
+            and age_seconds > 600
+        ):
+            add_issue(
+                AlertSeverity.WARNING,
+                "llm_no_estimates",
+                "LLM reasoner has no fresh estimates",
+            )
+        if llm_status.get("cost_cap_hit"):
+            add_issue(
+                AlertSeverity.WARNING,
+                "llm_cost_cap",
+                f"LLM daily cost cap reached "
+                f"(${llm_status.get('daily_cost_usd', 0):.2f})",
+            )
+
     # Paper 1/2: absolute drawdown kill switch
     drawdown_abs = drawdown.get("absolute_drawdown_pct", 0.0)
     if drawdown.get("absolute_kill_triggered"):
@@ -403,6 +429,8 @@ class OpsMonitor:
         kelly_state: dict[str, Any] | None = None,
         v3_state: dict[str, Any] | None = None,
         calibration_state: dict[str, Any] | None = None,
+        pnl_attribution: dict[str, Any] | None = None,
+        llm_reasoner_status: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Update rolling operational state after a quote cycle."""
         now = self._clock()
@@ -567,6 +595,10 @@ class OpsMonitor:
             snapshot["v3"] = v3_state
         if calibration_state is not None:
             snapshot["calibration"] = calibration_state
+        if llm_reasoner_status is not None:
+            snapshot["llm_reasoner"] = llm_reasoner_status
+        if pnl_attribution is not None:
+            snapshot["pnl_attribution"] = pnl_attribution
         if pmm2_status is not None:
             snapshot["pmm2"] = pmm2_status
         self._status_writer.write(snapshot)

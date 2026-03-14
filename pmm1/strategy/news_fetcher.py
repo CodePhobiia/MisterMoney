@@ -11,6 +11,7 @@ most important component" of effective LLM forecasting.
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any
 
@@ -18,6 +19,15 @@ import aiohttp
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+_PRICE_LEAK_PATTERNS = [
+    r'(?:betting|prediction)\s+(?:odds|market)[^.]{0,40}\d+[%\u00a2]',
+    r'(?:polymarket|kalshi|metaculus)[^.]{0,40}\d+[%\u00a2]',
+    r'implied\s+probability[^.]{0,30}\d+',
+    r'(?:bookmakers?|oddsmakers?)\s+(?:favor|give|set|odds)[^.]{0,30}\d+',
+    r'market\s+(?:is\s+)?(?:pricing|priced|trading)\s+(?:at\s+)?\$?0?\.\d+',
+    r'currently\s+(?:at|trading)\s+\$?0\.\d+',
+]
 
 
 class NewsFetcher:
@@ -39,6 +49,15 @@ class NewsFetcher:
         self._total_calls = 0
         self._total_errors = 0
 
+    def _evict_stale_cache(self) -> None:
+        """Remove stale news cache entries to prevent memory leaks."""
+        stale = [
+            k for k, (ts, _) in self._cache.items()
+            if time.time() - ts > self.cache_ttl_s * 2
+        ]
+        for k in stale:
+            del self._cache[k]
+
     @classmethod
     def from_env(cls) -> NewsFetcher:
         """Load configuration from environment variables."""
@@ -46,6 +65,19 @@ class NewsFetcher:
             backend=os.getenv("PMM1_NEWS_BACKEND", "none"),
             api_key=os.getenv("PMM1_NEWS_API_KEY", ""),
         )
+
+    def _filter_price_leaks(self, text: str) -> str:
+        """Strip market price references that would contaminate blind pass.
+
+        Paper 2: LLMs show 0.994 correlation with market prices when
+        shown them. Even indirect references in news can anchor.
+        """
+        for pattern in _PRICE_LEAK_PATTERNS:
+            text = re.sub(
+                pattern, '[market reference removed]',
+                text, flags=re.IGNORECASE,
+            )
+        return text
 
     async def fetch_context(
         self, question: str, max_words: int = 200,
@@ -71,6 +103,8 @@ class NewsFetcher:
                 )
             else:
                 return ""
+
+            result = self._filter_price_leaks(result)
 
             if result:
                 self._cache[cache_key] = (time.time(), result)

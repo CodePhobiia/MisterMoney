@@ -23,6 +23,15 @@ class MarketContextBuilder:
         self._price_cache: dict[str, tuple[float, str]] = {}
         self._cache_ttl = 120.0  # 2 min cache
 
+    def _evict_stale_cache(self) -> None:
+        """Remove stale price cache entries to prevent memory leaks."""
+        stale = [
+            k for k, (ts, _) in self._price_cache.items()
+            if time.time() - ts > self._cache_ttl * 2
+        ]
+        for k in stale:
+            del self._price_cache[k]
+
     def build_book_summary(self, book: Any) -> str:
         """Build detailed order book summary from OrderBook object.
 

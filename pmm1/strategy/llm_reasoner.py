@@ -397,6 +397,17 @@ class LLMReasoner:
         elif vol_regime == "high":
             eff_blend *= 0.5
 
+        # Kalman-inspired adaptive blend (M10)
+        # When calibrated: use signal/market variance ratio
+        if self.memory and self.memory.is_calibrated:
+            llm_var = max(0.001, est.uncertainty ** 2)
+            market_var = max(0.001, price_change ** 2 + 0.005)
+            # Kalman gain: high LLM variance -> trust market more
+            kalman_gain = llm_var / (llm_var + market_var)
+            # Invert: low LLM uncertainty -> higher blend weight
+            kalman_blend = max(0.05, min(0.5, 1.0 - kalman_gain))
+            eff_blend = min(eff_blend, kalman_blend)
+
         # Log-odds blend (H2) — respects external Bayesianity
         from pmm1.math.ensemble import log_pool
         blended = log_pool(
@@ -562,16 +573,23 @@ class LLMReasoner:
             p_challenged = p_blind
             uncertainty = blind_uncertainty
 
+        # Weak ensemble: combine blind + challenged (M3)
+        from pmm1.math.ensemble import log_pool
+        p_ensemble = log_pool(
+            [p_blind, p_challenged],
+            weights=[0.3, 0.7],
+        )
+
         # ── POST: Platt scaling (γ, τ) from memory, or α fallback ──
         from pmm1.math.extremize import generalized_calibration
         if self.memory and self.memory.is_calibrated:
             gamma, tau = self.memory.get_optimal_gamma_tau()
             p_calibrated = generalized_calibration(
-                p_challenged, gamma, tau,
+                p_ensemble, gamma, tau,
             )
         else:
             p_calibrated = extremize(
-                p_challenged, self.config.extremization_alpha,
+                p_ensemble, self.config.extremization_alpha,
             )
 
         latency = (time.time() - start) * 1000
@@ -633,6 +651,24 @@ class LLMReasoner:
             status["news"] = self.news_fetcher.get_status()
         return status
 
+    def _evict_stale(self) -> None:
+        """Remove stale cache entries to prevent memory leaks."""
+        max_age = self.config.signal_max_age_s * 2.0
+        stale = [
+            k for k, v in self._cache.items()
+            if v.age_seconds > max_age
+        ]
+        for k in stale:
+            del self._cache[k]
+        # Hard cap at 200 entries
+        if len(self._cache) > 200:
+            sorted_keys = sorted(
+                self._cache,
+                key=lambda k: self._cache[k].generated_at,
+            )
+            for k in sorted_keys[:len(self._cache) - 200]:
+                del self._cache[k]
+
     # ── Internal methods ──
 
     async def _loop(self) -> None:
@@ -651,6 +687,13 @@ class LLMReasoner:
 
         while self._running:
             try:
+                # Evict stale caches to prevent memory leaks (M8)
+                self._evict_stale()
+                if self.context_builder and hasattr(self.context_builder, '_evict_stale_cache'):
+                    self.context_builder._evict_stale_cache()
+                if self.news_fetcher and hasattr(self.news_fetcher, '_evict_stale_cache'):
+                    self.news_fetcher._evict_stale_cache()
+
                 markets = self._get_priority_markets()
                 analyzed = 0
 

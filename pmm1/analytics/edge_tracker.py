@@ -20,7 +20,7 @@ from pmm1.math.validation import (
     per_trade_sharpe,
     required_sample_size,
     rolling_sharpe,
-    sprt_update,
+    sprt_update_glr,
 )
 
 
@@ -59,6 +59,11 @@ class EdgeTracker:
         self.trades: list[TradeOutcome] = []
         self.sprt_log_ratio: float = 0.0
         self.sprt_decision: str = "undecided"
+        self._running_wins = 0
+        self._running_total = 0
+        self._decision_trade_index = 0
+        self._decision_history: list[tuple[str, int]] = []
+        self.window_size = 200
 
     def record_trade(
         self,
@@ -83,14 +88,34 @@ class EdgeTracker:
         )
         self.trades.append(trade)
 
-        # Update SPRT if we have enough context
+        # Track running stats for GLR
+        self._running_total += 1
+        if pnl > 0:
+            self._running_wins += 1
+
+        # Sliding window: reset SPRT after window_size trades past last decision
+        if (
+            self.sprt_decision != "undecided"
+            and len(self.trades) - self._decision_trade_index >= self.window_size
+        ):
+            self._decision_history.append(
+                (self.sprt_decision, self._decision_trade_index),
+            )
+            self.sprt_log_ratio = 0.0
+            self.sprt_decision = "undecided"
+            self._decision_trade_index = len(self.trades)
+
+        # Use GLR instead of fixed-alternative SPRT
         if self.sprt_decision == "undecided":
-            self.sprt_log_ratio, self.sprt_decision = sprt_update(
+            self.sprt_log_ratio, self.sprt_decision = sprt_update_glr(
                 self.sprt_log_ratio,
                 outcome,
-                p_true=predicted_p,
+                self._running_wins,
+                self._running_total,
                 p_null=market_p,
             )
+            if self.sprt_decision != "undecided":
+                self._decision_trade_index = len(self.trades)
 
     def get_rolling_sharpe(self, window: int = 100) -> float:
         """Annualized Sharpe from recent trades.
@@ -169,6 +194,10 @@ class EdgeTracker:
                 ),
                 4,
             ),
+            "decision_history": [
+                {"decision": d, "at_trade": i}
+                for d, i in self._decision_history[-5:]
+            ],
         }
 
     def _hours_elapsed(self) -> float:

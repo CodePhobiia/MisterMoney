@@ -180,3 +180,32 @@ def kelly_bet_dollars(
     dollar_amount = min(dollar_amount, max_dollars)
 
     return (side, round(dollar_amount, 2))
+
+
+def multi_bet_kelly_adjustment(
+    f_star: float,
+    n_positions: int,
+    rho: float = 0.05,
+) -> float:
+    """Adjust Kelly fraction for correlated simultaneous positions.
+
+    For equicorrelated positions: f_adj = f / (1 + (N-1) * rho)
+
+    At N=10, rho=0.05: f_adj = f / 1.45 ~ 0.69 x f
+    At N=10, rho=0.10: f_adj = f / 1.90 ~ 0.53 x f
+
+    Without this adjustment, single-bet Kelly over-sizes
+    correlated positions. At rho>0.20 this can cause negative
+    expected growth (mathematician audit finding M5).
+
+    Args:
+        f_star: Kelly fraction from single-bet calculation.
+        n_positions: Number of simultaneous positions.
+        rho: Estimated pairwise correlation between positions.
+
+    Returns:
+        Adjusted Kelly fraction.
+    """
+    if n_positions <= 1 or rho <= 0:
+        return f_star
+    return f_star / (1.0 + (n_positions - 1) * max(0.0, rho))

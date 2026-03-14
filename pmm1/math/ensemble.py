@@ -122,6 +122,7 @@ def update_weights_mwu(
     losses: list[float],
     eta: float = 0.1,
     min_weight: float = 0.05,
+    round_number: int | None = None,
 ) -> list[float]:
     """Multiplicative Weights Update for online model adaptation.
 
@@ -130,17 +131,30 @@ def update_weights_mwu(
 
     For 3 LLMs and 100 questions, per-question regret ≈ 0.074.
 
+    When round_number is provided, eta is computed optimally as
+    sqrt(2 ln(K) / T) per the M6 learning-rate decay finding.
+
     Args:
         weights: Current model weights.
         losses: Brier loss for each model on this observation.
-        eta: Learning rate.
+        eta: Learning rate (overridden when round_number is set).
         min_weight: Floor to prevent weight collapse.
+        round_number: Current round (1-based). If provided, eta
+            is computed as sqrt(2 ln(K) / T) for optimal regret.
 
     Returns:
         Updated normalized weights with floor enforced.
     """
     if not weights or not losses:
         return weights
+
+    # M6: adaptive learning rate decay
+    if round_number is not None and round_number > 0:
+        n_models = len(weights)
+        if n_models >= 2:
+            eta = math.sqrt(
+                2 * math.log(n_models) / round_number
+            )
 
     n = len(weights)
     updated = []

@@ -175,6 +175,7 @@ class QuoteEngine:
         market_price: float = 0.0,
         nav: float = 0.0,
         edge_confidence: float = 1.0,
+        n_active_positions: int = 1,
     ) -> float:
         """Compute quote size in SHARES.
 
@@ -212,6 +213,13 @@ class QuoteEngine:
                 min_edge=cfg.kelly_min_edge,
                 max_position_nav=cfg.kelly_max_position_nav,
             )
+            # Adjust for correlated simultaneous positions (M5)
+            if n_active_positions > 1:
+                from pmm1.math.kelly import multi_bet_kelly_adjustment
+                corr_factor = multi_bet_kelly_adjustment(
+                    1.0, n_active_positions, rho=0.05,
+                )
+                dollar_size *= corr_factor
             if dollar_size <= 0:
                 return 0.0
             target_shares = dollar_size / price
@@ -263,6 +271,7 @@ class QuoteEngine:
         market_price: float = 0.0,
         nav: float = 0.0,
         edge_confidence: float = 1.0,
+        n_active_positions: int = 1,
     ) -> QuoteIntent:
         """Compute full two-sided quote intent.
 
@@ -331,6 +340,7 @@ class QuoteEngine:
             market_price=market_price,
             nav=nav,
             edge_confidence=edge_confidence,
+            n_active_positions=n_active_positions,
         )
 
         # Asymmetric sizing: smaller on the side with more inventory

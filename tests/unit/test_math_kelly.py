@@ -172,3 +172,20 @@ def test_kelly_boundary_prices():
     assert kelly_fraction_yes(0.50, 1.0) == 0.0
     assert kelly_fraction_no(0.50, 0.0) == 0.0
     assert kelly_fraction_no(0.50, 1.0) == 0.0
+
+
+def test_multi_bet_kelly_adjustment():
+    """Correlation adjustment reduces position size."""
+    from pmm1.math.kelly import multi_bet_kelly_adjustment
+
+    f = 0.10
+    # Single position: no change
+    assert multi_bet_kelly_adjustment(f, 1) == f
+    # 10 positions, rho=0.05: f / 1.45
+    adj = multi_bet_kelly_adjustment(f, 10, rho=0.05)
+    assert 0.06 < adj < 0.08
+    # 10 positions, rho=0.20: f / 2.8
+    adj2 = multi_bet_kelly_adjustment(f, 10, rho=0.20)
+    assert adj2 < adj
+    # Zero correlation: no change
+    assert multi_bet_kelly_adjustment(f, 10, rho=0.0) == f
