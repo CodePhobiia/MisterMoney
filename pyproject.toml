@@ -41,6 +41,8 @@ dev = [
 [project.scripts]
 pmm1 = "pmm1.main:main"
 pmm1-health = "pmm1.tools.healthcheck:main"
+pmm1-backfill-spine = "pmm1.tools.backfill_spine:main"
+pmm1-rebuild-spine-facts = "pmm1.tools.rebuild_spine_facts:main"
 
 [tool.ruff]
 target-version = "py312"
@@ -56,3 +58,33 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+
+# Third-party libraries without type stubs
+[[tool.mypy.overrides]]
+module = [
+    "py_clob_client.*",
+    "polars",
+    "polars.*",
+    "duckdb",
+    "web3",
+    "web3.*",
+    "eth_account",
+    "eth_account.*",
+    "asyncpg",
+    "asyncpg.*",
+    "aiofiles",
+    "aiofiles.*",
+    "yaml",
+    "scipy",
+    "scipy.*",
+    "redis",
+    "redis.*",
+    "aiosqlite",
+    "aiosqlite.*",
+]
+ignore_missing_imports = true
+
+# v3 is a separate service, not in scope for pmm1/pmm2 strict checking
+[[tool.mypy.overrides]]
+module = "v3.*"
+ignore_errors = true

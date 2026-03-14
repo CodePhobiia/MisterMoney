@@ -8,7 +8,7 @@ Tick size is dynamic and changes near extremes. Must handle:
 
 from __future__ import annotations
 
-from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP, ROUND_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Literal
 
 import structlog

@@ -5,14 +5,14 @@ Records periodic book snapshots for queue estimation replay.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import structlog
 
 if TYPE_CHECKING:
-    from pmm1.storage.database import Database
     from pmm1.state.books import BookManager
+    from pmm1.storage.database import Database
     from pmm1.strategy.universe import MarketMetadata
 
 logger = structlog.get_logger(__name__)
@@ -43,7 +43,7 @@ class BookRecorder:
         Returns:
             Number of books successfully recorded
         """
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = datetime.now(UTC).isoformat()
         recorded_count = 0
 
         for condition_id, market in active_markets.items():

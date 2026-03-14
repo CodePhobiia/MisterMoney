@@ -70,6 +70,9 @@ class _FakeDrawdownState:
     drawdown_pct = 0.0
     daily_pnl = 0.0
     daily_high_watermark = 100.0
+    absolute_drawdown_pct = 0.0
+    session_peak_nav = 100.0
+    absolute_kill_triggered = False
 
 
 def test_alert_manager_cooldown_suppresses_duplicates():
@@ -181,3 +184,32 @@ def test_evaluate_runtime_health_reports_stale_status_and_db_failure():
     codes = {issue["code"] for issue in report["issues"]}
     assert "service_down" in codes
     assert "db_write_failure" in codes
+
+
+def test_evaluate_runtime_health_warns_when_resume_gate_invalid_in_quoting():
+    config = OpsConfig(status_stale_after_s=30, recent_failure_window_s=300)
+    report = evaluate_runtime_health(
+        {
+            "updated_at": 95.0,
+            "mode": "QUOTING",
+            "kill_switch": {"is_triggered": False, "active_reasons": []},
+            "drawdown": {"tier": "normal", "drawdown_pct": 0.0},
+            "reconciler": {"order_mismatch_streak": 0, "position_mismatch_streak": 0},
+            "runtime_safety": {"resume_token_valid": False},
+            "ops": {
+                "conditions": {
+                    "no_active_quotes": {"active": False, "duration_s": 0.0},
+                    "reconnect_storm": {"active": False, "count": 0},
+                    "excessive_churn": {"active": False, "ratio": 0.0},
+                },
+                "last_db_write_failure": None,
+                "last_fill_recorder_failure": None,
+            },
+        },
+        config=config,
+        now=100.0,
+        service_active=True,
+    )
+
+    codes = {issue["code"] for issue in report["issues"]}
+    assert "resume_gate" in codes

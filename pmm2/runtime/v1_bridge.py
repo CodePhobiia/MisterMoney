@@ -11,6 +11,7 @@ Live mode: pass through V1's order manager with full safety checks.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import structlog
 
@@ -34,14 +35,14 @@ class V1Bridge:
 
     def __init__(
         self,
-        order_manager=None,
-        risk_limits=None,
+        order_manager: Any = None,
+        risk_limits: Any = None,
         shadow_mode: bool = True,
         controller_label: str = "pmm2_shadow",
         stage_name: str = "shadow",
         live_capital_pct: float = 0.0,
         strategy_label: str = "pmm2_shadow",
-    ):
+    ) -> None:
         """Initialize V1 bridge.
 
         Args:
@@ -56,7 +57,7 @@ class V1Bridge:
         self.stage_name = stage_name
         self.live_capital_pct = live_capital_pct
         self.strategy_label = strategy_label
-        self.mutation_log: list[dict] = []
+        self.mutation_log: list[dict[str, Any]] = []
 
         logger.info(
             "v1_bridge_initialized",
@@ -70,8 +71,8 @@ class V1Bridge:
     async def execute_mutations(
         self,
         mutations: list[OrderMutation],
-        tick_sizes: dict[str, any] | None = None,
-    ) -> dict:
+        tick_sizes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Execute order mutations through V1.
 
         In shadow mode: log mutations but don't execute.
@@ -91,7 +92,7 @@ class V1Bridge:
             }
         """
         tick_sizes = tick_sizes or {}
-        result = {
+        result: dict[str, Any] = {
             "executed": 0,
             "skipped": 0,
             "failed": 0,
@@ -119,7 +120,7 @@ class V1Bridge:
         )
 
         for mutation in mutations:
-            detail = {
+            detail: dict[str, Any] = {
                 "controller": self.controller_label,
                 "stage": self.stage_name,
                 "strategy": self.strategy_label,
@@ -216,13 +217,13 @@ class V1Bridge:
             return False
 
         try:
-            from pmm1.api.clob_private import CreateOrderRequest, OrderType
+            from pmm1.api.clob_private import CreateOrderRequest, OrderSide, OrderType
 
             req = CreateOrderRequest(
                 token_id=mutation.token_id,
                 price=str(mutation.price),
                 size=str(mutation.size),
-                side=mutation.side,
+                side=OrderSide(mutation.side),
                 order_type=OrderType.GTC,
                 neg_risk=False,
             )
@@ -336,7 +337,11 @@ class V1Bridge:
                     if tracker is not None:
                         from pmm1.state.orders import OrderState
 
-                        tracker.update_state(mutation.order_id, OrderState.CANCELED, source="pmm2_amend")
+                        tracker.update_state(
+                            mutation.order_id,
+                            OrderState.CANCELED,
+                            source="pmm2_amend",
+                        )
                 except Exception as cancel_err:
                     logger.warning(
                         "v1_amend_cancel_failed",
@@ -347,13 +352,13 @@ class V1Bridge:
                     # (order may have already been filled/canceled)
 
             # Step 2: Place new order at amended price/size
-            from pmm1.api.clob_private import CreateOrderRequest, OrderType
+            from pmm1.api.clob_private import CreateOrderRequest, OrderSide, OrderType
 
             req = CreateOrderRequest(
                 token_id=mutation.token_id,
                 price=str(mutation.price),
                 size=str(mutation.size),
-                side=mutation.side,
+                side=OrderSide(mutation.side),
                 order_type=OrderType.GTC,
                 neg_risk=False,
             )
@@ -381,7 +386,7 @@ class V1Bridge:
             logger.error("v1_order_amend_failed", error=str(e))
             return False
 
-    def get_mutation_log(self, since_sec: float = 3600) -> list[dict]:
+    def get_mutation_log(self, since_sec: float = 3600) -> list[dict[str, Any]]:
         """Get recent mutation log entries.
 
         Args:

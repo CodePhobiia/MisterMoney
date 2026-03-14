@@ -2,12 +2,13 @@
 """Quick test of Sprint 4 scorer implementation."""
 
 import asyncio
-from pmm2.universe.metadata import EnrichedMarket
+
+from pmm1.storage.database import Database
+from pmm2.queue.estimator import QueueEstimator
+from pmm2.queue.hazard import FillHazard
 from pmm2.scorer.bundles import generate_bundles
 from pmm2.scorer.combined import MarketEVScorer
-from pmm1.storage.database import Database
-from pmm2.queue.hazard import FillHazard
-from pmm2.queue.estimator import QueueEstimator
+from pmm2.universe.metadata import EnrichedMarket
 
 
 async def main():
@@ -52,22 +53,26 @@ async def main():
     bundles = generate_bundles(market, nav=nav, min_order_size=3.0)
     print(f"Generated {len(bundles)} bundles:")
     for b in bundles:
-        print(f"  {b.bundle_type}: bid={b.bid_price:.3f}@{b.bid_size:.1f}, ask={b.ask_price:.3f}@{b.ask_size:.1f}, cap=${b.capital_usdc:.2f}")
+        print(
+            f"  {b.bundle_type}: bid={b.bid_price:.3f}"
+            f"@{b.bid_size:.1f}, ask={b.ask_price:.3f}"
+            f"@{b.ask_size:.1f}, cap=${b.capital_usdc:.2f}"
+        )
     print()
 
     # Initialize scorer components
     db = Database("data/pmm1.db")
     await db.init()
-    
+
     hazard = FillHazard()
     estimator = QueueEstimator()
-    
+
     scorer = MarketEVScorer(db, hazard, estimator)
-    
+
     # Score the market
     print("Scoring bundles...")
     scored = await scorer.score_market(market, nav=nav, reservation_price=0.50, min_order_size=3.0)
-    
+
     print(f"\nScored {len(scored)} bundles (sorted by marginal return):")
     for b in scored:
         print(f"\n{b.bundle_type}:")
@@ -81,11 +86,11 @@ async def main():
         print(f"  Carry cost: ${b.carry_cost:.4f}")
         print(f"  Total value: ${b.total_value:.4f}")
         print(f"  Marginal return: {b.marginal_return * 100:.2f}%")
-    
+
     if scored:
         best = scored[0]
         print(f"\n✅ Best bundle: {best.bundle_type} with {best.marginal_return * 100:.2f}% return")
-    
+
     await db.close()
 
 

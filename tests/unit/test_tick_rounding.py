@@ -2,21 +2,18 @@
 
 from decimal import Decimal
 
-import pytest
-
 from pmm1.execution.tick_rounding import (
-    MIN_PRICE,
     MAX_PRICE,
-    TICK_STANDARD,
+    MIN_PRICE,
     TICK_FINE,
+    TICK_STANDARD,
     TICK_ULTRA_FINE,
-    round_bid,
-    round_ask,
-    round_size,
-    round_price,
-    price_to_string,
-    is_valid_tick,
     ensure_spread,
+    is_valid_tick,
+    price_to_string,
+    round_ask,
+    round_bid,
+    round_size,
 )
 
 

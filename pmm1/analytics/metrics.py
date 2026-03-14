@@ -7,7 +7,7 @@ from collections import defaultdict
 from typing import Any
 
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 logger = structlog.get_logger(__name__)
 

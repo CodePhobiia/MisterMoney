@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +14,7 @@ logger = structlog.get_logger(__name__)
 try:
     import polars as pl
 except ImportError:
-    pl = None  # type: ignore
+    pl = None
 
 
 class ParquetWriter:
@@ -49,7 +48,7 @@ class ParquetWriter:
 
     def _get_path(self, data_type: str, ts: float | None = None) -> Path:
         """Get file path for a data type at a given timestamp."""
-        now = datetime.fromtimestamp(ts or time.time(), tz=timezone.utc)
+        now = datetime.fromtimestamp(ts or time.time(), tz=UTC)
         date_dir = now.strftime("%Y-%m-%d")
         hour_file = now.strftime("%H")
         path = self._base_dir / data_type / date_dir / f"{hour_file}.parquet"

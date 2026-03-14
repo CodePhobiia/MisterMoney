@@ -32,7 +32,7 @@ async def check_orders_scoring(
     # Get the SDK client (lazy-initialized in ClobPrivateClient)
     sdk_client = client._get_sdk_client()
 
-    def _check_scoring():
+    def _check_scoring() -> dict[str, bool]:
         """Synchronous SDK call — run in thread."""
         try:
             from py_clob_client.clob_types import OrdersScoringParams

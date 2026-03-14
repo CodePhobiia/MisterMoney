@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from typing import Any
 
 import structlog
 from pydantic import BaseModel, Field
 
-from pmm1.analytics.pnl import FillRecord, PnLSnapshot
+from pmm1.analytics.pnl import FillRecord
 
 logger = structlog.get_logger(__name__)
 
@@ -93,8 +92,8 @@ class PnLAttributor:
 
         # Compute market attribution
         for condition_id, fills in market_fills.items():
-            attr = self._compute_market_attribution(condition_id, fills)
-            attribution.by_market[condition_id] = attr
+            mattr = self._compute_market_attribution(condition_id, fills)
+            attribution.by_market[condition_id] = mattr
 
         return attribution
 

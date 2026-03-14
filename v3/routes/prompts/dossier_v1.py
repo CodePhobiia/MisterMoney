@@ -40,14 +40,16 @@ def build_dossier_synthesis_prompt(
 ) -> str:
     """
     Build the user prompt for Gemini long-context dossier synthesis
-    
+
     Args:
         question: Market question
         rules: Resolution rules
-        documents: List of source document dicts with keys: doc_id, title, source_type, publisher, content_summary
-        evidence: List of evidence item dicts with keys: evidence_id, claim, polarity, reliability, doc_id
+        documents: List of source document dicts with keys:
+            doc_id, title, source_type, publisher, content_summary
+        evidence: List of evidence item dicts with keys:
+            evidence_id, claim, polarity, reliability, doc_id
         clarifications: List of clarification texts
-        
+
     Returns:
         Formatted prompt string
     """
@@ -59,7 +61,7 @@ def build_dossier_synthesis_prompt(
         source_type = doc.get("source_type", "unknown")
         publisher = doc.get("publisher", "Unknown")
         content = doc.get("content_summary", doc.get("content", "(No content)"))
-        
+
         doc_lines.append(f"""
 DOCUMENT [{doc_id}]
 Type: {source_type}
@@ -68,9 +70,9 @@ Title: {title}
 Content:
 {content}
 ---""")
-    
+
     documents_block = "\n".join(doc_lines) if doc_lines else "(No documents available)"
-    
+
     # Format evidence items
     evidence_lines = []
     for i, item in enumerate(evidence, 1):
@@ -79,20 +81,20 @@ Content:
         polarity = item.get("polarity", "NEUTRAL")
         reliability = item.get("reliability", 0.5)
         doc_id = item.get("doc_id", "unknown")
-        
+
         evidence_lines.append(
             f"[{eid}] (from {doc_id}, {polarity}, reliability={reliability:.2f}):\n  {claim}"
         )
-    
+
     evidence_block = "\n".join(evidence_lines) if evidence_lines else "(No evidence available)"
-    
+
     # Format clarifications
     clarifications_block = ""
     if clarifications:
         clarifications_block = "\n\nCLARIFICATIONS:\n" + "\n".join(
             f"- {c}" for c in clarifications
         )
-    
+
     prompt = f"""MARKET QUESTION:
 {question}
 
@@ -106,7 +108,8 @@ EXTRACTED EVIDENCE:
 {evidence_block}
 
 TASK:
-Synthesize all source documents and evidence to estimate the probability that this market resolves YES.
+Synthesize all source documents and evidence to estimate \
+the probability that this market resolves YES.
 
 Consider:
 1. Do documents contradict each other?
@@ -116,5 +119,5 @@ Consider:
 5. What evidence gaps remain?
 
 Output ONLY the JSON object, nothing else."""
-    
+
     return prompt

@@ -1,17 +1,17 @@
 """Rewards API client — sampling markets and rebate tracking.
 
 Endpoints:
-- GET /sampling-simplified-markets — returns reward-eligible markets with condition_id, rates, constraints
+- GET /sampling-simplified-markets — returns reward-eligible
+  markets with condition_id, rates, constraints
 - GET /rebates/current?date=YYYY-MM-DD&maker_address=0x... — returns rebate data (no auth)
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import aiohttp
@@ -209,7 +209,7 @@ class RewardsClient:
             Rebate data dict, or None if no rebates or error.
         """
         if date is None:
-            date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            date = datetime.now(UTC).strftime("%Y-%m-%d")
 
         session = await self._get_session()
         url = f"{self.base_url}/rebates/current"
@@ -235,7 +235,7 @@ class RewardsClient:
                     )
                     return None
 
-                data = await resp.json()
+                data: dict[str, Any] = await resp.json()
                 logger.info("rebates_fetched", maker_address=maker_address, date=date, data=data)
                 return data
 

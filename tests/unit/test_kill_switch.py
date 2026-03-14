@@ -2,8 +2,6 @@
 
 import time
 
-import pytest
-
 from pmm1.risk.kill_switch import KillSwitch, KillSwitchReason
 
 

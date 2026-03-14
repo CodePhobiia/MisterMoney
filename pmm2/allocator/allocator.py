@@ -10,7 +10,8 @@ Full allocation cycle:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 
@@ -67,7 +68,7 @@ class CapitalAllocator:
             min_positive_return_bps=min_positive_return_bps,
         )
 
-    def update_nav(self, nav: float):
+    def update_nav(self, nav: float) -> None:
         """Update NAV (called when wallet balance changes).
 
         Args:
@@ -271,7 +272,7 @@ class CapitalAllocator:
 
         return final_plan
 
-    async def persist_decisions(self, db, plan: AllocationPlan):
+    async def persist_decisions(self, db: Any, plan: AllocationPlan) -> None:
         """Write allocation decisions to allocation_decision table.
 
         Args:
@@ -282,7 +283,7 @@ class CapitalAllocator:
             logger.info("no_bundles_to_persist")
             return
 
-        ts_iso = datetime.now(timezone.utc).isoformat()
+        ts_iso = datetime.now(UTC).isoformat()
 
         rows = []
         for bundle in plan.funded_bundles:
@@ -311,7 +312,7 @@ class CapitalAllocator:
 
         logger.info("allocation_decisions_persisted", count=len(rows))
 
-    def get_allocator_stats(self) -> dict:
+    def get_allocator_stats(self) -> dict[str, Any]:
         """Get current allocator statistics.
 
         Returns:

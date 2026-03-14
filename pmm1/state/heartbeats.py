@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 
 import structlog
 
@@ -38,7 +39,7 @@ class HeartbeatState:
         self._total_sent: int = 0
         self._total_failed: int = 0
         self._is_running: bool = False
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
 
     @property
     def last_heartbeat_id(self) -> str:
@@ -108,7 +109,7 @@ class HeartbeatState:
                 )
             await asyncio.sleep(self._interval_s)
 
-    def start(self) -> asyncio.Task:
+    def start(self) -> asyncio.Task[None]:
         """Start the heartbeat loop as an asyncio task."""
         if self._is_running:
             logger.warning("heartbeat_loop_already_running")
@@ -120,7 +121,7 @@ class HeartbeatState:
         self._task.add_done_callback(self._on_task_done)
         return self._task
 
-    def _on_task_done(self, task: asyncio.Task) -> None:
+    def _on_task_done(self, task: asyncio.Task[None]) -> None:
         """Handle heartbeat task completion/failure."""
         self._is_running = False
         if task.cancelled():
@@ -145,7 +146,7 @@ class HeartbeatState:
         self._task = None
         logger.info("heartbeat_loop_stopped")
 
-    def get_stats(self) -> dict:
+    def get_stats(self) -> dict[str, Any]:
         """Get heartbeat statistics."""
         return {
             "is_healthy": self.is_healthy,

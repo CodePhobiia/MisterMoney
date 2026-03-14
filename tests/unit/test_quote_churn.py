@@ -4,7 +4,7 @@ import asyncio
 import time
 from decimal import Decimal
 
-from pmm1.api.clob_private import CreateOrderRequest, OrderResponse, OrderSide, OrderType
+from pmm1.api.clob_private import CreateOrderRequest, OrderResponse
 from pmm1.execution.order_manager import OrderManager
 from pmm1.state.orders import OrderState, OrderTracker, TrackedOrder, zero_lifecycle_counts
 from pmm1.strategy.fill_escalation import FillEscalationConfig, FillEscalator

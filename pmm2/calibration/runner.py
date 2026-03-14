@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -20,7 +20,7 @@ logger = structlog.get_logger(__name__)
 
 class CalibrationRunner:
     """Top-level calibration orchestrator.
-    
+
     Runs daily calibration cycle:
     1. Pull realized rewards/rebates
     2. Update correction factors
@@ -28,16 +28,16 @@ class CalibrationRunner:
     4. Fit toxicity weights (if enough data)
     5. Generate and send attribution report
     """
-    
+
     def __init__(
-        self, 
-        db: Database, 
-        fill_hazard, 
+        self,
+        db: Database,
+        fill_hazard: Any,
         maker_address: str,
-        rewards_client=None
-    ):
+        rewards_client: Any = None
+    ) -> None:
         """Initialize calibration runner.
-        
+
         Args:
             db: Database instance
             fill_hazard: FillHazard instance
@@ -52,26 +52,26 @@ class CalibrationRunner:
         self.fill_hazard = fill_hazard
         self.maker_address = maker_address
         self.rewards_client = rewards_client
-    
-    async def run_daily_calibration(self, date: str):
+
+    async def run_daily_calibration(self, date: str) -> None:
         """Run full daily calibration cycle.
-        
+
         Args:
             date: Date string (YYYY-MM-DD)
         """
         logger.info("calibration_daily_start", date=date)
-        
+
         try:
             # 1. Pull and record reward/rebate actuals
             if self.rewards_client:
                 await self.rebate_tracker.fetch_and_record_daily(
                     self.maker_address, self.rewards_client, date
                 )
-            
+
             # 2. Update correction factors
             await self.reward_tracker.update_correction_factors()
             await self.rebate_tracker.update_correction_factors()
-            
+
             # 3. Calibrate fill probabilities
             corrections = await self.fill_calibrator.compute_calibration(
                 self.fill_hazard
@@ -81,7 +81,7 @@ class CalibrationRunner:
                     self.fill_hazard, corrections
                 )
                 logger.info("fill_calibration_applied", **corrections)
-            
+
             # 4. Fit toxicity weights
             weights = await self.toxicity_fitter.fit()
             if weights:
@@ -91,12 +91,12 @@ class CalibrationRunner:
                     w_5s=weights[1],
                     w_30s=weights[2]
                 )
-            
+
             # 5. Attribution report
             await self.attribution.send_daily_report(date)
-            
+
             logger.info("calibration_daily_complete", date=date)
-            
+
         except Exception as e:
             logger.error(
                 "calibration_daily_failed",

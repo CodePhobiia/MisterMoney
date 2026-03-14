@@ -11,7 +11,7 @@ Philosophy: HOLD is the overwhelming default. Only move when math is CLEARLY bet
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pmm2.persistence.action_ev import ActionEVCalculator, PersistenceAction
 from pmm2.persistence.hysteresis import HysteresisGate
@@ -137,7 +137,9 @@ class PersistenceOptimizer:
         target_prices: dict[str, float],
         depletion_rates: dict[str, float],
         inventory_skews: dict[str, float],
-        **kwargs,
+        book_depths: dict[str, dict[float, float]] | None = None,
+        tick_sizes: dict[str, float] | None = None,
+        **kwargs: Any,
     ) -> dict[str, tuple[PersistenceAction, float]]:
         """Batch decide for all live orders.
 
@@ -153,6 +155,10 @@ class PersistenceOptimizer:
             {order_id: (action, ev)} dict
         """
         decisions: dict[str, tuple[PersistenceAction, float]] = {}
+        book_depths = book_depths or {}
+        tick_sizes = tick_sizes or {}
+        kwargs = dict(kwargs)
+        default_tick_size: float = float(kwargs.pop("tick_size", 0.01))
 
         for order_id in live_orders:
             reservation = reservation_prices.get(order_id, 0.5)
@@ -166,6 +172,8 @@ class PersistenceOptimizer:
                 target_price=target,
                 depletion_rate=depletion,
                 inventory_skew=skew,
+                book_depth=book_depths.get(order_id),
+                tick_size=tick_sizes.get(order_id, default_tick_size),
                 **kwargs,
             )
             decisions[order_id] = decision

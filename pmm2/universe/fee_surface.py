@@ -7,6 +7,7 @@ profitable for market makers due to taker fee rebates.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import structlog
 
@@ -35,7 +36,7 @@ class FeeSurface:
         """Check if cached data is stale and needs refresh."""
         return time.time() - self._last_refresh >= self.ttl_seconds
 
-    def update_from_markets(self, markets: list[dict]) -> None:
+    def update_from_markets(self, markets: list[dict[str, Any]]) -> None:
         """Update fee surface from Gamma market data.
 
         Args:

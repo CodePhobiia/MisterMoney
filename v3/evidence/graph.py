@@ -3,16 +3,16 @@ V3 Evidence Graph CRUD Operations
 Create, read, update, delete operations for evidence layer
 """
 
-from typing import List
 import json
+
 import structlog
 
 from .db import Database
 from .entities import (
-    SourceDocument,
     EvidenceItem,
-    RuleGraph,
     FairValueSignal,
+    RuleGraph,
+    SourceDocument,
 )
 
 log = structlog.get_logger()
@@ -20,23 +20,23 @@ log = structlog.get_logger()
 
 class EvidenceGraph:
     """CRUD operations for evidence graph"""
-    
+
     def __init__(self, db: Database):
         """
         Initialize evidence graph with database connection
-        
+
         Args:
             db: Database instance
         """
         self.db = db
-        
+
     async def upsert_document(self, doc: SourceDocument) -> str:
         """
         Insert or update a source document
-        
+
         Args:
             doc: SourceDocument to upsert
-            
+
         Returns:
             doc_id of the upserted document
         """
@@ -57,9 +57,9 @@ class EvidenceGraph:
                 embedding = EXCLUDED.embedding
             RETURNING doc_id
         """
-        
+
         embedding_str = f"[{','.join(map(str, doc.embedding))}]" if doc.embedding else None
-        
+
         result = await self.db.fetchrow(
             query,
             doc.doc_id,
@@ -74,17 +74,17 @@ class EvidenceGraph:
             embedding_str,
             doc.created_at,
         )
-        
+
         log.info("document_upserted", doc_id=doc.doc_id)
         return result['doc_id']
-        
+
     async def add_evidence(self, item: EvidenceItem) -> str:
         """
         Add an evidence item
-        
+
         Args:
             item: EvidenceItem to add
-            
+
         Returns:
             evidence_id of the added item
         """
@@ -107,9 +107,9 @@ class EvidenceGraph:
                 embedding = EXCLUDED.embedding
             RETURNING evidence_id
         """
-        
+
         embedding_str = f"[{','.join(map(str, item.embedding))}]" if item.embedding else None
-        
+
         result = await self.db.fetchrow(
             query,
             item.evidence_id,
@@ -125,14 +125,14 @@ class EvidenceGraph:
             embedding_str,
             item.created_at,
         )
-        
+
         log.info("evidence_added", evidence_id=item.evidence_id, condition_id=item.condition_id)
         return result['evidence_id']
-        
+
     async def upsert_rule_graph(self, rule: RuleGraph) -> None:
         """
         Insert or update a rule graph
-        
+
         Args:
             rule: RuleGraph to upsert
         """
@@ -153,7 +153,7 @@ class EvidenceGraph:
                 clarification_ids = EXCLUDED.clarification_ids,
                 updated_at = EXCLUDED.updated_at
         """
-        
+
         await self.db.execute(
             query,
             rule.condition_id,
@@ -168,21 +168,21 @@ class EvidenceGraph:
             rule.updated_at,
             rule.created_at,
         )
-        
+
         log.info("rule_graph_upserted", condition_id=rule.condition_id)
-        
+
     async def get_evidence_bundle(
         self,
         condition_id: str,
         max_items: int = 20
-    ) -> List[EvidenceItem]:
+    ) -> list[EvidenceItem]:
         """
         Get recent evidence for a condition
-        
+
         Args:
             condition_id: Condition to get evidence for
             max_items: Maximum number of items to return
-            
+
         Returns:
             List of EvidenceItems, most recent first
         """
@@ -192,9 +192,9 @@ class EvidenceGraph:
             ORDER BY ts_observed DESC
             LIMIT $2
         """
-        
+
         rows = await self.db.fetch(query, condition_id, max_items)
-        
+
         items = []
         for row in rows:
             # Convert embedding from string to list if present
@@ -204,12 +204,13 @@ class EvidenceGraph:
                 embedding_str = str(row['embedding'])
                 if embedding_str.startswith('[') and embedding_str.endswith(']'):
                     embedding = [float(x) for x in embedding_str[1:-1].split(',')]
-            
-            # Parse extracted_values if it's a string (asyncpg returns JSONB as dict already, but just in case)
+
+            # Parse extracted_values if it's a string
+            # (asyncpg returns JSONB as dict already)
             extracted_values = row['extracted_values']
             if isinstance(extracted_values, str):
                 extracted_values = json.loads(extracted_values)
-            
+
             items.append(EvidenceItem(
                 evidence_id=row['evidence_id'],
                 condition_id=row['condition_id'],
@@ -224,36 +225,36 @@ class EvidenceGraph:
                 embedding=embedding,
                 created_at=row['created_at'],
             ))
-            
+
         log.info("evidence_bundle_fetched", condition_id=condition_id, count=len(items))
         return items
-        
+
     async def get_rule_graph(self, condition_id: str) -> RuleGraph | None:
         """
         Get rule graph for a condition
-        
+
         Args:
             condition_id: Condition to get rule graph for
-            
+
         Returns:
             RuleGraph or None if not found
         """
         query = "SELECT * FROM rule_graphs WHERE condition_id = $1"
         row = await self.db.fetchrow(query, condition_id)
-        
+
         if not row:
             log.info("rule_graph_not_found", condition_id=condition_id)
             return None
-        
+
         # Parse JSONB fields
         edge_cases = row['edge_cases']
         if isinstance(edge_cases, str):
             edge_cases = json.loads(edge_cases)
-        
+
         clarification_ids = row['clarification_ids']
         if isinstance(clarification_ids, str):
             clarification_ids = json.loads(clarification_ids)
-            
+
         rule = RuleGraph(
             condition_id=row['condition_id'],
             source_name=row['source_name'],
@@ -267,39 +268,39 @@ class EvidenceGraph:
             updated_at=row['updated_at'],
             created_at=row['created_at'],
         )
-        
+
         log.info("rule_graph_fetched", condition_id=condition_id)
         return rule
-        
+
     async def get_document(self, doc_id: str) -> SourceDocument | None:
         """
         Get a source document by ID
-        
+
         Args:
             doc_id: Document ID to fetch
-            
+
         Returns:
             SourceDocument or None if not found
         """
         query = "SELECT * FROM source_documents WHERE doc_id = $1"
         row = await self.db.fetchrow(query, doc_id)
-        
+
         if not row:
             log.info("document_not_found", doc_id=doc_id)
             return None
-            
+
         # Convert embedding from string to list if present
         embedding = None
         if row.get('embedding'):
             embedding_str = str(row['embedding'])
             if embedding_str.startswith('[') and embedding_str.endswith(']'):
                 embedding = [float(x) for x in embedding_str[1:-1].split(',')]
-        
+
         # Parse metadata JSONB
         metadata = row['metadata']
         if isinstance(metadata, str):
             metadata = json.loads(metadata)
-        
+
         doc = SourceDocument(
             doc_id=row['doc_id'],
             url=row['url'],
@@ -313,18 +314,18 @@ class EvidenceGraph:
             embedding=embedding,
             created_at=row['created_at'],
         )
-        
+
         log.info("document_fetched", doc_id=doc_id)
         return doc
-        
+
     async def deduplicate(self, condition_id: str) -> int:
         """
         Remove duplicate evidence items by content_hash
         Keeps the most recent version of each unique claim
-        
+
         Args:
             condition_id: Condition to deduplicate evidence for
-            
+
         Returns:
             Number of duplicates removed
         """
@@ -332,10 +333,10 @@ class EvidenceGraph:
         # and keeps only the most recent evidence_item per doc
         query = """
             WITH duplicates AS (
-                SELECT 
+                SELECT
                     e.evidence_id,
                     ROW_NUMBER() OVER (
-                        PARTITION BY d.content_hash, e.condition_id 
+                        PARTITION BY d.content_hash, e.condition_id
                         ORDER BY e.ts_observed DESC
                     ) as rn
                 FROM evidence_items e
@@ -347,19 +348,19 @@ class EvidenceGraph:
                 SELECT evidence_id FROM duplicates WHERE rn > 1
             )
         """
-        
+
         result = await self.db.execute(query, condition_id)
-        
+
         # Parse result like "DELETE 3"
         count = int(result.split()[-1]) if result.split()[-1].isdigit() else 0
-        
+
         log.info("evidence_deduplicated", condition_id=condition_id, removed=count)
         return count
-        
+
     async def save_signal(self, signal: FairValueSignal) -> None:
         """
         Save a fair value signal
-        
+
         Args:
             signal: FairValueSignal to save
         """
@@ -383,7 +384,7 @@ class EvidenceGraph:
                 models_used = EXCLUDED.models_used,
                 expires_at = EXCLUDED.expires_at
         """
-        
+
         await self.db.execute(
             query,
             signal.condition_id,
@@ -402,16 +403,16 @@ class EvidenceGraph:
             signal.expires_at,
             signal.created_at,
         )
-        
+
         log.info("signal_saved", condition_id=signal.condition_id)
-        
+
     async def get_latest_signal(self, condition_id: str) -> FairValueSignal | None:
         """
         Get the most recent fair value signal for a condition
-        
+
         Args:
             condition_id: Condition to get signal for
-            
+
         Returns:
             FairValueSignal or None if not found
         """
@@ -421,26 +422,26 @@ class EvidenceGraph:
             ORDER BY generated_at DESC
             LIMIT 1
         """
-        
+
         row = await self.db.fetchrow(query, condition_id)
-        
+
         if not row:
             log.info("signal_not_found", condition_id=condition_id)
             return None
-        
+
         # Parse JSONB fields
         evidence_ids = row['evidence_ids']
         if isinstance(evidence_ids, str):
             evidence_ids = json.loads(evidence_ids)
-        
+
         counterevidence_ids = row['counterevidence_ids']
         if isinstance(counterevidence_ids, str):
             counterevidence_ids = json.loads(counterevidence_ids)
-        
+
         models_used = row['models_used']
         if isinstance(models_used, str):
             models_used = json.loads(models_used)
-            
+
         signal = FairValueSignal(
             condition_id=row['condition_id'],
             generated_at=row['generated_at'],
@@ -458,6 +459,6 @@ class EvidenceGraph:
             expires_at=row['expires_at'],
             created_at=row['created_at'],
         )
-        
+
         log.info("signal_fetched", condition_id=condition_id)
         return signal

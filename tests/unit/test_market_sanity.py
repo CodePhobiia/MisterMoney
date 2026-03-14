@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from pmm1.risk.correlation import ThematicCorrelation
 from pmm1.settings import MarketFiltersConfig
@@ -32,7 +32,7 @@ def _scored_market(
             token_id_no=f"{condition_id}-no",
             event_id=event_id,
             question=question,
-            end_date=datetime.now(timezone.utc) + timedelta(days=7),
+            end_date=datetime.now(UTC) + timedelta(days=7),
             spread=spread,
             liquidity=liquidity,
         ),

@@ -231,7 +231,7 @@ class QuotePlanner:
 
         return allowed
 
-    def record_reprice(self, condition_id: str):
+    def record_reprice(self, condition_id: str) -> None:
         """Record a reprice event.
 
         Args:

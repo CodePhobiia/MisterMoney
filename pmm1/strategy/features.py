@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -130,10 +130,10 @@ class TradeAccumulator:
         self._prune()
         if len(self._trades) < 2:
             return 0.0
-        duration = self._trades[-1]["timestamp"] - self._trades[0]["timestamp"]
+        duration = float(self._trades[-1]["timestamp"] - self._trades[0]["timestamp"])
         if duration <= 0:
             return 0.0
-        return len(self._trades) / duration
+        return float(len(self._trades) / duration)
 
     def get_sweep_intensity(self, size_threshold: float = 500.0) -> float:
         """Large trade (sweep) intensity — fraction of volume from large trades."""
@@ -141,12 +141,12 @@ class TradeAccumulator:
         if not self._trades:
             return 0.0
 
-        total_vol = sum(t["size"] for t in self._trades)
-        sweep_vol = sum(t["size"] for t in self._trades if t["size"] >= size_threshold)
+        total_vol = float(sum(t["size"] for t in self._trades))
+        sweep_vol = float(sum(t["size"] for t in self._trades if t["size"] >= size_threshold))
 
         if total_vol == 0:
             return 0.0
-        return sweep_vol / total_vol
+        return float(sweep_vol / total_vol)
 
     def get_realized_volatility(self) -> float:
         """Short-horizon realized volatility from trade prices.
@@ -218,7 +218,7 @@ class FeatureEngine:
             external_signal: E_t from external sources.
         """
         now = time.time()
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(UTC)
         acc = self.get_accumulator(token_id)
 
         # Book features
@@ -281,7 +281,7 @@ class FeatureEngine:
         if end_date is not None:
             # Gamma may provide naive datetimes; normalize to UTC-aware for safe subtraction.
             if end_date.tzinfo is None:
-                end_date = end_date.replace(tzinfo=timezone.utc)
+                end_date = end_date.replace(tzinfo=UTC)
             delta = (end_date - now_dt).total_seconds()
             time_to_resolution_hours = max(0, delta / 3600)
 

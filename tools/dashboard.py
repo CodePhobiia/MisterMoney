@@ -4,11 +4,8 @@
 import asyncio
 import json
 import os
-import os
 import sys
-import time
-from datetime import datetime, timezone
-from decimal import Decimal
+from datetime import UTC, datetime
 
 # Add parent to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -25,31 +22,35 @@ GAMMA_URL = "https://gamma-api.polymarket.com"
 CLOB_URL = "https://clob.polymarket.com"
 
 # ERC20 ABI (balanceOf only)
-ERC20_ABI = json.loads('[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]')
+ERC20_ABI = json.loads(
+    '[{"constant":true,"inputs":[{"name":"_owner",'
+    '"type":"address"}],"name":"balanceOf","outputs":'
+    '[{"name":"balance","type":"uint256"}],"type":"function"}]'
+)
 
 
 async def get_wallet_balances() -> dict:
     """Get on-chain wallet balances."""
     w3 = Web3(Web3.HTTPProvider(RPC_URL))
-    
+
     # POL (native)
     pol_wei = w3.eth.get_balance(Web3.to_checksum_address(BOT_ADDRESS))
     pol = float(w3.from_wei(pol_wei, "ether"))
-    
+
     # USDC.e (6 decimals)
     usdc_e = w3.eth.contract(
         address=Web3.to_checksum_address(USDC_E_CONTRACT), abi=ERC20_ABI
     )
     usdc_e_raw = usdc_e.functions.balanceOf(Web3.to_checksum_address(BOT_ADDRESS)).call()
     usdc_e_bal = usdc_e_raw / 1e6
-    
+
     # Native USDC (6 decimals)
     usdc = w3.eth.contract(
         address=Web3.to_checksum_address(USDC_CONTRACT), abi=ERC20_ABI
     )
     usdc_raw = usdc.functions.balanceOf(Web3.to_checksum_address(BOT_ADDRESS)).call()
     usdc_bal = usdc_raw / 1e6
-    
+
     return {"pol": pol, "usdc_e": usdc_e_bal, "usdc": usdc_bal, "total_usd": usdc_e_bal + usdc_bal}
 
 
@@ -134,7 +135,7 @@ def parse_bot_metrics(logs: str) -> dict:
         "escalation_level": 0,
         "last_order_prices": [],
     }
-    
+
     for line in logs.split("\n"):
         try:
             if "quote_cycle_summary" in line:
@@ -168,12 +169,17 @@ def parse_bot_metrics(logs: str) -> dict:
                     d = json.loads(line)
                     evt = d.get("event", "unknown_error")
                     if evt not in [e.get("event") for e in metrics["errors"][-5:]]:
-                        metrics["errors"].append({"event": evt, "msg": str(d.get("error", d.get("message", "")))[:80]})
+                        msg = str(
+                            d.get("error", d.get("message", ""))
+                        )[:80]
+                        metrics["errors"].append(
+                            {"event": evt, "msg": msg}
+                        )
                 except Exception:
                     pass
         except Exception:
             continue
-    
+
     # Dedupe order prices, keep last 10
     metrics["last_order_prices"] = metrics["last_order_prices"][-10:]
     metrics["errors"] = metrics["errors"][-5:]
@@ -181,11 +187,11 @@ def parse_bot_metrics(logs: str) -> dict:
 
 
 async def main():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     print(f"\n{'='*70}")
     print(f"  💰 MisterMoney Dashboard — {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(f"{'='*70}")
-    
+
     # ── Wallet ──
     print("\n📊 WALLET BALANCES")
     print("-" * 40)
@@ -194,11 +200,11 @@ async def main():
         print(f"  USDC.e:  ${bal['usdc_e']:>10.2f}")
         print(f"  USDC:    ${bal['usdc']:>10.2f}")
         print(f"  POL:      {bal['pol']:>10.4f}")
-        print(f"  ─────────────────────")
+        print("  ─────────────────────")
         print(f"  Total:   ${bal['total_usd']:>10.2f}")
     except Exception as e:
         print(f"  ❌ Error: {e}")
-    
+
     # ── Positions ──
     print("\n📈 OPEN POSITIONS")
     print("-" * 40)
@@ -224,13 +230,17 @@ async def main():
                 pnl_pct = (pnl / (avg_price * size) * 100) if avg_price * size > 0 else 0
                 total_value += value
                 pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-                print(f"  {pnl_emoji} {size:.1f} shares @ ${avg_price:.3f} → ${cur_price:.3f}  PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)")
+                print(
+                    f"  {pnl_emoji} {size:.1f} shares"
+                    f" @ ${avg_price:.3f} → ${cur_price:.3f}"
+                    f"  PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)"
+                )
                 print(f"     Token: {token}...")
-            print(f"  ─────────────────────")
+            print("  ─────────────────────")
             print(f"  Position value: ${total_value:.2f}")
     except Exception as e:
         print(f"  ❌ Error: {e}")
-    
+
     # ── Open Orders ──
     print("\n📋 OPEN ORDERS")
     print("-" * 40)
@@ -253,7 +263,7 @@ async def main():
                 print(f"  {emoji} {side} {size} @ ${price}  [{token}...]")
     except Exception as e:
         print(f"  ❌ Error: {e}")
-    
+
     # ── Bot Metrics ──
     print("\n🤖 BOT STATUS")
     print("-" * 40)
@@ -267,20 +277,20 @@ async def main():
         print(f"  Fills (5m): {m['fills']}")
         if m.get('escalation_level', 0) > 0:
             print(f"  ⚡ Escalation: +{m['escalation_level']} ticks")
-        
+
         if m["last_order_prices"]:
-            print(f"\n  Recent Orders:")
+            print("\n  Recent Orders:")
             for op in m["last_order_prices"][-6:]:
                 emoji = "🟩" if op["side"] == "BUY" else "🟥"
                 print(f"    {emoji} {op['side']} @ ${op['price']}  [{op['token']}...]")
-        
+
         if m["errors"]:
-            print(f"\n  ⚠️  Recent Errors:")
+            print("\n  ⚠️  Recent Errors:")
             for e in m["errors"][-3:]:
                 print(f"    ❌ {e['event']}: {e['msg'][:60]}")
     except Exception as e:
         print(f"  ❌ Error: {e}")
-    
+
     print(f"\n{'='*70}\n")
 
 

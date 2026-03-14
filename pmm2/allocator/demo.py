@@ -5,11 +5,11 @@ Run: python3 -m pmm2.allocator.demo
 
 import asyncio
 
-from pmm2.allocator import AllocationConstraints, CapitalAllocator
+from pmm2.allocator import CapitalAllocator
 from pmm2.scorer.bundles import QuoteBundle
 
 
-async def demo_allocator():
+async def demo_allocator() -> None:
     """Demo the capital allocator with synthetic data."""
     print("=" * 60)
     print("Sprint 6: Discrete Capital Allocator Demo")
@@ -24,7 +24,7 @@ async def demo_allocator():
 
     # Show scale-aware defaults
     stats = allocator.get_allocator_stats()
-    print(f"\n🎯 Scale-aware constraints:")
+    print("\n🎯 Scale-aware constraints:")
     print(f"  - Active cap limit: ${stats['active_cap_limit']:.2f} (30% of NAV)")
     print(f"  - Per-market cap: ${stats['per_market_cap']:.2f}")
     print(f"  - Per-event cap: ${stats['per_event_cap']:.2f} (6% of NAV)")
@@ -32,7 +32,7 @@ async def demo_allocator():
     print(f"  - Hysteresis min: ${stats['hysteresis_min_usdc']:.2f} (scale-aware)")
 
     # Create synthetic bundles
-    print(f"\n📦 Creating synthetic bundles for 5 markets...")
+    print("\n📦 Creating synthetic bundles for 5 markets...")
 
     bundles = [
         # Market 1: High EV, reward-eligible
@@ -120,12 +120,12 @@ async def demo_allocator():
         "market_4": "event_C",
     }
 
-    print(f"  - 5 bundles created")
+    print("  - 5 bundles created")
     print(f"  - Total potential capital: ${sum(b.capital_usdc for b in bundles):.2f}")
-    print(f"  - Event clusters: 2 markets in event_A, others solo")
+    print("  - Event clusters: 2 markets in event_A, others solo")
 
     # Run allocation cycle (fresh start, no existing positions)
-    print(f"\n🚀 Running allocation cycle (no existing positions)...")
+    print("\n🚀 Running allocation cycle (no existing positions)...")
 
     plan = await allocator.run_allocation_cycle(
         scored_bundles=bundles,
@@ -135,14 +135,15 @@ async def demo_allocator():
     )
 
     # Show results
-    print(f"\n✅ Allocation complete!")
+    print("\n✅ Allocation complete!")
     print(f"  - Funded bundles: {len(plan.funded_bundles)}")
     print(f"  - Markets funded: {plan.markets_funded}")
     print(f"  - Capital used: ${plan.total_capital_used:.2f}")
     print(f"  - Slots used: {plan.total_slots_used} / {stats['total_slots']}")
-    print(f"  - Capital utilization: {plan.total_capital_used / stats['active_cap_limit'] * 100:.1f}%")
+    cap_util = plan.total_capital_used / stats['active_cap_limit'] * 100
+    print(f"  - Capital utilization: {cap_util:.1f}%")
 
-    print(f"\n📋 Funded bundles:")
+    print("\n📋 Funded bundles:")
     for i, bundle in enumerate(plan.funded_bundles, 1):
         print(
             f"  {i}. {bundle.market_condition_id} {bundle.bundle_type}: "

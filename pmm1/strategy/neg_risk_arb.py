@@ -17,7 +17,7 @@ Filters applied to avoid phantom liquidity:
 
 from __future__ import annotations
 
-import time
+from typing import Any
 
 import structlog
 from pydantic import BaseModel, Field
@@ -46,7 +46,7 @@ class NegRiskSignal(BaseModel):
     edge_pct: float = 0.0  # Edge as percentage of capital deployed
     max_size: float = 0.0
     is_actionable: bool = False
-    details: dict = Field(default_factory=dict)
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class NegRiskOrderIntent(BaseModel):

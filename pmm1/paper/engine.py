@@ -11,17 +11,17 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 import structlog
 
-from pmm1.state.books import BookManager, OrderBook
+from pmm1.state.books import BookManager
 
 logger = structlog.get_logger(__name__)
 
 
-class PaperSide(str, Enum):
+class PaperSide(StrEnum):
     BUY = "BUY"
     SELL = "SELL"
 
@@ -379,7 +379,10 @@ class PaperEngine:
             position_value=position_value,
             nav=nav,
             pnl=nav - self.initial_nav,
-            pnl_pct=((nav - self.initial_nav) / self.initial_nav * 100) if self.initial_nav > 0 else 0,
+            pnl_pct=(
+                ((nav - self.initial_nav) / self.initial_nav * 100)
+                if self.initial_nav > 0 else 0
+            ),
             num_positions=len([q for q in self.positions.values() if q > 0]),
             num_open_orders=len(self.orders),
             total_fills=len(self.fills),

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 
@@ -13,7 +14,11 @@ logger = structlog.get_logger(__name__)
 class NightlyCalibrator:
     """Runs calibration jobs daily at 03:00 UTC."""
 
-    def __init__(self, db, fill_hazard, fill_calibrator, toxicity_fitter=None):
+    def __init__(
+        self, db: Any, fill_hazard: Any,
+        fill_calibrator: Any,
+        toxicity_fitter: Any = None,
+    ) -> None:
         self.db = db
         self.fill_hazard = fill_hazard
         self.fill_calibrator = fill_calibrator
@@ -27,11 +32,11 @@ class NightlyCalibrator:
         if self._last_run is None:
             return True
         age_hours = (
-            datetime.now(timezone.utc) - self._last_run
+            datetime.now(UTC) - self._last_run
         ).total_seconds() / 3600
         return age_hours > 48
 
-    async def run_calibration(self) -> dict:
+    async def run_calibration(self) -> dict[str, object]:
         """Run all calibration jobs. Returns summary."""
         results: dict[str, object] = {}
 
@@ -60,15 +65,15 @@ class NightlyCalibrator:
                 logger.error("toxicity_calibration_failed", error=str(e))
                 results["toxicity_calibration"] = f"error: {e}"
 
-        self._last_run = datetime.now(timezone.utc)
+        self._last_run = datetime.now(UTC)
         self._is_stale = False
         logger.info("nightly_calibration_complete", results=results)
         return results
 
-    async def calibration_loop(self, run_hour_utc: int = 3):
+    async def calibration_loop(self, run_hour_utc: int = 3) -> None:
         """Background loop — runs calibration at specified UTC hour daily."""
         while True:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             # Calculate seconds until next run
             target = now.replace(
                 hour=run_hour_utc, minute=0, second=0, microsecond=0

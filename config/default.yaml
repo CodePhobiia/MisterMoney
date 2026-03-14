@@ -148,6 +148,7 @@ v3:
   redis_url: "redis://localhost:6379"
   min_confidence: 0.70               # Minimum confidence to use V3 signal (1 - uncertainty)
   signal_max_age_seconds: 300.0      # Max age before falling back to midpoint
+  blend_weight: 0.0                  # Paper 1: start at 0 (disabled), ramp to 0.33
 
 ops:
   runtime_status_path: "./data/runtime_status.json"

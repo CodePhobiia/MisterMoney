@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -15,6 +15,7 @@ from pmm2.shadow.valuation import (
     merge_market_contexts,
     shadow_quote_from_order,
 )
+from pmm2.v1_views import read_bot_state_nav
 
 logger = structlog.get_logger(__name__)
 
@@ -24,17 +25,17 @@ class V1StateSnapshot:
 
     @staticmethod
     def capture(
-        bot_state,
+        bot_state: Any,
         *,
         market_contexts: dict[str, MarketShadowContext | Any] | None = None,
-        queue_estimator=None,
-        fill_hazard=None,
+        queue_estimator: Any = None,
+        fill_hazard: Any = None,
         allocator_interval_sec: float = 60.0,
     ) -> dict[str, Any]:
         """Capture a rich V1 state snapshot for counterfactual analysis."""
 
-        snapshot = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+        snapshot: dict[str, Any] = {
+            "timestamp": datetime.now(UTC).isoformat(),
             "markets": set(),
             "orders": [],
             "positions": [],
@@ -66,7 +67,7 @@ class V1StateSnapshot:
             snapshot["nav"] = nav
             snapshot["nav_valid"] = nav > 0.0
 
-            quotes_by_market: dict[str, list] = {}
+            quotes_by_market: dict[str, list[Any]] = {}
 
             if hasattr(bot_state, "order_tracker"):
                 active_orders = list(bot_state.order_tracker.get_active_orders(token_id=None))
@@ -101,7 +102,11 @@ class V1StateSnapshot:
                         "price": shadow_quote.price,
                         "size": shadow_quote.size,
                         "capital_usdc": shadow_quote.capital_usdc,
-                        "status": getattr(getattr(order, "state", ""), "value", str(getattr(order, "state", ""))),
+                        "status": getattr(
+                            getattr(order, "state", ""),
+                            "value",
+                            str(getattr(order, "state", "")),
+                        ),
                         "is_scoring": bool(getattr(order, "is_scoring", False)),
                         "quote_role": shadow_quote.quote_role,
                         "fill_prob_30s": shadow_quote.fill_prob_30s,
@@ -193,7 +198,7 @@ class V1StateSnapshot:
 
     @staticmethod
     def _build_market_context_map(
-        bot_state,
+        bot_state: Any,
         *,
         market_contexts: dict[str, MarketShadowContext | Any] | None = None,
     ) -> dict[str, MarketShadowContext]:
@@ -227,11 +232,11 @@ class V1StateSnapshot:
 
     @staticmethod
     def _fill_probability_for_order(
-        order,
+        order: Any,
         context: MarketShadowContext | None,
         *,
-        queue_estimator=None,
-        fill_hazard=None,
+        queue_estimator: Any = None,
+        fill_hazard: Any = None,
     ) -> float:
         order_id = getattr(order, "order_id", "")
         if queue_estimator is not None:
@@ -263,22 +268,12 @@ class V1StateSnapshot:
         )
 
     @staticmethod
-    def _get_nav(bot_state) -> float:
+    def _get_nav(bot_state: Any) -> float:
         """Get current NAV from bot state."""
-
-        if hasattr(bot_state, "nav"):
-            return float(bot_state.nav)
-        if hasattr(bot_state, "wallet_balance"):
-            return float(bot_state.wallet_balance)
-        if hasattr(bot_state, "total_equity"):
-            return float(bot_state.total_equity)
-        if hasattr(bot_state, "inventory_manager") and hasattr(
-            bot_state.inventory_manager, "get_total_nav_estimate"
-        ):
-            return float(bot_state.inventory_manager.get_total_nav_estimate())
-
-        logger.warning("nav_not_available_returning_zero")
-        return 0.0
+        nav = read_bot_state_nav(bot_state)
+        if nav <= 0.0:
+            logger.warning("nav_not_available_returning_zero")
+        return nav
 
     @staticmethod
     def summarize(snapshot: dict[str, Any]) -> str:

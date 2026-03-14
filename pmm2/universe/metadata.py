@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 logger = structlog.get_logger(__name__)
 

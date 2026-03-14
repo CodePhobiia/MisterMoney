@@ -12,11 +12,11 @@
 MisterMoney currently contains multiple useful but fragmented data paths:
 
 - SQLite persistence for operational facts
-- Parquet recording for research / replay artifacts
-- fill recorder with 1s / 5s / 30s markouts
-- runtime status snapshots
+- Parquet recording for research and replay artifacts
+- Fill recorder with 1s / 5s / 30s markouts
+- Runtime status snapshots
 - PMM2 shadow cycle persistence
-- ad hoc logs for order lifecycle, suppressions, and ops alerts
+- Ad hoc logs for order lifecycle, suppressions, and ops alerts
 
 This is **not yet sufficient** for continuous strategy improvement at production quality.
 
@@ -39,12 +39,12 @@ This specification defines that missing system.
 MisterMoney will adopt an **append-only event-backed data spine** with derived fact tables, replay bundles, and operator-facing analytical models.
 
 ### Recommended stack
-- **Postgres + TimescaleDB** — durable operational analytics and fact storage
-- **Redis Streams** — hot event capture / bus / low-latency coordination
-- **Parquet** — cold archival raw events and replay bundles
-- **DuckDB** — offline analytical exploration on archived data
-- **Grafana / Metabase** — operator and performance dashboards
-- **dbt / SQL materializations** — reproducible fact models and diagnostics
+- **Postgres + TimescaleDB** - durable operational analytics and fact storage
+- **Redis Streams** - hot event capture, bus, and low-latency coordination
+- **Parquet** - cold archival raw events and replay bundles
+- **DuckDB** - offline analytical exploration on archived data
+- **Grafana / Metabase** - operator and performance dashboards
+- **dbt / SQL materializations** - reproducible fact models and diagnostics
 
 ### Core principle
 > Every meaningful quote, order, fill, suppression, risk adjustment, and PMM decision must become a queryable, replayable, lineage-bearing fact.
@@ -115,39 +115,41 @@ Correctness, auditability, and promotion safety outrank raw analytics performanc
 ## 5. High-Level Architecture
 
 ```text
-                ┌─────────────────────────┐
-                │   PMM1 / PMM2 Runtime   │
-                │  (decision + execution) │
-                └────────────┬────────────┘
-                             │
-                  canonical domain events
-                             │
-                ┌────────────▼────────────┐
-                │     Redis Streams       │
-                │   hot event transport   │
-                └────────────┬────────────┘
-                             │
-         ┌───────────────────┼───────────────────┐
-         │                   │                   │
-         ▼                   ▼                   ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│ Postgres /      │  │ Parquet Archive │  │ Runtime Status  │
-│ TimescaleDB     │  │ raw bundles     │  │ / Health Cache  │
-│ fact storage    │  │ replay inputs   │  │ Redis / JSON     │
-└────────┬────────┘  └────────┬────────┘  └─────────────────┘
-         │                    │
-         ▼                    ▼
-┌─────────────────┐  ┌─────────────────┐
-│ Materialized    │  │ Replay / Eval   │
-│ fact models     │  │ engines         │
-│ attribution     │  │ shadow analysis │
-└────────┬────────┘  └─────────────────┘
-         │
-         ▼
-┌────────────────────────────────────────┐
-│ Dashboards / Reports / Promotion Gates │
-│ Grafana / Metabase / dbt outputs       │
-└────────────────────────────────────────┘
++---------------------------+
+|   PMM1 / PMM2 Runtime     |
+|  decision + execution     |
++-------------+-------------+
+              |
+              v
+      canonical domain events
+              |
+              v
++---------------------------+
+|       Redis Streams       |
+|   hot transport / fanout  |
++-----+-------------+-------+
+      |             |
+      |             +--------------------+
+      |                                  |
+      v                                  v
++-------------------+          +-------------------+
+| Postgres /        |          | Parquet Archive   |
+| TimescaleDB       |          | raw events /      |
+| event + fact data |          | replay bundles    |
++---------+---------+          +---------+---------+
+          |                              |
+          v                              v
++-------------------+          +-------------------+
+| Materialized      |          | Replay / Eval     |
+| fact models       |          | engines           |
+| attribution       |          | shadow analysis   |
++---------+---------+          +-------------------+
+          |
+          v
++----------------------------------------------+
+| Dashboards / Reports / Promotion Gates       |
+| Grafana / Metabase / dbt outputs             |
++----------------------------------------------+
 ```
 
 ---
@@ -159,8 +161,8 @@ Correctness, auditability, and promotion safety outrank raw analytics performanc
 
 Use for:
 - canonical event log
-- order/fill/quote/market/cycle facts
-- PMM2 shadow/canary diagnostics
+- order / fill / quote / market / cycle facts
+- PMM2 shadow / canary diagnostics
 - markout / attribution metrics
 - materialized views and read models
 
@@ -168,7 +170,7 @@ Use for:
 - strong relational semantics
 - good time-series ergonomics
 - suitable for joins between orders, fills, market state, and controller metadata
-- aligned with repository direction already described in V3/V4 docs
+- aligned with repository direction already described in V3 / V4 docs
 
 ## 6.2 Redis Streams
 **Role:** hot event transport and short-lived coordination.
@@ -220,20 +222,20 @@ All important runtime facts must be captured as append-only events.
 ## 7.1 Event envelope
 Every event MUST include:
 
-- `event_id` — UUID
-- `event_type` — stable domain event name
-- `ts_event` — event-time in UTC
-- `ts_ingest` — ingestion-time in UTC
-- `controller` — `v1`, `pmm2_shadow`, `pmm2_canary`, `pmm2_production`, etc.
-- `strategy` — fine-grained strategy label
-- `session_id` — runtime session identifier
-- `git_sha` — exact code revision
-- `config_hash` — normalized config snapshot hash
-- `run_stage` — `shadow`, `canary_5pct`, `production`, etc.
-- `condition_id` — when applicable
-- `token_id` — when applicable
-- `order_id` — when applicable
-- `payload_json` — event-specific structured payload
+- `event_id` - UUID
+- `event_type` - stable domain event name
+- `ts_event` - event-time in UTC
+- `ts_ingest` - ingestion-time in UTC
+- `controller` - `v1`, `pmm2_shadow`, `pmm2_canary`, `pmm2_production`, etc.
+- `strategy` - fine-grained strategy label
+- `session_id` - runtime session identifier
+- `git_sha` - exact code revision
+- `config_hash` - normalized config snapshot hash
+- `run_stage` - `shadow`, `canary_5pct`, `production`, etc.
+- `condition_id` - when applicable
+- `token_id` - when applicable
+- `order_id` - when applicable
+- `payload_json` - event-specific structured payload
 
 ## 7.2 Event families
 
@@ -337,7 +339,7 @@ One row per logical order.
 ### Purpose
 - order lifecycle analytics
 - churn analysis
-- strategy/controller attribution
+- strategy / controller attribution
 
 ---
 
@@ -578,7 +580,7 @@ Hot operational state should live in Redis / runtime caches, not be re-derived f
 - latest PMM2 controller status
 
 ### Do not treat Redis as truth
-Redis is a serving/cache layer only.
+Redis is a serving / cache layer only.
 
 ---
 
@@ -588,7 +590,7 @@ Redis is a serving/cache layer only.
 Every replayable bundle should include:
 - event slice from `event_log`
 - referenced config snapshot
-- referenced model/scorer snapshots
+- referenced model / scorer snapshots
 - relevant book snapshots
 - relevant market metadata snapshots
 - controller stage metadata
@@ -649,7 +651,7 @@ Support comparisons between:
 Produce:
 - top churn markets
 - worst adverse-selection markets
-- stale-book suppression rate by market/theme
+- stale-book suppression rate by market / theme
 - reward market underperformance report
 - fill-probability calibration error report
 - PMM2 shadow-vs-live disagreement report
@@ -687,7 +689,7 @@ Should show:
 
 ## 13.2 Strategy dashboard
 Should show:
-- fills by market/theme/controller
+- fills by market / theme / controller
 - markouts by horizon
 - reward capture
 - suppressions by reason
@@ -740,32 +742,32 @@ Replay tool for event ranges / sessions.
 Compute fill / markout / reward / churn attribution over a chosen window.
 
 ## 15.4 `mm-promotion-report`
-Produce a canary/shadow promotion report using current gates and minimum sample thresholds.
+Produce a canary / shadow promotion report using current gates and minimum sample thresholds.
 
 ---
 
 ## 16. Recommended Implementation Phases
 
-## Phase A — Truth spine MVP
+## Phase A - Truth spine MVP
 - introduce `event_log`
 - emit canonical events from PMM1 and PMM2
 - add `config_snapshot`
 - attach `git_sha`, `config_hash`, `controller`
 
-## Phase B — Fact tables
+## Phase B - Fact tables
 - materialize `order_fact`, `fill_fact`, `quote_fact`, `market_cycle_fact`, `shadow_cycle_fact`
 
-## Phase C — Dashboard layer
+## Phase C - Dashboard layer
 - operator dashboard
 - strategy dashboard
 - PMM2 dashboard
 
-## Phase D — Replay layer
+## Phase D - Replay layer
 - replay bundles
 - deterministic cycle replay
 - scorer comparison tooling
 
-## Phase E — Continuous improvement layer
+## Phase E - Continuous improvement layer
 - nightly calibration jobs
 - attribution reports
 - promotion report generation
@@ -774,15 +776,15 @@ Produce a canary/shadow promotion report using current gates and minimum sample 
 
 ## 17. Practical Recommendation
 
-MisterMoney should build this system now as a **MisterMoney Performance Spine**, not as “more logging.”
+MisterMoney should build this system now as a **MisterMoney Performance Spine**, not as "more logging."
 
 ### Recommended concrete stack
-- **Postgres + TimescaleDB** — primary durable analytics store
-- **Redis Streams** — live event capture and hot event bus
-- **Parquet** — cold archive + replay bundles
-- **DuckDB** — offline investigations and model-fitting exploration
-- **Grafana / Metabase** — dashboards
-- **dbt / SQL materializations** — reproducible fact models
+- **Postgres + TimescaleDB** - primary durable analytics store
+- **Redis Streams** - live event capture and hot event bus
+- **Parquet** - cold archive and replay bundles
+- **DuckDB** - offline investigations and model-fitting exploration
+- **Grafana / Metabase** - dashboards
+- **dbt / SQL materializations** - reproducible fact models
 
 ### Minimum required durable tables
 - `event_log`

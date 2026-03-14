@@ -9,6 +9,7 @@ Sign convention: positive = adverse (we lost), negative = favorable
 from __future__ import annotations
 
 import time
+from datetime import UTC
 
 import structlog
 
@@ -35,9 +36,9 @@ async def compute_toxicity(
     cutoff_ts = time.time() - lookback_sec
 
     # Convert to ISO8601 for query
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    cutoff_iso = datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).isoformat()
+    cutoff_iso = datetime.fromtimestamp(cutoff_ts, tz=UTC).isoformat()
 
     # Query recent fills with markouts
     sql = """
@@ -86,4 +87,4 @@ async def compute_toxicity(
     # Floor at zero — negative toxicity (favorable selection) should not
     # inflate EV; it's an unreliable signal that turns structural cost
     # into phantom revenue.
-    return max(0.0, weighted_markout)
+    return float(max(0.0, weighted_markout))

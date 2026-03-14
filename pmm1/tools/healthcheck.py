@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import json
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -50,6 +49,13 @@ def _format_text(report: dict[str, Any], status_path: str) -> str:
         f"severity={report['severity']}",
         f"status_path={status_path}",
     ]
+    config = report.get("config", {})
+    resolved_config_path = config.get("resolved_config_path")
+    if resolved_config_path:
+        lines.append(f"resolved_config_path={resolved_config_path}")
+    config_hash = config.get("config_hash")
+    if config_hash:
+        lines.append(f"config_hash={config_hash}")
     age_seconds = report.get("age_seconds")
     if age_seconds is not None:
         lines.append(f"age_seconds={age_seconds:.1f}")
@@ -114,6 +120,7 @@ async def amain() -> None:
             service_active=_service_active(args.service),
         )
         report["status_path"] = status_path
+        report["config"] = dict(snapshot.get("config", {}))
 
     if args.notify:
         await _maybe_notify(report)

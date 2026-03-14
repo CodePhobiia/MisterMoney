@@ -40,12 +40,12 @@ class FillEscalator:
 
     Usage:
         escalator = FillEscalator(config)
-        
+
         # In quote loop:
         improvement_ticks = escalator.get_escalation_ticks()
         bid_price += improvement_ticks * tick_size
         ask_price -= improvement_ticks * tick_size
-        
+
         # In fill callback:
         escalator.record_fill()
 

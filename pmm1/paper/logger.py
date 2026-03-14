@@ -10,7 +10,6 @@ Output files in data/paper/:
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
@@ -101,7 +100,7 @@ class PaperLogger:
         condition_id: str = "",
         event_id: str = "",
         edge: float = 0.0,
-        orders: list[dict] | None = None,
+        orders: list[dict[str, Any]] | None = None,
         details: dict[str, Any] | None = None,
     ) -> None:
         """Log an arb opportunity detection."""

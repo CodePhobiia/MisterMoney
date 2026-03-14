@@ -1,6 +1,7 @@
 """Resolution cost computation — risk from market ambiguity and time to resolution.
 
-C_res = α₁ * ambiguity + α₂ / max(hours_to_resolution, 6) + α₃ * dispute_risk + α₄ * neg_risk_placeholder
+C_res = α₁ * ambiguity + α₂ / max(hours_to_resolution, 6)
+      + α₃ * dispute_risk + α₄ * neg_risk_placeholder
 """
 
 from __future__ import annotations

@@ -172,21 +172,60 @@ class QuoteEngine:
         volatility_regime: str = "normal",
         time_to_catalyst_hours: float = float("inf"),
         fair_value: float = 0.5,
+        market_price: float = 0.0,
+        nav: float = 0.0,
+        edge_confidence: float = 1.0,
     ) -> float:
-        """Compute quote size in SHARES, targeting a dollar exposure.
+        """Compute quote size in SHARES.
 
-        Dollar-based: target $8 per market → shares = $8 / price.
-        Adjusted for confidence, inventory, volatility, time-to-catalyst.
+        Two modes:
+        - Kelly (kelly_enabled=True): edge-proportional sizing
+          from Paper 2, §1. Bets more on larger edges.
+        - Dollar-flat (default): target $8 per market per side,
+          independent of edge magnitude.
+
+        Both modes apply the same downstream adjustments:
+        confidence, inventory, volatility, time-to-catalyst.
         """
-        price = max(0.01, fair_value)  # avoid division by zero
+        price = max(0.01, fair_value)
         k = self.size_decay_k
 
-        # Dollar-based: convert target dollars to shares at current price
-        target_shares = self.target_dollar_size / price
+        cfg = self.config
+        if (
+            cfg.kelly_enabled
+            and nav > 0
+            and market_price > 0
+        ):
+            # Kelly sizing (Paper 2 §1 + §2)
+            from pmm1.math.kelly import kelly_bet_dollars
+
+            _, dollar_size = kelly_bet_dollars(
+                p_true=fair_value,
+                p_market=market_price,
+                nav=nav,
+                lambda_frac=(
+                    cfg.kelly_fraction * edge_confidence
+                ),
+                adverse_selection_lambda=(
+                    cfg.kelly_adverse_selection_lambda
+                ),
+                min_edge=cfg.kelly_min_edge,
+                max_position_nav=cfg.kelly_max_position_nav,
+            )
+            if dollar_size <= 0:
+                return 0.0
+            target_shares = dollar_size / price
+        else:
+            # Dollar-flat sizing (original)
+            target_shares = self.target_dollar_size / price
+
         max_shares = self.max_dollar_size / price
 
-        # Adjust for confidence, rewards, inventory
-        size = (target_shares * confidence * reward_boost) / (1.0 + k * abs(market_inventory))
+        # Apply shared adjustments
+        size = (
+            (target_shares * confidence * reward_boost)
+            / (1.0 + k * abs(market_inventory))
+        )
 
         # Volatility discount
         vol_multiplier = {
@@ -221,6 +260,9 @@ class QuoteEngine:
         neg_risk: bool = False,
         condition_id: str = "",
         position_age_hours: float = 0.0,
+        market_price: float = 0.0,
+        nav: float = 0.0,
+        edge_confidence: float = 1.0,
     ) -> QuoteIntent:
         """Compute full two-sided quote intent.
 
@@ -269,10 +311,12 @@ class QuoteEngine:
         if bid_price >= ask_price:
             mid = (bid_price + ask_price) / 2.0
             bid_price = float(
-                (Decimal(str(mid - tick_size)) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+                (Decimal(str(mid - tick_size)) / tick)
+                .to_integral_value(rounding=ROUND_FLOOR) * tick
             )
             ask_price = float(
-                (Decimal(str(mid + tick_size)) / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+                (Decimal(str(mid + tick_size)) / tick)
+                .to_integral_value(rounding=ROUND_CEILING) * tick
             )
 
         # 4. Size (dollar-based)
@@ -284,6 +328,9 @@ class QuoteEngine:
             volatility_regime=features.vol_regime,
             time_to_catalyst_hours=features.time_to_resolution_hours,
             fair_value=fair_value,
+            market_price=market_price,
+            nav=nav,
+            edge_confidence=edge_confidence,
         )
 
         # Asymmetric sizing: smaller on the side with more inventory
@@ -303,13 +350,13 @@ class QuoteEngine:
         ask_size = max(1.0, round(ask_size, 2))
 
         # Enforce Polymarket minimums: min 5 shares AND min $1 dollar value
-        MIN_SHARES = 5.0
-        MIN_DOLLAR = 1.5
+        min_shares = 5.0
+        min_dollar = 1.5
         if bid_price > 0:
-            min_bid_shares = max(MIN_SHARES, MIN_DOLLAR / bid_price)
+            min_bid_shares = max(min_shares, min_dollar / bid_price)
             bid_size = max(bid_size, min_bid_shares)
         if ask_price > 0:
-            min_ask_shares = max(MIN_SHARES, MIN_DOLLAR / ask_price)
+            min_ask_shares = max(min_shares, min_dollar / ask_price)
             ask_size = max(ask_size, min_ask_shares)
 
         intent = QuoteIntent(

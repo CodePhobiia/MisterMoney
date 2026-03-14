@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
+
+if TYPE_CHECKING:
+    from pmm1.storage.spine import SpineEvent
 
 logger = structlog.get_logger(__name__)
 
@@ -38,6 +41,7 @@ class RedisStateStore:
     KEY_BOT_STATE = "pmm1:bot_state"
     KEY_NAV = "pmm1:nav"
     KEY_KILL_SWITCH = "pmm1:kill_switch"
+    KEY_SPINE_STREAM = "pmm1:spine:events"
 
     def __init__(self, redis_url: str = "redis://localhost:6379/0") -> None:
         self._url = redis_url
@@ -92,7 +96,7 @@ class RedisStateStore:
         client = await self._ensure_connected()
         data = await client.get(f"{self.PREFIX_BOOK}{token_id}")
         if data:
-            return json.loads(data)
+            return cast(dict[str, Any], json.loads(data))
         return None
 
     # ── Order State ──
@@ -103,7 +107,10 @@ class RedisStateStore:
         order_data["updated_at"] = time.time()
         await client.hset(
             f"{self.PREFIX_ORDER}{order_id}",
-            mapping={k: json.dumps(v) if isinstance(v, (dict, list)) else str(v) for k, v in order_data.items()},
+            mapping={
+                k: json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+                for k, v in order_data.items()
+            },
         )
         # Index by token
         token_id = order_data.get("token_id", "")
@@ -164,7 +171,7 @@ class RedisStateStore:
         client = await self._ensure_connected()
         data = await client.get(f"{self.PREFIX_MARKET}{condition_id}")
         if data:
-            return json.loads(data)
+            return cast(dict[str, Any], json.loads(data))
         return None
 
     # ── Feature Cache ──
@@ -188,7 +195,7 @@ class RedisStateStore:
         client = await self._ensure_connected()
         data = await client.get(f"{self.PREFIX_FEATURE}{token_id}")
         if data:
-            return json.loads(data)
+            return cast(dict[str, Any], json.loads(data))
         return None
 
     # ── Position State ──
@@ -211,7 +218,7 @@ class RedisStateStore:
         client = await self._ensure_connected()
         data = await client.get(f"{self.PREFIX_POSITION}{condition_id}")
         if data:
-            return json.loads(data)
+            return cast(dict[str, Any], json.loads(data))
         return None
 
     # ── Bot State ──
@@ -227,7 +234,7 @@ class RedisStateStore:
         client = await self._ensure_connected()
         data = await client.get(self.KEY_BOT_STATE)
         if data:
-            return json.loads(data)
+            return cast(dict[str, Any], json.loads(data))
         return None
 
     # ── NAV ──
@@ -245,7 +252,7 @@ class RedisStateStore:
         client = await self._ensure_connected()
         data = await client.get(self.KEY_NAV)
         if data:
-            return json.loads(data).get("nav")
+            return cast(float | None, json.loads(data).get("nav"))
         return None
 
     # ── Kill Switch ──
@@ -264,5 +271,108 @@ class RedisStateStore:
         client = await self._ensure_connected()
         data = await client.get(self.KEY_KILL_SWITCH)
         if data:
-            return json.loads(data)
+            return cast(dict[str, Any], json.loads(data))
         return None
+
+    # Redis Streams - data spine transport
+
+    async def append_spine_stream_event(
+        self,
+        event: SpineEvent | dict[str, Any],
+        *,
+        stream_key: str | None = None,
+        maxlen: int | None = 100_000,
+    ) -> str:
+        """Append one canonical spine event to a Redis Stream."""
+        from pmm1.storage.spine import SpineEvent as SpineEventModel
+
+        payload = (
+            event if isinstance(event, SpineEventModel)
+            else SpineEventModel.model_validate(event)
+        )
+        client = await self._ensure_connected()
+        fields = {
+            "event_id": payload.event_id,
+            "event_type": payload.event_type,
+            "ts_event": payload.ts_event.isoformat(),
+            "ts_ingest": payload.ts_ingest.isoformat(),
+            "controller": payload.controller,
+            "strategy": payload.strategy,
+            "session_id": payload.session_id,
+            "git_sha": payload.git_sha,
+            "config_hash": payload.config_hash,
+            "run_stage": payload.run_stage,
+            "condition_id": payload.condition_id or "",
+            "token_id": payload.token_id or "",
+            "order_id": payload.order_id or "",
+            "payload_json": json.dumps(payload.payload_json, sort_keys=True),
+        }
+        kwargs: dict[str, Any] = {}
+        if maxlen is not None:
+            kwargs = {"maxlen": maxlen, "approximate": True}
+        return cast(str, await client.xadd(stream_key or self.KEY_SPINE_STREAM, fields, **kwargs))
+
+    async def ensure_spine_consumer_group(
+        self,
+        group_name: str,
+        *,
+        stream_key: str | None = None,
+        start_id: str = "0",
+    ) -> None:
+        """Create a Redis Streams consumer group if it does not already exist."""
+        client = await self._ensure_connected()
+        try:
+            await client.xgroup_create(
+                stream_key or self.KEY_SPINE_STREAM,
+                group_name,
+                id=start_id,
+                mkstream=True,
+            )
+        except Exception as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+
+    async def read_spine_stream(
+        self,
+        *,
+        stream_key: str | None = None,
+        group_name: str | None = None,
+        consumer_name: str | None = None,
+        start_id: str = ">",
+        count: int = 100,
+        block_ms: int = 1000,
+    ) -> list[tuple[str, dict[str, str]]]:
+        """Read spine events from Redis Streams."""
+        client = await self._ensure_connected()
+        target_stream = stream_key or self.KEY_SPINE_STREAM
+        if group_name and consumer_name:
+            streams = await client.xreadgroup(
+                group_name,
+                consumer_name,
+                {target_stream: start_id},
+                count=count,
+                block=block_ms,
+            )
+        else:
+            streams = await client.xread(
+                {target_stream: start_id},
+                count=count,
+                block=block_ms,
+            )
+
+        events: list[tuple[str, dict[str, str]]] = []
+        for _, entries in streams:
+            for event_id, fields in entries:
+                events.append((event_id, fields))
+        return events
+
+    async def ack_spine_stream_event(
+        self,
+        event_id: str,
+        *,
+        group_name: str,
+        stream_key: str | None = None,
+    ) -> int:
+        """Acknowledge one spine event in a consumer group."""
+        client = await self._ensure_connected()
+        return int(await client.xack(stream_key or self.KEY_SPINE_STREAM, group_name, event_id))

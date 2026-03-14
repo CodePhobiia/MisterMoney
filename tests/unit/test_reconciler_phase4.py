@@ -7,6 +7,7 @@ import asyncio
 from pmm1.execution.reconciler import Reconciler
 from pmm1.state.orders import OrderTracker, TrackedOrder
 from pmm1.state.positions import PositionTracker
+from pmm1.storage.spine import SpineEmitter
 
 
 class _FakeClobClient:
@@ -30,6 +31,20 @@ class _FakeKillSwitch:
 
     def report_reconciliation_clean(self) -> None:
         self.clean_calls += 1
+
+
+class _FakeSpineStore:
+    def __init__(self) -> None:
+        self.events = []
+
+    async def append_spine_event(self, event) -> None:
+        self.events.append(event)
+
+    async def upsert_config_snapshot(self, snapshot) -> None:
+        return None
+
+    async def upsert_model_snapshot(self, snapshot) -> None:
+        return None
 
 
 def test_reconciler_resets_order_mismatch_streak_after_clean_cycle():
@@ -101,3 +116,50 @@ def test_reconciler_only_trips_kill_switch_after_persistent_order_mismatches():
         asyncio.run(reconciler.reconcile_orders())
 
     assert kill_switch.mismatch_calls == ["orders: 0 unknown, 1 missing"]
+
+
+def test_reconciler_emits_spine_events_for_clean_and_mismatch_cycles():
+    order_tracker = OrderTracker()
+    order_tracker.track_submitted(
+        TrackedOrder(
+            order_id="order-1",
+            token_id="token-1",
+            condition_id="condition-1",
+            side="BUY",
+            price="0.50",
+            original_size="10",
+            strategy="mm",
+        )
+    )
+    spine_store = _FakeSpineStore()
+    spine = SpineEmitter(
+        spine_store,
+        session_id="20260313_120000",
+        git_sha="sha-1",
+        config_hash="cfg-1",
+    )
+    reconciler = Reconciler(
+        clob_client=_FakeClobClient(),
+        data_client=_FakeDataClient(),
+        order_tracker=order_tracker,
+        position_tracker=PositionTracker(),
+        spine_emitter=spine,
+    )
+
+    asyncio.run(reconciler.reconcile_orders())
+    mismatch_event = spine_store.events[-1]
+    assert mismatch_event.event_type == "position_mismatch_detected"
+    assert mismatch_event.payload_json["kind"] == "orders"
+
+    # A clean cycle should emit a reconciled event.
+    clean_reconciler = Reconciler(
+        clob_client=_FakeClobClient(),
+        data_client=_FakeDataClient(),
+        order_tracker=OrderTracker(),
+        position_tracker=PositionTracker(),
+        spine_emitter=spine,
+    )
+    asyncio.run(clean_reconciler.reconcile_orders())
+    clean_event = spine_store.events[-1]
+    assert clean_event.event_type == "position_reconciled"
+    assert clean_event.payload_json["kind"] == "orders"

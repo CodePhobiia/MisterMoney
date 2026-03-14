@@ -6,7 +6,7 @@ import os
 
 from pmm2.config import PMM2Config, load_pmm2_config
 from pmm2.planner import DiffEngine, QuotePlanner, TargetQuotePlan
-from pmm2.runtime import PMM2Runtime, V1Bridge, maybe_init_pmm2
+from pmm2.runtime import PMM2Runtime, V1Bridge
 
 
 def test_config(monkeypatch=None):
@@ -49,7 +49,6 @@ def test_quote_planner():
     print("\n=== Testing QuotePlanner ===")
 
     from pmm2.scorer.bundles import QuoteBundle
-    from pmm2.universe.metadata import EnrichedMarket
 
     planner = QuotePlanner(max_reprices_per_minute=3)
 
@@ -97,7 +96,7 @@ def test_diff_engine():
     """Test DiffEngine."""
     print("\n=== Testing DiffEngine ===")
 
-    from pmm2.planner import QuoteLadderRung, TargetQuotePlan
+    from pmm2.planner import QuoteLadderRung
 
     diff = DiffEngine()
 
@@ -174,7 +173,6 @@ def test_runtime_init():
     """Test PMM2Runtime initialization."""
     print("\n=== Testing PMM2Runtime ===")
 
-    from pmm1.storage.database import Database
 
     config = PMM2Config(
         enabled=True,

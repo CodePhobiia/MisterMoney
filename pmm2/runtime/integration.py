@@ -15,6 +15,8 @@ DO NOT modify main.py in this sprint — just provide the hooks.
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 
 from pmm2.config import load_pmm2_config
@@ -24,7 +26,7 @@ from pmm2.runtime.v1_bridge import V1Bridge
 logger = structlog.get_logger(__name__)
 
 
-async def maybe_init_pmm2(settings, db, bot_state) -> PMM2Runtime | None:
+async def maybe_init_pmm2(settings: Any, db: Any, bot_state: Any) -> PMM2Runtime | None:
     """Initialize PMM-2 if enabled in config.
 
     Checks config for pmm2.enabled flag.
@@ -38,18 +40,16 @@ async def maybe_init_pmm2(settings, db, bot_state) -> PMM2Runtime | None:
     Returns:
         PMM2Runtime instance if enabled, None otherwise
     """
+    if not hasattr(settings, "raw_config"):
+        raise RuntimeError("settings_missing_raw_config")
+
+    config = load_pmm2_config(settings.raw_config)
+
+    if not config.enabled:
+        logger.info("pmm2_disabled_in_config")
+        return None
+
     try:
-        # Load config
-        if not hasattr(settings, "raw_config"):
-            logger.warning("settings_missing_raw_config")
-            return None
-
-        config = load_pmm2_config(settings.raw_config)
-
-        if not config.enabled:
-            logger.info("pmm2_disabled_in_config")
-            return None
-
         # Create V1 bridge
         order_manager = getattr(bot_state, "order_manager", None)
         risk_limits = getattr(bot_state, "risk_limits", None)
@@ -67,7 +67,12 @@ async def maybe_init_pmm2(settings, db, bot_state) -> PMM2Runtime | None:
         )
 
         # Create runtime
-        runtime = PMM2Runtime(config, db, bridge)
+        runtime = PMM2Runtime(
+            config,
+            db,
+            bridge,
+            spine_emitter=getattr(bot_state, "spine", None),
+        )
 
         # Start all loops
         tasks = await runtime.start(bot_state, settings)
@@ -84,8 +89,16 @@ async def maybe_init_pmm2(settings, db, bot_state) -> PMM2Runtime | None:
         return runtime
 
     except Exception as e:
-        logger.error("pmm2_init_failed", error=str(e), exc_info=True)
-        return None
+        logger.error(
+            "pmm2_init_failed",
+            enabled=config.enabled,
+            shadow=config.shadow_mode,
+            controller=config.controller_label,
+            stage=config.stage_name,
+            error=str(e),
+            exc_info=True,
+        )
+        raise
 
 
 def pmm2_on_book_delta(
@@ -94,7 +107,7 @@ def pmm2_on_book_delta(
     price: float,
     old_size: float,
     new_size: float,
-):
+) -> None:
     """Forward book delta to PMM-2 queue estimator.
 
     Called from book WS handler in main.py.
@@ -115,7 +128,10 @@ def pmm2_on_fill(
     order_id: str,
     fill_size: float,
     fill_price: float,
-):
+    *,
+    token_id: str = "",
+    condition_id: str = "",
+) -> None:
     """Forward fill event to PMM-2.
 
     Called from fill WS handler in main.py.
@@ -127,7 +143,13 @@ def pmm2_on_fill(
         fill_price: fill price
     """
     if runtime:
-        runtime.on_fill(order_id, fill_size, fill_price)
+        runtime.on_fill(
+            order_id,
+            fill_size,
+            fill_price,
+            token_id=token_id,
+            condition_id=condition_id,
+        )
 
 
 def pmm2_on_order_live(
@@ -138,7 +160,9 @@ def pmm2_on_order_live(
     price: float,
     size: float,
     book_depth: float,
-):
+    *,
+    condition_id: str = "",
+) -> None:
     """Forward order-live event to PMM-2.
 
     Called when an order goes live (after placement confirmation).
@@ -153,10 +177,18 @@ def pmm2_on_order_live(
         book_depth: visible size at this price level
     """
     if runtime:
-        runtime.on_order_live(order_id, token_id, side, price, size, book_depth)
+        runtime.on_order_live(
+            order_id,
+            token_id,
+            side,
+            price,
+            size,
+            book_depth,
+            condition_id=condition_id,
+        )
 
 
-def pmm2_on_order_canceled(runtime: PMM2Runtime | None, order_id: str):
+def pmm2_on_order_canceled(runtime: PMM2Runtime | None, order_id: str) -> None:
     """Forward order-canceled event to PMM-2.
 
     Called when an order is canceled (user action or exchange).

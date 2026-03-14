@@ -12,6 +12,7 @@ Produces human-readable summaries of shadow mode performance:
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import structlog
 
@@ -21,7 +22,7 @@ logger = structlog.get_logger(__name__)
 class ShadowDashboard:
     """Generate shadow mode status for Telegram reporting."""
 
-    def __init__(self, counterfactual):
+    def __init__(self, counterfactual: Any) -> None:
         """Initialize shadow dashboard.
 
         Args:
@@ -49,6 +50,7 @@ class ShadowDashboard:
         """
         summary = self.cf.get_summary()
         gates = self.cf.get_gates_status()
+        promotion = self.cf.get_promotion_diagnostics()
 
         # Count gates passed
         gates_passed = sum(1 for g in gates.values() if g)
@@ -64,7 +66,8 @@ class ShadowDashboard:
         # Positive EV gate
         ev_emoji = "✅" if gates.get("gate_ev_positive", False) else "⏳"
         lines.append(
-            f"{ev_emoji} {summary['positive_ev_pct']:.1f}% positive EV ({summary['ev_sample_count']} samples)"
+            f"{ev_emoji} {summary['positive_ev_pct']:.1f}% positive EV "
+            f"({summary['ev_sample_count']} samples)"
         )
 
         # EV delta
@@ -76,7 +79,9 @@ class ShadowDashboard:
         reward_improvement = summary["avg_reward_market_delta"]
         reward_sign = "+" if reward_improvement >= 0 else ""
         lines.append(
-            f"{reward_emoji} Reward delta: {reward_sign}{reward_improvement:.1f} markets / ${summary['avg_reward_ev_delta_usdc']:+.4f}"
+            f"{reward_emoji} Reward delta: "
+            f"{reward_sign}{reward_improvement:.1f} markets "
+            f"/ ${summary['avg_reward_ev_delta_usdc']:+.4f}"
         )
 
         # Churn reduction
@@ -90,16 +95,21 @@ class ShadowDashboard:
         overlap = summary["avg_market_overlap"]
         lines.append(f"🎯 Market overlap: {overlap:.1%}")
         lines.append(
-            f"🪞 Quote gap: {summary['avg_overlap_quote_distance_bps']:.1f} bps on overlapping markets"
+            f"🪞 Quote gap: "
+            f"{summary['avg_overlap_quote_distance_bps']:.1f} bps "
+            f"on overlapping markets"
         )
 
-        # Launch readiness
+        # Shadow diagnostics
         lines.append("")
-        if summary["ready_for_live"]:
-            lines.append(f"Launch readiness: ✅ *READY* ({gates_passed}/{total_gates} gates passed)")
+        if summary["diagnostic_ready"]:
+            lines.append(
+                f"Shadow diagnostics: ✅ Ready "
+                f"({gates_passed}/{total_gates} gates passed)"
+            )
         else:
             lines.append(
-                f"Launch readiness: ⏳ Not ready ({gates_passed}/{total_gates} gates passed)"
+                f"Shadow diagnostics: ⏳ Not ready ({gates_passed}/{total_gates} gates passed)"
             )
 
             # Show which gates are blocking
@@ -116,9 +126,23 @@ class ShadowDashboard:
             if blocking:
                 lines.append(f"Blocking: {', '.join(blocking)}")
 
+        lines.append(
+            f"Promotion gate: {'✅ READY' if summary['ready_for_live'] else '⏳ Not ready'} "
+            f"({summary['shadow_days_observed']:.1f}/10.0 days observed)"
+        )
+        lines.append(
+            f"Observed fills: {summary['fill_count_observed']} "
+            f"across {len(summary['unique_fill_markets_observed'])} markets"
+        )
+        if promotion["blocking_gates"]:
+            lines.append(f"Promotion blockers: {', '.join(promotion['blocking_gates'])}")
+
         return "\n".join(lines)
 
-    async def send_daily_shadow_report(self, chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")):
+    async def send_daily_shadow_report(
+        self,
+        chat_id: str = os.getenv("TELEGRAM_CHAT_ID", ""),
+    ) -> None:
         """Send daily shadow mode report via Telegram.
 
         Args:
@@ -143,7 +167,7 @@ class ShadowDashboard:
                 exc_info=True,
             )
 
-    async def send_milestone_report(self, milestone: int):
+    async def send_milestone_report(self, milestone: int) -> None:
         """Send a report when reaching a cycle milestone.
 
         Args:
@@ -174,7 +198,7 @@ class ShadowDashboard:
                 exc_info=True,
             )
 
-    def get_detailed_metrics(self) -> dict[str, any]:
+    def get_detailed_metrics(self) -> dict[str, Any]:
         """Get detailed metrics for programmatic access.
 
         Returns:

@@ -6,7 +6,7 @@ Async SQLite using aiosqlite for storing fills, book snapshots, scoring history,
 from __future__ import annotations
 
 import inspect
-import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -27,9 +27,9 @@ class Database:
         """
         self.db_path = Path(db_path)
         self._conn: aiosqlite.Connection | None = None
-        self._on_write_failure = None
+        self._on_write_failure: Callable[..., Any] | None = None
 
-    def set_on_write_failure(self, callback) -> None:
+    def set_on_write_failure(self, callback: Callable[..., Any] | None) -> None:
         """Register an optional callback for failed write operations."""
         self._on_write_failure = callback
 
@@ -51,7 +51,7 @@ class Database:
 
         # Connect to database
         self._conn = await aiosqlite.connect(str(self.db_path))
-        
+
         # Enable WAL mode for better concurrency
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.commit()
@@ -62,7 +62,7 @@ class Database:
             logger.error("schema_file_not_found", path=str(schema_path))
             raise FileNotFoundError(f"Schema file not found: {schema_path}")
 
-        with open(schema_path, "r") as f:
+        with open(schema_path) as f:
             schema_sql = f.read()
 
         # Execute schema (creates tables if they don't exist)
@@ -79,6 +79,7 @@ class Database:
             raise RuntimeError("Database not initialized. Call init() first.")
 
         await self._migrate_allocation_decision_table()
+        await self._migrate_fill_record_table()
         await self._conn.commit()
 
     async def _migrate_allocation_decision_table(self) -> None:
@@ -115,6 +116,53 @@ class Database:
             logger.info(
                 "database_schema_migrated",
                 table="allocation_decision",
+                added_columns=added_columns,
+            )
+
+    async def _migrate_fill_record_table(self) -> None:
+        """Extend fill_record with canonical identity and ingest-state columns."""
+        if not self._conn:
+            raise RuntimeError("Database not initialized. Call init() first.")
+
+        cursor = await self._conn.execute("PRAGMA table_info(fill_record)")
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+        if not rows:
+            return
+
+        existing = {row[1] for row in rows}
+        required_columns = {
+            "exchange_trade_id": "TEXT DEFAULT ''",
+            "fill_identity": "TEXT",
+            "fee_known": "INTEGER DEFAULT 1",
+            "fee_source": "TEXT DEFAULT 'unknown'",
+            "ingest_state": "TEXT DEFAULT 'applied'",
+            "raw_event_json": "TEXT",
+            "resolved_at": "TEXT",
+        }
+
+        added_columns: list[str] = []
+        for column, column_type in required_columns.items():
+            if column in existing:
+                continue
+            await self._conn.execute(
+                f"ALTER TABLE fill_record ADD COLUMN {column} {column_type}"
+            )
+            added_columns.append(column)
+
+        await self._conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_fill_record_identity
+            ON fill_record(fill_identity)
+            WHERE fill_identity IS NOT NULL AND fill_identity != ''
+            """
+        )
+
+        if added_columns:
+            logger.info(
+                "database_schema_migrated",
+                table="fill_record",
                 added_columns=added_columns,
             )
 
@@ -204,11 +252,11 @@ class Database:
                 cursor = await self._conn.execute(sql)
 
             rows = await cursor.fetchall()
-            
+
             # Convert rows to dicts using column names
             columns = [desc[0] for desc in cursor.description]
             result = [dict(zip(columns, row)) for row in rows]
-            
+
             await cursor.close()
             return result
         except Exception as e:
@@ -239,7 +287,7 @@ class Database:
                 cursor = await self._conn.execute(sql)
 
             row = await cursor.fetchone()
-            
+
             if row is None:
                 await cursor.close()
                 return None
@@ -247,7 +295,7 @@ class Database:
             # Convert row to dict using column names
             columns = [desc[0] for desc in cursor.description]
             result = dict(zip(columns, row))
-            
+
             await cursor.close()
             return result
         except Exception as e:
@@ -258,7 +306,7 @@ class Database:
         """Get the rowid of the last INSERT."""
         if not self._conn:
             raise RuntimeError("Database not initialized. Call init() first.")
-        
+
         cursor = await self._conn.execute("SELECT last_insert_rowid()")
         row = await cursor.fetchone()
         await cursor.close()

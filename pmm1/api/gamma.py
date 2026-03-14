@@ -42,6 +42,7 @@ class GammaMarket(BaseModel):
     rewards_max_spread: float = Field(alias="rewardsMaxSpread", default=0.0)
     rewards_daily_rate: float = Field(alias="rewardsDailyRate", default=0.0)
     fees_enabled: bool = Field(alias="feesEnabled", default=False)
+    fee_rate: float = Field(alias="feeRate", default=0.0)
     events: list[dict[str, Any]] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
@@ -53,7 +54,8 @@ class GammaMarket(BaseModel):
             return []
         import json
         try:
-            return json.loads(self.clob_token_ids)
+            result: list[str] = json.loads(self.clob_token_ids)
+            return result
         except (json.JSONDecodeError, TypeError):
             return []
 

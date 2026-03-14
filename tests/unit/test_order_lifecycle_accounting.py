@@ -4,6 +4,7 @@ import asyncio
 from decimal import Decimal
 
 from pmm1.api.clob_private import CreateOrderRequest, OrderResponse, OrderSide, OrderType
+from pmm1.execution.mutation_guard import MutationGuardDecision
 from pmm1.execution.order_manager import OrderManager
 from pmm1.state.orders import OrderState, OrderTracker, TrackedOrder
 from pmm1.strategy.quote_engine import QuoteIntent
@@ -43,7 +44,10 @@ class _FakeClobClient:
     ) -> list[OrderResponse]:
         if self._responses:
             return self._responses.pop(0)
-        return [_make_order_response(order_id=f"oid-{idx}") for idx, _ in enumerate(orders, start=1)]
+        return [
+            _make_order_response(order_id=f"oid-{idx}")
+            for idx, _ in enumerate(orders, start=1)
+        ]
 
     async def cancel_orders(self, order_ids: list[str]) -> dict[str, bool]:
         self.cancel_calls.append(list(order_ids))
@@ -110,7 +114,9 @@ def test_diff_and_apply_counts_successful_submit_and_cancel() -> None:
 
 def test_diff_and_apply_does_not_count_rejected_response_as_submitted() -> None:
     tracker = OrderTracker()
-    client = _FakeClobClient(responses=[[_make_order_response(success=False, error_msg="rejected")]])
+    client = _FakeClobClient(
+        responses=[[_make_order_response(success=False, error_msg="rejected")]]
+    )
     manager = OrderManager(client=client, order_tracker=tracker, use_gtd=False)
     baseline = tracker.snapshot_lifecycle_counts()
 
@@ -159,3 +165,35 @@ def test_submit_order_tracks_non_quote_submission_paths() -> None:
     assert tracked is not None
     assert tracked.strategy == "taker_bootstrap"
     assert tracker.diff_lifecycle_counts(baseline)["submitted"] == 1
+
+
+def test_submit_order_blocks_when_mutation_guard_denies() -> None:
+    tracker = OrderTracker()
+    client = _FakeClobClient()
+    manager = OrderManager(client=client, order_tracker=tracker, use_gtd=False)
+    manager.set_mutation_guard(
+        lambda request, condition_id, strategy: MutationGuardDecision(
+            allowed=False,
+            reason="resume_token_invalid",
+            details={"blocked_reason": "market_ws_reconnect"},
+        )
+    )
+
+    result = asyncio.run(
+        manager.submit_order(
+            CreateOrderRequest(
+                token_id="tok-1",
+                price="0.61",
+                size="7",
+                side=OrderSide.BUY,
+                order_type=OrderType.FAK,
+                post_only=False,
+            ),
+            condition_id="cond-1",
+            strategy="taker_bootstrap",
+        )
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "blocked_by_guard:resume_token_invalid"
+    assert tracker.total_tracked == 0

@@ -15,9 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +24,7 @@ import structlog
 
 from pmm1.state.books import OrderBook
 from pmm1.storage.parquet import ParquetWriter
+from pmm1.storage.spine import make_session_id
 
 logger = structlog.get_logger(__name__)
 
@@ -49,13 +49,13 @@ class LiveRecorder:
         # Raw event buffers (JSONL)
         self._event_buffers: dict[str, list[str]] = {}
         self._is_recording = False
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
         self._record_count: int = 0
-        self._session_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        self._session_id = make_session_id()
 
     def _get_jsonl_path(self, event_type: str) -> Path:
         """Get JSONL file path for an event type."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         date_dir = now.strftime("%Y-%m-%d")
         path = self._base_dir / "jsonl" / event_type / date_dir / f"{self._session_id}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,8 +87,8 @@ class LiveRecorder:
         # Raw JSONL
         self._write_event("book_snapshot", {
             "token_id": token_id,
-            "bids": [{"price": str(l.price), "size": str(l.size)} for l in bids],
-            "asks": [{"price": str(l.price), "size": str(l.size)} for l in asks],
+            "bids": [{"price": str(lvl.price), "size": str(lvl.size)} for lvl in bids],
+            "asks": [{"price": str(lvl.price), "size": str(lvl.size)} for lvl in asks],
             "tick_size": str(book.tick_size),
             "sequence": book.sequence,
         })
@@ -236,7 +236,7 @@ class LiveRecorder:
             await asyncio.sleep(self._flush_interval)
             self.flush()
 
-    def start(self) -> asyncio.Task | None:
+    def start(self) -> asyncio.Task[None] | None:
         """Start recording."""
         self._is_recording = True
         self._task = asyncio.create_task(self._flush_loop())

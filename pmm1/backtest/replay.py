@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Coroutine
+from typing import Any
 
 import structlog
 
@@ -14,7 +15,7 @@ logger = structlog.get_logger(__name__)
 try:
     import polars as pl
 except ImportError:
-    pl = None  # type: ignore
+    pl = None
 
 
 class ReplayEvent:

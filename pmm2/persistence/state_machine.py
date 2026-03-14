@@ -7,12 +7,12 @@ NEW → WARMING → SCORING → ENTRENCHED → STALE → EXIT
 from __future__ import annotations
 
 import time
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
 
-class OrderPersistenceState(str, Enum):
+class OrderPersistenceState(StrEnum):
     """Order lifecycle states."""
 
     NEW = "NEW"  # just posted

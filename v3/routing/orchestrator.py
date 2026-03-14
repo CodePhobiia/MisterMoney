@@ -5,21 +5,21 @@ Dispatches markets to appropriate routes based on classification
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import List
+
 import structlog
 
-from v3.providers.registry import ProviderRegistry
-from v3.evidence.graph import EvidenceGraph
 from v3.evidence.db import Database
 from v3.evidence.entities import (
     EvidenceItem,
     FairValueSignal,
     RoutePlan,
 )
+from v3.evidence.graph import EvidenceGraph
 from v3.intake.schemas import MarketMeta
-from v3.routes.simple import SimpleRoute
-from v3.routes.rule_heavy import RuleHeavyRoute
+from v3.providers.registry import ProviderRegistry
 from v3.routes.dossier import DossierRoute
+from v3.routes.rule_heavy import RuleHeavyRoute
+from v3.routes.simple import SimpleRoute
 
 log = structlog.get_logger()
 
@@ -35,14 +35,14 @@ ROUTE_TIMEOUTS = {
 
 class RouteOrchestrator:
     """Dispatches markets to appropriate routes based on classification"""
-    
-    def __init__(self, 
-                 registry: ProviderRegistry, 
-                 evidence_graph: EvidenceGraph, 
+
+    def __init__(self,
+                 registry: ProviderRegistry,
+                 evidence_graph: EvidenceGraph,
                  db: Database):
         """
         Initialize route orchestrator
-        
+
         Args:
             registry: Provider registry instance
             evidence_graph: Evidence graph instance
@@ -51,29 +51,29 @@ class RouteOrchestrator:
         self.registry = registry
         self.evidence_graph = evidence_graph
         self.db = db
-        
+
         # Initialize routes
         self.simple_route = SimpleRoute(registry, evidence_graph)
         self.rule_route = RuleHeavyRoute(registry, evidence_graph)
         self.dossier_route = DossierRoute(registry, evidence_graph)
         # TODO: Initialize numeric route when ready
-    
+
     async def execute(self,
                      plan: RoutePlan,
                      market: MarketMeta,
-                     evidence: List[EvidenceItem],
+                     evidence: list[EvidenceItem],
                      rule_text: str) -> FairValueSignal:
         """
         Routes to numeric/simple/rule/dossier based on plan.route.
         Enforces SLA timeouts per route.
         On timeout: return last cached signal or neutral.
-        
+
         Args:
             plan: Route plan with route selection
             market: Market metadata
             evidence: List of evidence items
             rule_text: Resolution rules text
-            
+
         Returns:
             FairValueSignal from the appropriate route
         """
@@ -81,10 +81,10 @@ class RouteOrchestrator:
                 condition_id=plan.condition_id,
                 route=plan.route,
                 priority=plan.priority)
-        
+
         # Get timeout for this route
         timeout_seconds = ROUTE_TIMEOUTS.get(plan.route, 30.0)
-        
+
         # Dispatch to appropriate route with timeout
         try:
             signal = await self._execute_with_timeout(
@@ -93,36 +93,36 @@ class RouteOrchestrator:
                 condition_id=plan.condition_id
             )
             return signal
-            
-        except asyncio.TimeoutError:
+
+        except TimeoutError:
             log.warning("route_timeout",
                        condition_id=plan.condition_id,
                        route=plan.route,
                        timeout_seconds=timeout_seconds)
-            
+
             # Try to get last cached signal
             cached = await self._get_cached_signal(plan.condition_id)
             if cached:
                 log.info("using_cached_signal", condition_id=plan.condition_id)
                 return cached
-            
+
             # Return neutral signal as fallback
             return self._neutral_signal(plan.condition_id, plan.route)
-    
+
     async def _dispatch_route(self,
                              plan: RoutePlan,
                              market: MarketMeta,
-                             evidence: List[EvidenceItem],
+                             evidence: list[EvidenceItem],
                              rule_text: str) -> FairValueSignal:
         """
         Internal dispatcher to route-specific handlers
-        
+
         Args:
             plan: Route plan
             market: Market metadata
             evidence: Evidence items
             rule_text: Resolution rules
-            
+
         Returns:
             FairValueSignal from the selected route
         """
@@ -134,13 +134,13 @@ class RouteOrchestrator:
                 rule_text=rule_text,
                 clarifications=[],
             )
-        
+
         elif plan.route == "numeric":
             # TODO: Implement numeric route
             log.warning("numeric_route_not_implemented", condition_id=plan.condition_id)
-            return self._neutral_signal(plan.condition_id, "numeric", 
+            return self._neutral_signal(plan.condition_id, "numeric",
                                        reason="Numeric route not yet implemented")
-        
+
         elif plan.route == "rule":
             return await self.rule_route.execute(
                 condition_id=plan.condition_id,
@@ -149,7 +149,7 @@ class RouteOrchestrator:
                 rule_text=rule_text,
                 clarifications=getattr(market, 'clarifications', []),
             )
-        
+
         elif plan.route == "dossier":
             # Fetch documents from evidence items
             doc_ids = set(item.doc_id for item in evidence if item.doc_id)
@@ -158,7 +158,7 @@ class RouteOrchestrator:
                 doc = await self.evidence_graph.get_document(doc_id)
                 if doc:
                     documents.append(doc)
-            
+
             return await self.dossier_route.execute(
                 condition_id=plan.condition_id,
                 market=market,
@@ -167,69 +167,69 @@ class RouteOrchestrator:
                 rule_text=rule_text,
                 clarifications=getattr(market, 'clarifications', []),
             )
-        
+
         else:
             log.error("unknown_route", route=plan.route, condition_id=plan.condition_id)
             return self._neutral_signal(plan.condition_id, plan.route,
                                        reason=f"Unknown route: {plan.route}")
-    
+
     async def _execute_with_timeout(self,
                                     coro,
                                     timeout_seconds: float,
                                     condition_id: str) -> FairValueSignal:
         """
         Execute coroutine with timeout
-        
+
         Args:
             coro: Coroutine to execute
             timeout_seconds: Timeout in seconds
             condition_id: Market condition ID (for logging)
-            
+
         Returns:
             FairValueSignal from the coroutine
-            
+
         Raises:
             asyncio.TimeoutError: If execution exceeds timeout
         """
         return await asyncio.wait_for(coro, timeout=timeout_seconds)
-    
+
     async def _get_cached_signal(self, condition_id: str) -> FairValueSignal | None:
         """
         Retrieve last cached signal for a condition
-        
+
         Args:
             condition_id: Market condition ID
-            
+
         Returns:
             Last FairValueSignal or None if not found
         """
         try:
             return await self.evidence_graph.get_latest_signal(condition_id)
         except Exception as e:
-            log.error("get_cached_signal_failed", 
-                     condition_id=condition_id, 
+            log.error("get_cached_signal_failed",
+                     condition_id=condition_id,
                      error=str(e))
             return None
-    
-    def _neutral_signal(self, 
-                       condition_id: str, 
+
+    def _neutral_signal(self,
+                       condition_id: str,
                        route: str,
                        reason: str = "Fallback neutral signal") -> FairValueSignal:
         """
         Create a neutral (50/50) signal as fallback
-        
+
         Args:
             condition_id: Market condition ID
             route: Route type
             reason: Reason for neutral signal
-            
+
         Returns:
             Neutral FairValueSignal
         """
-        log.info("creating_neutral_signal", 
-                condition_id=condition_id, 
+        log.info("creating_neutral_signal",
+                condition_id=condition_id,
                 reason=reason)
-        
+
         return FairValueSignal(
             condition_id=condition_id,
             generated_at=datetime.utcnow(),

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 from pydantic import BaseModel
 
-from pmm1.state.orders import OrderTracker, TrackedOrder
+from pmm1.state.orders import OrderTracker
 from pmm1.state.positions import PositionTracker
 
 logger = structlog.get_logger(__name__)
@@ -174,7 +176,7 @@ class InventoryManager:
             return 0.0
         return min(pos.yes_size, pos.no_size)
 
-    def get_rebalance_actions(self, condition_id: str) -> list[dict]:
+    def get_rebalance_actions(self, condition_id: str) -> list[dict[str, Any]]:
         """Get recommended rebalancing actions for a market.
 
         Priority from §13:
@@ -183,7 +185,7 @@ class InventoryManager:
             3. Internal cross-event conversion (neg-risk)
             4. External market hedge (last resort)
         """
-        actions: list[dict] = []
+        actions: list[dict[str, Any]] = []
         pos = self.positions.get(condition_id)
         if pos is None:
             return actions

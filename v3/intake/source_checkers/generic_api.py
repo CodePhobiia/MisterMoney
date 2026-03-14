@@ -4,12 +4,13 @@ Fallback checker for structured APIs
 """
 
 import re
+
 import aiohttp
 import structlog
-from datetime import datetime, timezone
+
+from v3.evidence.entities import RuleGraph
 
 from .base import SourceChecker, SourceCheckResult
-from v3.evidence.entities import RuleGraph
 
 log = structlog.get_logger()
 
@@ -17,16 +18,16 @@ log = structlog.get_logger()
 class GenericAPIChecker(SourceChecker):
     """
     Fallback checker for known structured APIs
-    
+
     Attempts to fetch URL and extract numeric values from JSON response
     """
-    
+
     TIMEOUT_SECONDS = 8
-    
+
     def _extract_value_from_json(self, data: dict, hint: str | None = None) -> float | str | None:
         """
         Extract a numeric or string value from JSON response
-        
+
         Strategies:
         1. If hint provided, look for that key
         2. Look for common value keys: 'value', 'price', 'result', 'data'
@@ -35,11 +36,11 @@ class GenericAPIChecker(SourceChecker):
         """
         if not isinstance(data, dict):
             return None
-        
+
         # Strategy 1: Use hint
         if hint and hint in data:
             return data[hint]
-        
+
         # Strategy 2: Common keys
         common_keys = ['value', 'price', 'result', 'data', 'current', 'latest']
         for key in common_keys:
@@ -50,7 +51,7 @@ class GenericAPIChecker(SourceChecker):
                 elif isinstance(val, dict):
                     # Recurse
                     return self._extract_value_from_json(val, hint)
-        
+
         # Strategy 3: Single key-value
         if len(data) == 1:
             key = list(data.keys())[0]
@@ -59,7 +60,7 @@ class GenericAPIChecker(SourceChecker):
                 return val
             elif isinstance(val, dict):
                 return self._extract_value_from_json(val, hint)
-        
+
         # Strategy 4: First numeric value
         for key, val in data.items():
             if isinstance(val, (int, float)):
@@ -69,22 +70,22 @@ class GenericAPIChecker(SourceChecker):
                     return float(val)
                 except ValueError:
                     pass
-        
+
         return None
-    
+
     def _is_valid_url(self, url: str) -> bool:
         """Check if string is a valid HTTP(S) URL"""
         return url.startswith(('http://', 'https://'))
-    
+
     async def check(self, condition_id: str, rule: RuleGraph) -> SourceCheckResult:
         """
         Fetch generic API and extract value
-        
+
         Attempts to parse JSON response and extract numeric value,
         then compare against threshold.
         """
         source = rule.source_name
-        
+
         if not self._is_valid_url(source):
             log.warning("generic_invalid_url",
                        source=source,
@@ -99,7 +100,7 @@ class GenericAPIChecker(SourceChecker):
                 raw_data={'error': 'Invalid URL'},
                 ttl_seconds=300
             )
-        
+
         try:
             async with aiohttp.ClientSession() as session:
                 timeout = aiohttp.ClientTimeout(total=self.TIMEOUT_SECONDS)
@@ -118,7 +119,7 @@ class GenericAPIChecker(SourceChecker):
                             raw_data={'error': f'HTTP {resp.status}'},
                             ttl_seconds=300
                         )
-                    
+
                     # Try to parse as JSON
                     try:
                         data = await resp.json()
@@ -136,10 +137,10 @@ class GenericAPIChecker(SourceChecker):
                             raw_data={'error': 'Failed to parse JSON'},
                             ttl_seconds=300
                         )
-                    
+
                     # Extract value
                     current_value = self._extract_value_from_json(data)
-                    
+
                     if current_value is None:
                         log.warning("generic_no_value_extracted",
                                    url=source,
@@ -154,37 +155,46 @@ class GenericAPIChecker(SourceChecker):
                             raw_data=data if isinstance(data, dict) else {'raw': str(data)},
                             ttl_seconds=300
                         )
-                    
+
                     # Compute probability
                     threshold = rule.threshold_num if rule.threshold_num is not None else 0.0
-                    
+
                     # Try to convert to float for comparison
                     try:
                         current_numeric = float(current_value)
                         threshold_numeric = float(threshold)
-                        
+
                         if rule.operator in ('>', '>='):
                             if current_numeric >= threshold_numeric:
                                 probability = 0.9
                             else:
                                 # Linear interpolation
-                                ratio = current_numeric / threshold_numeric if threshold_numeric != 0 else 0.5
+                                ratio = (
+                                current_numeric / threshold_numeric
+                                if threshold_numeric != 0 else 0.5
+                            )
                                 probability = max(0.05, min(0.95, ratio))
-                        
+
                         elif rule.operator in ('<', '<='):
                             if current_numeric <= threshold_numeric:
                                 probability = 0.9
                             else:
-                                ratio = threshold_numeric / current_numeric if current_numeric != 0 else 0.5
+                                ratio = (
+                                threshold_numeric / current_numeric
+                                if current_numeric != 0 else 0.5
+                            )
                                 probability = max(0.05, min(0.95, ratio))
-                        
+
                         else:
                             # Unknown operator, use distance
-                            distance_pct = abs(current_numeric - threshold_numeric) / max(abs(threshold_numeric), 1.0)
+                            distance_pct = (
+                                abs(current_numeric - threshold_numeric)
+                                / max(abs(threshold_numeric), 1.0)
+                            )
                             probability = max(0.05, min(0.95, 1.0 - distance_pct))
-                        
+
                         confidence = 0.7  # Moderate confidence for generic API
-                    
+
                     except (ValueError, TypeError):
                         # Non-numeric value, can't compute probability
                         log.warning("generic_non_numeric_value",
@@ -192,13 +202,13 @@ class GenericAPIChecker(SourceChecker):
                                    threshold=threshold)
                         probability = 0.5
                         confidence = 0.3
-                    
+
                     log.info("generic_check_success",
                             url=source,
                             current_value=current_value,
                             threshold=threshold,
                             probability=probability)
-                    
+
                     return SourceCheckResult(
                         condition_id=condition_id,
                         source=source,
@@ -209,7 +219,7 @@ class GenericAPIChecker(SourceChecker):
                         raw_data=data if isinstance(data, dict) else {'value': str(data)},
                         ttl_seconds=120  # Cache for 2 minutes
                     )
-        
+
         except aiohttp.ClientError as e:
             log.error("generic_network_error", error=str(e), url=source)
             return SourceCheckResult(

@@ -11,8 +11,8 @@ import hashlib
 import hmac
 import time
 from decimal import Decimal
-from enum import Enum
-from typing import Any
+from enum import StrEnum
+from typing import Any, cast
 
 import aiohttp
 import structlog
@@ -21,19 +21,19 @@ from pydantic import BaseModel, Field
 logger = structlog.get_logger(__name__)
 
 
-class OrderSide(str, Enum):
+class OrderSide(StrEnum):
     BUY = "BUY"
     SELL = "SELL"
 
 
-class OrderType(str, Enum):
+class OrderType(StrEnum):
     GTC = "GTC"
     GTD = "GTD"
     FOK = "FOK"
     FAK = "FAK"
 
 
-class OrderStatus(str, Enum):
+class OrderStatus(StrEnum):
     LIVE = "LIVE"
     MATCHED = "MATCHED"
     DELAYED = "DELAYED"
@@ -194,7 +194,7 @@ class ClobPrivateClient:
         self._session: aiohttp.ClientSession | None = None
         self._sdk_client = None  # Lazy-initialized py-clob-client ClobClient
 
-    def _get_sdk_client(self):
+    def _get_sdk_client(self) -> Any:
         """Lazy-initialize the synchronous py-clob-client SDK client.
 
         This handles EIP-712 signing for order creation/posting.
@@ -280,7 +280,11 @@ class ClobPrivateClient:
 
         import json as json_mod
         # Use compact separators matching SDK: json.dumps(body, separators=(",", ":"))
-        body_str = json_mod.dumps(json_body, separators=(",", ":"), ensure_ascii=False) if json_body is not None else ""
+        body_str = (
+            json_mod.dumps(json_body, separators=(",", ":"), ensure_ascii=False)
+            if json_body is not None
+            else ""
+        )
         auth_headers = self._auth_headers(method.upper(), path, body_str)
 
         headers = {
@@ -354,7 +358,7 @@ class ClobPrivateClient:
             neg_risk=order.neg_risk if order.neg_risk else None,
         )
 
-        def _create_and_post():
+        def _create_and_post() -> Any:
             """Synchronous SDK call — run in thread."""
             signed_order = sdk_client.create_order(order_args, options)
             return sdk_client.post_order(
@@ -452,11 +456,15 @@ class ClobPrivateClient:
                     )
                     return OrderResponse(
                         success=False,
-                        error_msg=str(e),
+                        errorMsg=str(e),
                     )
 
         responses = await asyncio.gather(*[submit_one(o) for o in orders])
-        logger.info("orders_batch_created", count=len(orders), success=sum(1 for r in responses if r.success))
+        logger.info(
+            "orders_batch_created",
+            count=len(orders),
+            success=sum(1 for r in responses if r.success),
+        )
         return list(responses)
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
@@ -472,7 +480,7 @@ class ClobPrivateClient:
                 return data
             if hasattr(data, 'json'):
                 try:
-                    return data.json()
+                    return cast(dict[str, Any], data.json())
                 except Exception:
                     return {"success": True}
             return {"success": True}
@@ -482,7 +490,7 @@ class ClobPrivateClient:
             "DELETE", "/order", json_body={"orderID": order_id}
         )
         logger.info("order_canceled", order_id=order_id)
-        return data
+        return cast(dict[str, Any], data)
 
     async def cancel_orders(self, order_ids: list[str]) -> dict[str, Any]:
         """Cancel multiple orders.
@@ -497,7 +505,7 @@ class ClobPrivateClient:
                 return data
             if hasattr(data, 'json'):
                 try:
-                    return data.json()
+                    return cast(dict[str, Any], data.json())
                 except Exception:
                     return {"success": True}
             return {"success": True}
@@ -507,7 +515,7 @@ class ClobPrivateClient:
             "DELETE", "/orders", json_body=[{"orderID": oid} for oid in order_ids]
         )
         logger.info("orders_canceled", count=len(order_ids))
-        return data
+        return cast(dict[str, Any], data)
 
     async def cancel_all(self) -> dict[str, Any]:
         """Cancel all open orders for this account.
@@ -522,7 +530,7 @@ class ClobPrivateClient:
                 return data
             if hasattr(data, 'json'):
                 try:
-                    return data.json()
+                    return cast(dict[str, Any], data.json())
                 except Exception:
                     return {"success": True}
             return {"success": True}
@@ -530,7 +538,7 @@ class ClobPrivateClient:
         # Fallback to direct REST
         data = await self._request("DELETE", "/cancel-all")
         logger.warning("all_orders_canceled")
-        return data
+        return cast(dict[str, Any], data)
 
     async def cancel_market_orders(
         self, market: str, asset_id: str | None = None
@@ -541,7 +549,7 @@ class ClobPrivateClient:
             payload["asset_id"] = asset_id
         data = await self._request("DELETE", "/cancel-market-orders", json_body=payload)
         logger.info("market_orders_canceled", market=market, asset_id=asset_id)
-        return data
+        return cast(dict[str, Any], data)
 
     async def get_open_orders(
         self,
@@ -564,6 +572,8 @@ class ClobPrivateClient:
             orders_data = data.get("data", data.get("orders", []))
         else:
             orders_data = data
+        if orders_data is None:
+            orders_data = []
         orders = [OpenOrder.model_validate(o) for o in orders_data]
         logger.debug("open_orders_fetched", count=len(orders))
         return orders
@@ -595,7 +605,7 @@ class ClobPrivateClient:
         }
         data = await self._request("GET", "/balance-allowance", params=params)
         logger.debug("balances_fetched", data=data)
-        return data
+        return cast(dict[str, Any], data)
 
 
 class ClobRestartError(Exception):

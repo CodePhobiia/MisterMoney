@@ -69,7 +69,7 @@ Before restarting the bot, verify:
 - [ ] **CLOB API credentials** — API key, secret, passphrase are valid (test with a GET /auth endpoint)
 - [ ] **CTF approvals** — ERC-1155 approvals are set for the CLOB exchange contract
 - [ ] **No lingering flatten flag** — `rm -f /tmp/pmm1_flatten`
-- [ ] **Config is correct** — Review `config/default.yaml` and `config/prod.yaml`
+- [ ] **Config is correct** — `config/default.yaml` is always the base config. `config/prod.yaml` only applies when `PMM1_CONFIG_OVERRIDE=config/prod.yaml` is exported in the service or shell environment before startup.
 - [ ] **Dangerous toggles acknowledged explicitly**
   - If taker bootstrap is enabled in live mode: `export PMM1_ACK_TAKER_BOOTSTRAP=YES`
   - If PMM-2 live mode is enabled (`shadow_mode: false`): `export PMM1_ACK_PMM2_LIVE=YES`
@@ -84,6 +84,13 @@ Before restarting the bot, verify:
 systemctl --user start pmm1
 # Or directly:
 cd /home/ubuntu/MisterMoney && python -m pmm1.main
+```
+
+For PMM2 canary/live runs using `config/prod.yaml`, export the override explicitly before start:
+
+```bash
+export PMM1_CONFIG_OVERRIDE=config/prod.yaml
+systemctl --user restart pmm1
 ```
 
 ### Verify healthy startup:
@@ -269,7 +276,7 @@ journalctl --user -u pmm1 | grep -E "ops_alert|DB WRITE FAILURE|FILL RECORDER FA
 | File | Purpose |
 |------|---------|
 | `config/default.yaml` | Base configuration |
-| `config/prod.yaml` | Production overrides |
+| `config/prod.yaml` | Optional override; only loaded when `PMM1_CONFIG_OVERRIDE=config/prod.yaml` is set |
 | `.env` | Secrets (API keys, wallet key) |
 | `data/pmm1.db` | SQLite database (fills, books, queue state) |
 | `data/parquet/` | Historical data (Parquet format) |

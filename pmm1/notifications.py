@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import time
-from enum import Enum
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from enum import StrEnum
 
 import aiohttp
 import structlog
@@ -18,7 +17,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 
-class AlertSeverity(str, Enum):
+class AlertSeverity(StrEnum):
     """Operational alert severities."""
 
     INFO = "info"
@@ -35,16 +34,16 @@ _ALERT_PREFIX = {
 
 async def send_telegram(message: str) -> None:
     """Send a message via Telegram bot API.
-    
+
     Args:
         message: Message text to send (supports Markdown).
     """
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("telegram_not_configured")
         return
-    
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -62,7 +61,7 @@ async def send_telegram(message: str) -> None:
                         status=response.status,
                         error=await response.text(),
                     )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("telegram_send_timeout")
     except Exception as e:
         logger.warning("telegram_send_failed", error=str(e))
@@ -138,14 +137,44 @@ class AlertManager:
         )
         return True
 
-    async def info(self, event_type: str, details: str, **kwargs: object) -> bool:
-        return await self.notify(AlertSeverity.INFO, event_type, details, **kwargs)
+    async def info(
+        self,
+        event_type: str,
+        details: str,
+        *,
+        dedupe_key: str | None = None,
+        cooldown_s: float | None = None,
+    ) -> bool:
+        return await self.notify(
+            AlertSeverity.INFO, event_type, details,
+            dedupe_key=dedupe_key, cooldown_s=cooldown_s,
+        )
 
-    async def warning(self, event_type: str, details: str, **kwargs: object) -> bool:
-        return await self.notify(AlertSeverity.WARNING, event_type, details, **kwargs)
+    async def warning(
+        self,
+        event_type: str,
+        details: str,
+        *,
+        dedupe_key: str | None = None,
+        cooldown_s: float | None = None,
+    ) -> bool:
+        return await self.notify(
+            AlertSeverity.WARNING, event_type, details,
+            dedupe_key=dedupe_key, cooldown_s=cooldown_s,
+        )
 
-    async def critical(self, event_type: str, details: str, **kwargs: object) -> bool:
-        return await self.notify(AlertSeverity.CRITICAL, event_type, details, **kwargs)
+    async def critical(
+        self,
+        event_type: str,
+        details: str,
+        *,
+        dedupe_key: str | None = None,
+        cooldown_s: float | None = None,
+    ) -> bool:
+        return await self.notify(
+            AlertSeverity.CRITICAL, event_type, details,
+            dedupe_key=dedupe_key, cooldown_s=cooldown_s,
+        )
 
 
 def format_fill_notification(
@@ -157,7 +186,7 @@ def format_fill_notification(
     is_scoring: bool = False,
 ) -> str:
     """Format a fill notification message.
-    
+
     Args:
         side: BUY or SELL
         size: Fill size in shares
@@ -165,7 +194,7 @@ def format_fill_notification(
         token_id: Token ID (first 16 chars will be shown)
         order_id: Order ID (first 16 chars will be shown)
         is_scoring: Whether the order was scoring for rewards
-    
+
     Returns:
         Formatted message string
     """
@@ -200,13 +229,13 @@ def format_exit_notification(
     size: float,
 ) -> str:
     """Format an exit signal notification.
-    
+
     Args:
         exit_type: Exit type (e.g., "take_profit", "stop_loss")
         token_id: Token ID (first 16 chars will be shown)
         price: Current price
         size: Position size
-    
+
     Returns:
         Formatted message string
     """

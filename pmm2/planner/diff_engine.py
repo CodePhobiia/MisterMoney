@@ -9,6 +9,8 @@ Philosophy:
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 from pydantic import BaseModel
 
@@ -44,14 +46,28 @@ class DiffEngine:
     4. Rate-limit mutations per market
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize diff engine."""
         pass
+
+    def _order_price(self, order: Any) -> float:
+        raw_price = getattr(order, "price_float", None)
+        if raw_price is None:
+            raw_price = getattr(order, "price", 0.0) or 0.0
+        return float(raw_price)
+
+    def _order_size_open(self, order: Any) -> float:
+        raw_size = getattr(order, "size_open", None)
+        if raw_size is None:
+            raw_size = getattr(order, "remaining_size_float", None)
+        if raw_size is None:
+            raw_size = getattr(order, "remaining_size", 0.0) or 0.0
+        return float(raw_size)
 
     def diff(
         self,
         target: TargetQuotePlan,
-        live_orders: list,
+        live_orders: list[Any],
         persistence_decisions: dict[str, tuple[PersistenceAction, float]] | None = None,
         tick_size: float = 0.01,
     ) -> list[OrderMutation]:
@@ -78,13 +94,13 @@ class DiffEngine:
         mutations: list[OrderMutation] = []
 
         # Build lookup: (token_id, side, price_bucket) → live orders
-        live_by_key: dict[tuple[str, str, float], list] = {}
+        live_by_key: dict[tuple[str, str, float], list[Any]] = {}
         for order in live_orders:
             if not hasattr(order, "token_id") or not hasattr(order, "side"):
                 continue
 
             # Bucket price to nearest tick
-            price_bucket = round(order.price / tick_size) * tick_size
+            price_bucket = round(self._order_price(order) / tick_size) * tick_size
             key = (order.token_id, order.side, price_bucket)
             live_by_key.setdefault(key, []).append(order)
 
@@ -122,7 +138,7 @@ class DiffEngine:
                         break
 
                 # Check size match
-                size_diff = abs(order.size_open - rung.size)
+                size_diff = abs(self._order_size_open(order) - rung.size)
                 if size_diff < best_size_diff:
                     best_match = order
                     best_size_diff = size_diff
@@ -136,9 +152,10 @@ class DiffEngine:
                     if decision:
                         action, _ = decision
                         if action in (
-                            PersistenceAction.IMPROVE_1T,
-                            PersistenceAction.IMPROVE_2T,
-                            PersistenceAction.WIDEN_1T,
+                            PersistenceAction.IMPROVE1,
+                            PersistenceAction.IMPROVE2,
+                            PersistenceAction.WIDEN1,
+                            PersistenceAction.WIDEN2,
                         ):
                             # Persistence optimizer approved a move → amend
                             mutations.append(
@@ -156,7 +173,7 @@ class DiffEngine:
                             logger.debug(
                                 "diff_amend",
                                 order_id=best_match.order_id,
-                                old_size=best_match.size_open,
+                                old_size=self._order_size_open(best_match),
                                 new_size=rung.size,
                                 reason=action.value,
                             )

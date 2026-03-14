@@ -16,22 +16,24 @@ Startup sequence (§10):
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from collections import OrderedDict, defaultdict
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
 import structlog
 
-from pmm1.checks.ctf_approval import check_ctf_approvals
+from pmm1.analytics.edge_tracker import EdgeTracker
+from pmm1.analytics.fv_calibrator import FairValueCalibrator
+from pmm1.analytics.metrics import MetricsCollector
+from pmm1.analytics.pnl import PnLTracker
 from pmm1.api.clob_private import (
-    ClobAuthError,
-    ClobPausedError,
     ClobPrivateClient,
-    ClobRateLimitError,
-    ClobRestartError,
     CreateOrderRequest,
     OrderSide,
     OrderType,
@@ -43,27 +45,50 @@ from pmm1.api.geoblock import GeoblockError, check_geoblock
 from pmm1.api.rewards import RewardsClient
 from pmm1.api.scoring import check_orders_scoring
 from pmm1.backtest.recorder import LiveRecorder
-from pmm1.execution.batcher import OrderBatcher
+from pmm1.checks.ctf_approval import check_ctf_approvals
+from pmm1.execution.mutation_guard import LiveMutationGuard
 from pmm1.execution.order_manager import OrderManager
 from pmm1.execution.reconciler import Reconciler
 from pmm1.logging import get_logger, setup_logging
+from pmm1.materializers import (
+    BookSnapshotFactMaterializer,
+    CanaryCycleFactMaterializer,
+    FillFactMaterializer,
+    OrderFactMaterializer,
+    QuoteFactMaterializer,
+    ShadowCycleFactMaterializer,
+)
+from pmm1.notifications import (
+    AlertManager,
+    format_exit_notification,
+    send_telegram,
+)
+from pmm1.ops import OpsMonitor
+from pmm1.paper.engine import PaperEngine
+from pmm1.paper.logger import PaperLogger
+from pmm1.recorder.book_recorder import BookRecorder
+from pmm1.recorder.fill_recorder import FillRecorder
 from pmm1.risk.drawdown import DrawdownGovernor
 from pmm1.risk.kill_switch import KillSwitch
 from pmm1.risk.limits import RiskLimits
 from pmm1.risk.resolution import ResolutionRiskManager
 from pmm1.settings import Settings, load_settings
-from pmm1.state.books import BookManager
+from pmm1.state.books import BookManager, build_order_book_from_snapshot
 from pmm1.state.heartbeats import HeartbeatState
 from pmm1.state.inventory import InventoryManager
-from pmm1.state.orders import OrderTracker, zero_lifecycle_counts
+from pmm1.state.orders import OrderState, OrderTracker, zero_lifecycle_counts
 from pmm1.state.positions import PositionTracker
+from pmm1.storage.database import Database
 from pmm1.storage.parquet import ParquetWriter
+from pmm1.storage.postgres import PostgresStore
+from pmm1.storage.redis import RedisStateStore
+from pmm1.storage.spine import SpineEmitter, make_session_id, resolve_git_sha
 from pmm1.strategy.binary_parity import BinaryParityDetector
+from pmm1.strategy.exit_manager import ExitManager
 from pmm1.strategy.fair_value import FairValueModel
 from pmm1.strategy.features import FeatureEngine
 from pmm1.strategy.fill_escalation import FillEscalator
-from pmm1.strategy.neg_risk_arb import NegRiskArbDetector, NegRiskOutcome
-from pmm1.strategy.exit_manager import ExitManager
+from pmm1.strategy.llm_reasoner import LLMReasoner, ReasonerConfig
 from pmm1.strategy.market_sanity import (
     MarketTelemetry,
     MarketTelemetryEvent,
@@ -73,32 +98,17 @@ from pmm1.strategy.market_sanity import (
     compute_concentration_suppressions,
     inventory_context_for_token,
 )
+from pmm1.strategy.neg_risk_arb import NegRiskArbDetector, NegRiskOutcome
 from pmm1.strategy.quote_engine import QuoteEngine, QuoteIntent
 from pmm1.strategy.rewards import RewardEstimator
 from pmm1.strategy.universe import MarketMetadata, select_universe
 from pmm1.ws.market_ws import MarketWebSocket
 from pmm1.ws.user_ws import UserWebSocket
-from pmm1.analytics.metrics import MetricsCollector
-from pmm1.analytics.pnl import PnLTracker
-from pmm1.notifications import (
-    AlertManager,
-    AlertSeverity,
-    format_exit_notification,
-    format_fill_notification,
-    send_telegram,
-)
-from pmm1.ops import OpsMonitor
-from pmm1.paper.engine import PaperEngine
-from pmm1.paper.logger import PaperLogger
-from pmm1.storage.database import Database
-from pmm1.recorder.fill_recorder import FillRecorder
-from pmm1.recorder.book_recorder import BookRecorder
-from collections import OrderedDict, defaultdict
 
 logger: structlog.stdlib.BoundLogger = None  # type: ignore
 
 
-def _task_done_callback(task: asyncio.Task) -> None:
+def _task_done_callback(task: asyncio.Task[Any]) -> None:
     """Log exceptions from fire-and-forget tasks."""
     if task.cancelled():
         return
@@ -190,7 +200,9 @@ class BotState:
         self.parity_detector = BinaryParityDetector()
         self.neg_risk_detector = NegRiskArbDetector()
         self.reward_estimator = RewardEstimator()
-        self.fill_escalator = FillEscalator(settings.exit.fill_escalation)
+        self.fill_escalator = FillEscalator(
+            settings.exit.fill_escalation  # type: ignore[arg-type]
+        )
 
         # Risk
         from pmm1.risk.correlation import ThematicCorrelation
@@ -220,11 +232,30 @@ class BotState:
 
         # Sampling (reward-eligible) condition IDs
         self.reward_eligible: set[str] = set()
-        self.pmm2_runtime = None
+        self.pmm2_runtime: Any = None
+        self.gamma_client: Any = None
+        self.rewards_client: Any = None
+        self.order_manager: OrderManager | None = None
+        self.spine: SpineEmitter | None = None
+        self.spine_store: PostgresStore | None = None
+        self.spine_stream_store: RedisStateStore | None = None
+        self.order_fact_materializer: OrderFactMaterializer | None = None
+        self.fill_fact_materializer: FillFactMaterializer | None = None
+        self.book_snapshot_fact_materializer: BookSnapshotFactMaterializer | None = None
+        self.quote_fact_materializer: QuoteFactMaterializer | None = None
+        self.shadow_cycle_fact_materializer: ShadowCycleFactMaterializer | None = None
+        self.canary_cycle_fact_materializer: CanaryCycleFactMaterializer | None = None
+        self.session_id: str = ""
+        self.git_sha: str = "unknown"
+        self.config_hash: str = ""
+        self.nav: float = 0.0
+        self.resume_token_valid: bool = False
+        self.resume_blocked_reason: str = ""
+        self.resume_token_invalidated_at: float = 0.0
 
     def eligible_markets(self) -> list[MarketMetadata]:
         """Get markets eligible for quoting in current mode."""
-        if self.mode == "FLATTEN_ONLY":
+        if self.mode in {"FLATTEN_ONLY", "PAUSED"}:
             return []  # No new quotes
         if self.mode in ("SHUTDOWN", "STARTUP"):
             return []
@@ -252,6 +283,15 @@ async def run(settings: Settings | None = None) -> None:
     )
     logger = get_logger("pmm1.main")
     logger.info("pmm1_starting", name=settings.bot.name, env=settings.bot.env)
+    config_context = {
+        "base_config_path": settings.config_base_path,
+        "override_config_path": settings.config_override_path,
+        "resolved_config_path": settings.resolved_config_path,
+        "config_hash": settings.config_hash,
+    }
+    logger.info("config_loaded", **config_context)
+    session_id = make_session_id()
+    git_sha = resolve_git_sha()
 
     # ── Risk overcommit validation ──
     max_possible = settings.bot.max_markets * settings.risk.per_market_gross_nav
@@ -261,7 +301,10 @@ async def run(settings: Settings | None = None) -> None:
             max_markets=settings.bot.max_markets,
             per_market_pct=settings.risk.per_market_gross_nav,
             combined_pct=f"{max_possible:.0%}",
-            message="Combined market limits exceed 80% of NAV — reduce max_markets or per_market_gross_nav",
+            message=(
+                "Combined market limits exceed 80% of NAV"
+                " — reduce max_markets or per_market_gross_nav"
+            ),
         )
 
     # ── 1. Geoblock check ──
@@ -302,6 +345,9 @@ async def run(settings: Settings | None = None) -> None:
 
     # ── Initialize state ──
     state = BotState(settings)
+    state.session_id = session_id
+    state.git_sha = git_sha
+    state.config_hash = settings.config_hash
     alert_manager = AlertManager(default_cooldown_s=settings.ops.alert_cooldown_s)
     ops_monitor = OpsMonitor(settings.ops, alert_manager=alert_manager)
     ops_monitor.write_lifecycle_status(
@@ -309,7 +355,109 @@ async def run(settings: Settings | None = None) -> None:
         paper_mode=settings.bot.paper_mode,
         note="startup",
         kill_switch=state.kill_switch.get_status(),
+        config_context=config_context,
+        runtime_safety={
+            "resume_token_valid": state.resume_token_valid,
+            "resume_blocked_reason": state.resume_blocked_reason,
+            "resume_token_invalidated_at": state.resume_token_invalidated_at,
+            "last_successful_full_reconciliation_at": 0.0,
+        },
     )
+
+    spine_store: PostgresStore | None = None
+    spine_stream_store: RedisStateStore | None = None
+    spine: SpineEmitter | None = None
+    try:
+        spine_store = PostgresStore(settings.storage.postgres_dsn)
+        await spine_store.connect()
+        try:
+            spine_stream_store = RedisStateStore(settings.storage.redis_url)
+            await spine_stream_store.connect()
+        except Exception as stream_error:
+            logger.warning(
+                "spine_stream_init_failed",
+                redis_url=settings.storage.redis_url,
+                error=str(stream_error),
+            )
+            spine_stream_store = None
+        bootstrap_snapshot = await SpineEmitter(
+            spine_store,
+            session_id=session_id,
+            git_sha=git_sha,
+            config_hash="bootstrap",
+            default_controller="v1",
+            default_run_stage="paper" if settings.bot.paper_mode else "production",
+            stream_store=spine_stream_store,
+        ).persist_config_snapshot(settings.raw_config)
+        if bootstrap_snapshot is not None:
+            spine = SpineEmitter(
+                spine_store,
+                session_id=session_id,
+                git_sha=git_sha,
+                config_hash=bootstrap_snapshot.config_hash,
+                default_controller="v1",
+                default_run_stage="paper" if settings.bot.paper_mode else "production",
+                stream_store=spine_stream_store,
+            )
+            state.config_hash = bootstrap_snapshot.config_hash
+            config_context["config_hash"] = bootstrap_snapshot.config_hash
+            state.spine = spine
+            state.spine_store = spine_store
+            state.spine_stream_store = spine_stream_store
+            logger.info(
+                "spine_initialized",
+                session_id=session_id,
+                git_sha=git_sha,
+                config_hash=bootstrap_snapshot.config_hash,
+                run_stage="paper" if settings.bot.paper_mode else "production",
+            )
+            if spine_store is not None and spine_stream_store is not None:
+                state.order_fact_materializer = OrderFactMaterializer(
+                    spine_store,
+                    spine_stream_store,
+                    consumer_name=f"{settings.bot.name.lower()}-{session_id}",
+                )
+                state.fill_fact_materializer = FillFactMaterializer(
+                    spine_store,
+                    spine_stream_store,
+                    consumer_name=f"{settings.bot.name.lower()}-{session_id}",
+                )
+                state.book_snapshot_fact_materializer = BookSnapshotFactMaterializer(
+                    spine_store,
+                    spine_stream_store,
+                    consumer_name=f"{settings.bot.name.lower()}-{session_id}",
+                )
+                state.quote_fact_materializer = QuoteFactMaterializer(
+                    spine_store,
+                    spine_stream_store,
+                    consumer_name=f"{settings.bot.name.lower()}-{session_id}",
+                )
+                state.shadow_cycle_fact_materializer = ShadowCycleFactMaterializer(
+                    spine_store,
+                    spine_stream_store,
+                    consumer_name=f"{settings.bot.name.lower()}-{session_id}",
+                )
+                state.canary_cycle_fact_materializer = CanaryCycleFactMaterializer(
+                    spine_store,
+                    spine_stream_store,
+                    consumer_name=f"{settings.bot.name.lower()}-{session_id}",
+                )
+    except Exception as e:
+        logger.warning(
+            "spine_init_failed",
+            dsn=settings.storage.postgres_dsn,
+            error=str(e),
+        )
+        if spine_store is not None:
+            try:
+                await spine_store.close()
+            except Exception:
+                pass
+        if spine_stream_store is not None:
+            try:
+                await spine_stream_store.close()
+            except Exception:
+                pass
 
     # ── 4. Fetch universe (ordered by 24h volume for best market selection) ──
     logger.info("fetching_universe")
@@ -348,6 +496,9 @@ async def run(settings: Settings | None = None) -> None:
                 reward_daily_rate=market.rewards_daily_rate,
                 reward_min_size=market.rewards_min_size,
                 reward_max_spread=market.rewards_max_spread,
+                fees_enabled=market.fees_enabled,
+                fee_rate=market.fee_rate if market.fee_rate > 0 else 0.0,
+                fee_known=not market.fees_enabled or market.fee_rate > 0,
             )
             all_markets.append(md)
         logger.info("universe_from_markets_api", count=len(all_markets))
@@ -384,12 +535,13 @@ async def run(settings: Settings | None = None) -> None:
                     reward_min_size=market.rewards_min_size,
                     reward_max_spread=market.rewards_max_spread,
                     fees_enabled=market.fees_enabled,
+                    fee_rate=market.fee_rate if market.fee_rate > 0 else 0.0,
+                    fee_known=not market.fees_enabled or market.fee_rate > 0,
                 )
                 # S0-4: Log fee-enabled markets
                 if market.fees_enabled:
                     logger.info(
                         "fee_market_found",
-                        event="fee_market_found",
                         condition_id=market.condition_id,
                         question=market.question[:50] if market.question else "?",
                     )
@@ -404,21 +556,24 @@ async def run(settings: Settings | None = None) -> None:
     try:
         sampling_markets = await rewards_client.fetch_sampling_markets()
         logger.info("sampling_markets_fetched", count=len(sampling_markets))
-        
+
         # Build token_id → RewardInfo lookup (Gamma returns empty condition_ids,
         # so we must match by token_id instead)
         token_to_reward: dict[str, Any] = {}
         for ri in sampling_markets.values():
             for tid in ri.token_ids:
                 token_to_reward[tid] = ri
-        
+
         # Mark reward eligibility and update reward data
         matched = 0
         for m in all_markets:
             # Try condition_id match first, then token_id match
             reward_info = sampling_markets.get(m.condition_id)
             if not reward_info:
-                reward_info = token_to_reward.get(m.token_id_yes) or token_to_reward.get(m.token_id_no)
+                reward_info = (
+                    token_to_reward.get(m.token_id_yes)
+                    or token_to_reward.get(m.token_id_no)
+                )
             if reward_info:
                 m.reward_eligible = True
                 m.reward_daily_rate = reward_info.daily_rate
@@ -426,7 +581,12 @@ async def run(settings: Settings | None = None) -> None:
                 m.reward_max_spread = reward_info.max_spread
                 state.reward_eligible.add(m.condition_id)
                 matched += 1
-        logger.info("reward_matching_done", matched=matched, total=len(all_markets), token_index_size=len(token_to_reward))
+        logger.info(
+            "reward_matching_done",
+            matched=matched,
+            total=len(all_markets),
+            token_index_size=len(token_to_reward),
+        )
     except Exception as e:
         logger.warning("sampling_markets_fetch_failed", error=str(e))
     finally:
@@ -531,9 +691,17 @@ async def run(settings: Settings | None = None) -> None:
                                 if event_id:
                                     md.event_id = event_id
                                     enriched_event_ids += 1
-                                    logger.debug("event_id_enriched", condition_id=md.condition_id[:16], event_id=event_id)
+                                    logger.debug(
+                                        "event_id_enriched",
+                                        condition_id=md.condition_id[:16],
+                                        event_id=event_id,
+                                    )
             except Exception as e:
-                logger.warning("event_id_enrichment_failed", condition_id=md.condition_id[:16], error=str(e))
+                logger.warning(
+                    "event_id_enrichment_failed",
+                    condition_id=md.condition_id[:16],
+                    error=str(e),
+                )
 
     # Re-register event groupings for any newly enriched event_ids
     for md in state.active_markets.values():
@@ -615,7 +783,12 @@ async def run(settings: Settings | None = None) -> None:
             balance = raw_balance / 1e6 if raw_balance > 1_000_000 else raw_balance
             allowance = raw_allowance / 1e6 if raw_allowance > 1_000_000 else raw_allowance
             state.inventory_manager.update_balances(balance, allowance)
-            logger.info("balances_loaded", balance=f"${balance:.2f}", allowance=f"${allowance:.2f}", raw=raw_balance)
+            logger.info(
+                "balances_loaded",
+                balance=f"${balance:.2f}",
+                allowance=f"${allowance:.2f}",
+                raw=raw_balance,
+            )
         except Exception as e:
             logger.warning("balances_load_failed", error=str(e))
 
@@ -647,7 +820,9 @@ async def run(settings: Settings | None = None) -> None:
             order_tracker=state.order_tracker,
             order_ttl_s=settings.execution.order_ttl_effective_s,
             post_only=settings.execution.post_only,
+            spine_emitter=state.spine,
         )
+        state.order_manager = order_manager
         # Re-sync server time after potentially long universe fetch
         try:
             fresh_server_time = await clob_public.get_server_time()
@@ -668,9 +843,48 @@ async def run(settings: Settings | None = None) -> None:
             wallet_address=settings.wallet.address,
             reconcile_orders_s=settings.bot.reconcile_orders_s,
             reconcile_positions_s=settings.bot.reconcile_positions_s,
+            spine_emitter=state.spine,
         )
         reconciler.set_kill_switch(state.kill_switch)
         reconciler.set_on_mismatch(ops_monitor.record_reconciliation_mismatch)
+        mutation_guard = LiveMutationGuard(
+            risk_limits=state.risk_limits,
+            inventory_manager=state.inventory_manager,
+            kill_switch=state.kill_switch,
+            drawdown=state.drawdown,
+            heartbeat=heartbeat,
+            market_getter=state.active_markets.get,
+            resume_token_getter=lambda: state.resume_token_valid,
+            resume_reason_getter=lambda: state.resume_blocked_reason,
+        )
+        order_manager.set_mutation_guard(
+            lambda request, condition_id, strategy: mutation_guard.evaluate(
+                request,
+                condition_id=condition_id,
+                strategy=strategy,
+            )
+        )
+
+    def _runtime_safety_context() -> dict[str, Any]:
+        reconciler_stats = reconciler.get_stats() if reconciler else {}
+        return {
+            "resume_token_valid": bool(
+                reconciler_stats.get("resume_token_valid", state.resume_token_valid)
+            ),
+            "resume_blocked_reason": str(
+                reconciler_stats.get("resume_invalid_reason", state.resume_blocked_reason) or ""
+            ),
+            "resume_token_invalidated_at": float(
+                reconciler_stats.get(
+                    "last_resume_invalidated_at",
+                    state.resume_token_invalidated_at,
+                )
+                or 0.0
+            ),
+            "last_successful_full_reconciliation_at": float(
+                reconciler_stats.get("last_successful_full_reconciliation_at", 0.0) or 0.0
+            ),
+        }
 
     # ── Initialize ExitManager ──
     exit_manager = ExitManager(
@@ -681,8 +895,8 @@ async def run(settings: Settings | None = None) -> None:
         clob_public=clob_public,
     )
 
-    recorder = LiveRecorder()
     parquet_writer = ParquetWriter(settings.storage.parquet_dir)
+    recorder = LiveRecorder(parquet_writer=parquet_writer)
 
     async def _on_kill_switch(reason: str, message: str) -> None:
         await alert_manager.critical(
@@ -690,8 +904,18 @@ async def run(settings: Settings | None = None) -> None:
             f"{reason}: {message}",
             dedupe_key=f"kill_switch:{reason}",
         )
+        if state.spine is not None:
+            await state.spine.emit_event(
+                event_type="kill_switch_triggered",
+                strategy="ops",
+                payload_json={
+                    "reason": reason,
+                    "message": message,
+                    "active_reasons": [r.value for r in state.kill_switch.active_reasons],
+                },
+            )
 
-    async def _on_drawdown_tier(old_tier, new_tier, dd_pct: float) -> None:
+    async def _on_drawdown_tier(old_tier: str, new_tier: str, dd_pct: float) -> None:
         details = f"{old_tier}→{new_tier}, DD: {dd_pct:.1f}%"
         if new_tier == "normal":
             await alert_manager.info(
@@ -711,6 +935,16 @@ async def run(settings: Settings | None = None) -> None:
                 details,
                 dedupe_key=f"drawdown:{new_tier}",
             )
+        if state.spine is not None:
+            await state.spine.emit_event(
+                event_type="drawdown_tier_changed",
+                strategy="ops",
+                payload_json={
+                    "old_tier": old_tier,
+                    "new_tier": new_tier,
+                    "drawdown_pct": dd_pct,
+                },
+            )
 
     state.kill_switch.set_on_trigger(_on_kill_switch)
     state.drawdown.set_on_tier_change(_on_drawdown_tier)
@@ -726,8 +960,11 @@ async def run(settings: Settings | None = None) -> None:
 
     # ── Initialize PMM-2 runtime (Sprint 7) ──
     from pmm2.runtime.integration import (
-        maybe_init_pmm2, pmm2_on_book_delta, pmm2_on_fill,
-        pmm2_on_order_live, pmm2_on_order_canceled,
+        maybe_init_pmm2,
+        pmm2_on_book_delta,
+        pmm2_on_fill,
+        pmm2_on_order_canceled,
+        pmm2_on_order_live,
     )
     pmm2_runtime = await maybe_init_pmm2(settings, db, state)
     state.pmm2_runtime = pmm2_runtime
@@ -742,6 +979,7 @@ async def run(settings: Settings | None = None) -> None:
                 max_skew_cents=settings.v3.max_skew_cents,
                 min_confidence=settings.v3.min_confidence,
                 max_age_seconds=settings.v3.signal_max_age_seconds,
+                blend_weight=settings.v3.blend_weight,
                 enabled=True,
             )
             await v3_integrator.connect()
@@ -749,6 +987,94 @@ async def run(settings: Settings | None = None) -> None:
         except Exception as e:
             logger.warning("v3_integrator_init_failed", error=str(e))
             v3_integrator = None
+
+    # ── Paper 2 math wiring: EdgeTracker + FairValueCalibrator ──
+    edge_tracker = EdgeTracker(min_trades=50, target_edge=0.05)
+    fv_calibrator = FairValueCalibrator(min_samples=100)
+
+    # ── Embedded Opus reasoner (OAuth, background loop) ──
+    llm_reasoner_config = ReasonerConfig.from_env()
+    llm_reasoner = LLMReasoner(llm_reasoner_config)
+    if llm_reasoner_config.enabled:
+        await llm_reasoner.start()
+
+    async def emit_spine_event(
+        *,
+        event_type: str,
+        strategy: str,
+        controller: str | None = None,
+        run_stage: str | None = None,
+        condition_id: str | None = None,
+        token_id: str | None = None,
+        order_id: str | None = None,
+        payload_json: dict[str, Any] | None = None,
+    ) -> None:
+        if state.spine is None:
+            return
+        await state.spine.emit_event(
+            event_type=event_type,
+            strategy=strategy or "system",
+            controller=controller,
+            run_stage=run_stage,
+            condition_id=condition_id,
+            token_id=token_id,
+            order_id=order_id,
+            payload_json=payload_json or {},
+        )
+
+    async def emit_quote_intent_events(
+        intent: QuoteIntent,
+        *,
+        fair_value: float,
+        inventory: float,
+        question: str,
+        stage: str,
+    ) -> None:
+        side_specs = [
+            ("BUY", intent.bid_price, intent.bid_size, intent.bid_suppression_reasons),
+            ("SELL", intent.ask_price, intent.ask_size, intent.ask_suppression_reasons),
+        ]
+        for side, price, size, reasons in side_specs:
+            deduped_reasons = list(dict.fromkeys(reasons))
+            if price is not None and size is not None and size > 0:
+                await emit_spine_event(
+                    event_type="quote_intent_created",
+                    strategy=intent.strategy or "mm",
+                    condition_id=intent.condition_id or None,
+                    token_id=intent.token_id,
+                    payload_json={
+                        "stage": stage,
+                        "side": side,
+                        "intended_price": price,
+                        "intended_size": size,
+                        "reservation_price": intent.reservation_price,
+                        "half_spread": intent.half_spread,
+                        "fair_value": fair_value,
+                        "confidence": intent.confidence,
+                        "inventory": inventory,
+                        "neg_risk": intent.neg_risk,
+                        "question": question[:120] if question else "",
+                    },
+                )
+            elif deduped_reasons:
+                await emit_spine_event(
+                    event_type="quote_side_suppressed",
+                    strategy=intent.strategy or "mm",
+                    condition_id=intent.condition_id or None,
+                    token_id=intent.token_id,
+                    payload_json={
+                        "stage": stage,
+                        "side": side,
+                        "reasons": deduped_reasons,
+                        "reservation_price": intent.reservation_price,
+                        "half_spread": intent.half_spread,
+                        "fair_value": fair_value,
+                        "confidence": intent.confidence,
+                        "inventory": inventory,
+                        "neg_risk": intent.neg_risk,
+                        "question": question[:120] if question else "",
+                    },
+                )
 
     # ── 8 & 9. Connect WebSockets ──
     all_token_ids = []
@@ -763,140 +1089,826 @@ async def run(settings: Settings | None = None) -> None:
         book = state.book_manager.get(token_id)
         if book:
             recorder.record_book_snapshot(token_id, book)
-            # PMM-2: forward book deltas to queue estimator
-            # (simplified — full delta tracking would need old vs new per level)
+
+    async def on_book_delta(token_id: str, price: float, old_size: float, new_size: float) -> None:
+        """Callback when a single book level changes from WS."""
+        pmm2_on_book_delta(pmm2_runtime, token_id, price, old_size, new_size)
 
     async def on_trade(token_id: str, price: float) -> None:
         """Callback when a trade occurs."""
         state.feature_engine.record_trade(token_id, price, 0.0, "UNKNOWN")
         recorder.record_trade(token_id, price, 0.0, "UNKNOWN")
 
-    async def on_reconnect() -> None:
-        """Callback after user WS reconnect — trigger reconciliation."""
+    async def on_tick_change(token_id: str, tick_size: Decimal) -> None:
+        """Callback when a token's tick size changes."""
+        condition_id = None
+        for md in state.active_markets.values():
+            if md.token_id_yes == token_id or md.token_id_no == token_id:
+                condition_id = md.condition_id
+                break
+        await emit_spine_event(
+            event_type="tick_size_changed",
+            strategy="market_data",
+            condition_id=condition_id,
+            token_id=token_id,
+            payload_json={"tick_size": str(tick_size)},
+        )
+
+    def _invalidate_resume_token(reason: str) -> None:
+        if reconciler is not None:
+            reconciler.invalidate_resume_token(reason)
+            reconciler_stats = reconciler.get_stats()
+            state.resume_token_valid = bool(reconciler_stats.get("resume_token_valid", False))
+            state.resume_blocked_reason = str(
+                reconciler_stats.get("resume_invalid_reason", reason) or reason
+            )
+            state.resume_token_invalidated_at = float(
+                reconciler_stats.get("last_resume_invalidated_at", time.time()) or time.time()
+            )
+        if state.resume_token_valid or state.resume_blocked_reason != reason:
+            logger.warning("quote_resume_blocked", reason=reason)
+        state.resume_token_valid = False
+        state.resume_blocked_reason = reason
+        state.resume_token_invalidated_at = time.time()
+
+    def _mark_resume_token_valid(reason: str) -> None:
+        if reconciler is not None:
+            reconciler_stats = reconciler.get_stats()
+            state.resume_token_valid = bool(reconciler_stats.get("resume_token_valid", False))
+            state.resume_blocked_reason = str(
+                reconciler_stats.get("resume_invalid_reason", "") or ""
+            )
+            state.resume_token_invalidated_at = float(
+                reconciler_stats.get(
+                    "last_resume_invalidated_at",
+                    state.resume_token_invalidated_at,
+                )
+                or state.resume_token_invalidated_at
+            )
+        if not state.resume_token_valid:
+            logger.warning(
+                "quote_resume_unblock_skipped",
+                reason=reason,
+                blocked_reason=state.resume_blocked_reason,
+            )
+            return
+        logger.info("quote_resume_unblocked", reason=reason)
+
+    async def _rebuild_rest_books_for_active_tokens() -> bool:
+        token_ids = market_ws.subscribed_assets or [
+            token_id
+            for md in state.active_markets.values()
+            for token_id in (md.token_id_yes, md.token_id_no)
+            if token_id
+        ]
+        if not token_ids:
+            return True
+
+        failures: list[str] = []
+        for token_id in sorted(set(token_ids)):
+            try:
+                rest_book = await clob_public.get_order_book(token_id)
+                if not rest_book or not rest_book.bids or not rest_book.asks:
+                    raise RuntimeError("empty_rest_book")
+                cache_key = f"rest_book_{token_id}"
+                state.rest_book_cache[cache_key] = _build_cached_rest_book(token_id, rest_book)
+                state.rest_book_cache_ts[cache_key] = time.time()
+            except Exception as book_error:
+                failures.append(f"{token_id[:16]}:{book_error}")
+                logger.warning(
+                    "post_reconnect_rest_book_refresh_failed",
+                    token_id=token_id[:16],
+                    error=str(book_error),
+                )
+
+        return not failures
+
+    async def _handle_transport_recovery(source: str, *, rebuild_market_books: bool) -> None:
+        _invalidate_resume_token(f"{source}_reconnect")
+        if rebuild_market_books:
+            logger.info("post_reconnect_rest_book_refresh_started", source=source)
+            books_ok = await _rebuild_rest_books_for_active_tokens()
+            if not books_ok:
+                logger.warning("post_reconnect_rest_book_refresh_incomplete", source=source)
+                return
         if reconciler:
-            logger.info("post_reconnect_reconciliation")
-            await reconciler.full_reconciliation()
+            logger.info("post_reconnect_reconciliation", source=source)
+            recovery_result = await reconciler.full_reconciliation()
+            if not recovery_result.success:
+                logger.warning(
+                    "post_reconnect_reconciliation_failed",
+                    source=source,
+                    errors=recovery_result.errors,
+                )
+                _invalidate_resume_token(f"{source}_reconciliation_failed")
+                return
+        _mark_resume_token_valid(source)
+
+    async def on_market_reconnect() -> None:
+        """Callback after market WS reconnect — rebuild books and reconcile."""
+        await _handle_transport_recovery("market_ws", rebuild_market_books=True)
+
+    async def on_user_reconnect() -> None:
+        """Callback after user WS reconnect — reconcile before resuming quotes."""
+        await _handle_transport_recovery("user_ws", rebuild_market_books=False)
 
     # Track notified fills to prevent duplicate notifications (LRU dedup)
     _fill_dedup = _LRUDedup(maxsize=2000)
+    _pending_fill_events: dict[str, dict[str, Any]] = {}
+    _pending_fill_drain_task: asyncio.Task[Any] | None = None
 
-    async def on_fill(msg: dict[str, Any]) -> None:
-        """Callback when a fill/trade is received from UserWebSocket."""
+    def _fill_fee_details(
+        fill_msg: dict[str, Any],
+        market_md: MarketMetadata | None,
+        *,
+        price: float,
+        size: float,
+    ) -> tuple[float | None, bool, str]:
+        payload_fee = fill_msg.get("fee_amount")
+        if payload_fee is not None:
+            return float(payload_fee), True, str(fill_msg.get("fee_source") or "payload")
+        if market_md is not None and getattr(market_md, "fee_known", False):
+            fee_rate = float(getattr(market_md, "fee_rate", 0.0) or 0.0)
+            return price * size * fee_rate, True, "market_metadata"
+        return None, False, str(fill_msg.get("fee_source") or "unknown")
+
+    async def _lookup_trade_fee(fill_msg: dict[str, Any]) -> tuple[float | None, str]:
+        token_id = str(fill_msg.get("token_id") or "")
+        if not token_id or not settings.wallet.address:
+            return None, "unknown"
         try:
-            # Extract fill details
-            token_id = msg.get("asset_id") or msg.get("token_id", "")
-            order_id = msg.get("orderID") or msg.get("order_id") or msg.get("id", "")
-            side = msg.get("side", "").upper()
-            price_str = msg.get("price") or msg.get("matchPrice", "0")
-            size_str = msg.get("size") or msg.get("matchSize", "0")
-            
-            price = float(price_str) if price_str else 0.0
-            size = float(size_str) if size_str else 0.0
-            
-            if size <= 0 or price <= 0:
+            trades = await data_api.get_trades(
+                address=settings.wallet.address,
+                asset_id=token_id,
+                limit=100,
+            )
+        except Exception as fee_error:
+            logger.warning(
+                "trade_fee_lookup_failed",
+                token_id=token_id[:16],
+                order_id=str(fill_msg.get("order_id") or "")[:16],
+                error=str(fee_error),
+            )
+            return None, "unknown"
+
+        exchange_trade_id = str(fill_msg.get("exchange_trade_id") or "")
+        target_order_id = str(fill_msg.get("order_id") or "")
+        target_price = float(fill_msg.get("price", 0.0) or 0.0)
+        target_size = float(fill_msg.get("size", 0.0) or 0.0)
+        for trade in trades:
+            if exchange_trade_id and trade.id == exchange_trade_id:
+                return trade.fee_float, "data_api_trade"
+            if (
+                trade.asset_id == token_id
+                and abs(trade.price_float - target_price) < 1e-9
+                and abs(trade.size_float - target_size) < 1e-9
+                and (not target_order_id or trade.taker_order_id == target_order_id)
+            ):
+                return trade.fee_float, "data_api_trade"
+        return None, "unknown"
+
+    async def _persist_pending_fill(
+        fill_msg: dict[str, Any],
+        *,
+        tracked: Any | None,
+        ingest_state: str,
+        fee: float | None,
+        fee_known: bool,
+        fee_source: str,
+    ) -> int:
+        order_id = str(fill_msg.get("order_id") or "")
+        token_id = str(
+            fill_msg.get("token_id")
+            or (getattr(tracked, "token_id", "") if tracked else "")
+            or ""
+        )
+        condition_id = str(
+            fill_msg.get("condition_id")
+            or (getattr(tracked, "condition_id", "") if tracked else "")
+            or ""
+        )
+        side = str(
+            fill_msg.get("side")
+            or (getattr(tracked, "side", "") if tracked else "")
+            or ""
+        ).upper()
+        market_md = (
+            state.active_markets.get(condition_id)
+            if condition_id else None
+        )
+        reward_eligible = (
+            market_md.reward_eligible
+            if market_md
+            else condition_id in state.reward_eligible
+        )
+        is_scoring = bool(getattr(tracked, "is_scoring", False))
+        book = state.book_manager.get(token_id) if token_id else None
+        mid_at_fill = book.get_midpoint() if book else None
+        return await fill_recorder.record_fill(
+            ts=datetime.now(UTC),
+            condition_id=condition_id,
+            token_id=token_id,
+            order_id=order_id,
+            side=side or "UNKNOWN",
+            price=float(fill_msg.get("price", 0.0) or 0.0),
+            size=float(fill_msg.get("size", 0.0) or 0.0),
+            fee=fee,
+            mid_at_fill=mid_at_fill,
+            is_scoring=is_scoring,
+            reward_eligible=reward_eligible,
+            exchange_trade_id=str(fill_msg.get("exchange_trade_id") or ""),
+            fill_identity=str(fill_msg.get("fill_identity") or ""),
+            fee_known=fee_known,
+            fee_source=fee_source,
+            ingest_state=ingest_state,
+            raw_event_json=dict(fill_msg.get("raw_msg") or {}),
+        )
+
+    async def _apply_fill_once(
+        fill_msg: dict[str, Any],
+        *,
+        tracked: Any,
+        fee: float,
+        fee_known: bool,
+        fee_source: str,
+        pending_fill_id: int | None = None,
+    ) -> bool:
+        order_id = str(fill_msg.get("order_id") or tracked.order_id or "")
+        token_id = str(fill_msg.get("token_id") or tracked.token_id or "")
+        condition_id = str(fill_msg.get("condition_id") or tracked.condition_id or "")
+        side = str(fill_msg.get("side") or tracked.side or "").upper()
+        price = float(fill_msg.get("price", 0.0) or 0.0)
+        size = float(fill_msg.get("size", 0.0) or 0.0)
+        market_md = state.active_markets.get(condition_id) if condition_id else None
+        market_question = market_md.question if market_md else (condition_id or "")
+        dollar_value = size * price
+        reward_eligible = (
+            market_md.reward_eligible
+            if market_md
+            else condition_id in state.reward_eligible
+        )
+        is_scoring = bool(tracked.is_scoring)
+        book = state.book_manager.get(token_id) if token_id else None
+        mid_at_fill = book.get_midpoint() if book else None
+
+        logger.info(
+            "fill_confirmed",
+            token_id=token_id[:16] if token_id else "?",
+            order_id=order_id[:16] if order_id else "?",
+            side=side,
+            price=price,
+            size=size,
+            dollar_value=round(dollar_value, 2),
+            market=market_question[:40] if market_question else "?",
+            fee_source=fee_source,
+        )
+
+        if condition_id:
+            pos = (
+                state.position_tracker.get(condition_id)
+                or state.position_tracker.get_by_token(token_id)
+            )
+            if pos:
+                pos.apply_fill(token_id, "BUY" if side == "BUY" else "SELL", size, price, fee=fee)
+            else:
+                logger.warning(
+                    "fill_position_untracked",
+                    order_id=order_id[:16],
+                    condition_id=condition_id[:16],
+                    token_id=token_id[:16],
+                )
+
+        if pending_fill_id is not None:
+            await fill_recorder.resolve_pending_fill(
+                pending_fill_id,
+                condition_id=condition_id,
+                token_id=token_id,
+                order_id=order_id,
+                side=side,
+                fee=fee,
+                fee_known=fee_known,
+                fee_source=fee_source,
+                mid_at_fill=mid_at_fill,
+                is_scoring=is_scoring,
+                reward_eligible=reward_eligible,
+            )
+        elif condition_id and token_id:
+            _t = asyncio.create_task(
+                fill_recorder.record_fill(
+                    ts=datetime.now(UTC),
+                    condition_id=condition_id,
+                    token_id=token_id,
+                    order_id=order_id,
+                    side=side,
+                    price=price,
+                    size=size,
+                    fee=fee,
+                    mid_at_fill=mid_at_fill,
+                    is_scoring=is_scoring,
+                    reward_eligible=reward_eligible,
+                    exchange_trade_id=str(fill_msg.get("exchange_trade_id") or ""),
+                    fill_identity=str(fill_msg.get("fill_identity") or ""),
+                    fee_known=fee_known,
+                    fee_source=fee_source,
+                    ingest_state="applied",
+                    raw_event_json=dict(fill_msg.get("raw_msg") or {}),
+                )
+            )
+            _t.add_done_callback(_task_done_callback)
+
+        event_type = (
+            "order_filled"
+            if tracked.state == OrderState.FILLED
+            else "order_partially_filled"
+        )
+        realized_spread_capture = None
+        adverse_selection_estimate = None
+        if mid_at_fill is not None:
+            if side == "BUY":
+                realized_spread_capture = mid_at_fill - price
+            else:
+                realized_spread_capture = price - mid_at_fill
+            adverse_selection_estimate = -realized_spread_capture
+        await emit_spine_event(
+            event_type=event_type,
+            strategy=tracked.strategy or "mm",
+            condition_id=condition_id,
+            token_id=token_id,
+            order_id=order_id,
+            payload_json={
+                "side": side,
+                "price": price,
+                "size": size,
+                "fee": fee,
+                "fee_known": fee_known,
+                "fee_source": fee_source,
+                "exchange_trade_id": str(fill_msg.get("exchange_trade_id") or ""),
+                "fill_identity": str(fill_msg.get("fill_identity") or ""),
+                "dollar_value": dollar_value,
+                "mid_at_fill": mid_at_fill,
+                "is_scoring": is_scoring,
+                "reward_eligible": reward_eligible,
+                "fee_usdc": fee,
+                "dollar_value_usdc": dollar_value,
+                "realized_spread_capture": realized_spread_capture,
+                "adverse_selection_estimate": adverse_selection_estimate,
+            },
+        )
+
+        pnl_text = ""
+        if side == "SELL" and condition_id:
+            pos = (
+                state.position_tracker.get(condition_id)
+                or state.position_tracker.get_by_token(token_id)
+            )
+            avg_entry = pos.yes_avg_price if pos and pos.yes_avg_price > 0 else 0
+            if not avg_entry and pos:
+                avg_entry = pos.no_avg_price
+            if avg_entry > 0:
+                pnl = (price - avg_entry) * size
+                pnl_pct = ((price / avg_entry) - 1) * 100
+                pnl_emoji = "📈" if pnl >= 0 else "📉"
+                pnl_text = f"\n{pnl_emoji} PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)"
+
+        scoring_badge = " 💰" if is_scoring else ""
+        emoji = "🟢" if side == "BUY" else "🔴"
+        market_line = f"\n📊 {market_question[:50]}" if market_question else ""
+        notification = (
+            f"{emoji} *{side or 'FILL'}*{scoring_badge}: {size:.1f} shares @ ${price:.3f}\n"
+            f"💵 Value: ${dollar_value:.2f}"
+            f"{pnl_text}"
+            f"{market_line}"
+        )
+        _notify_task: asyncio.Task[Any] = asyncio.create_task(
+            send_telegram(notification),
+        )
+        _notify_task.add_done_callback(_task_done_callback)
+
+        if hasattr(state, "fill_escalator"):
+            state.fill_escalator.record_fill()
+
+        book_for_pnl = state.book_manager.get(token_id)
+        mid_at_fill_pnl = None
+        if book_for_pnl:
+            bb = book_for_pnl.get_best_bid()
+            ba = book_for_pnl.get_best_ask()
+            if bb and ba:
+                mid_at_fill_pnl = (bb.price_float + ba.price_float) / 2
+
+        from pmm1.analytics.pnl import FillRecord as PnLFillRecord
+
+        pnl_fill = PnLFillRecord(
+            order_id=order_id,
+            token_id=token_id,
+            condition_id=condition_id or "",
+            side=side,
+            price=price,
+            size=size,
+            fee=fee,
+            strategy=tracked.strategy or "mm",
+            fill_timestamp=time.time(),
+            mid_at_fill=mid_at_fill_pnl or price,
+        )
+        if hasattr(state, "pnl_tracker"):
+            state.pnl_tracker.record_fill(pnl_fill)
+
+        pmm2_on_fill(
+            pmm2_runtime,
+            order_id,
+            size,
+            price,
+            token_id=token_id,
+            condition_id=condition_id,
+        )
+        return True
+
+    async def _drain_pending_fill_events(trigger: str) -> None:
+        if not _pending_fill_events:
+            return
+        if reconciler is not None:
+            recovery_result = await reconciler.full_reconciliation()
+            if not recovery_result.success:
+                logger.warning(
+                    "pending_fill_reconciliation_failed",
+                    trigger=trigger,
+                    errors=recovery_result.errors,
+                )
                 return
-            
-            # ── GATE 1: Must be OUR order (tracked by order manager) ──
-            tracked = state.order_tracker.get(order_id)
+        for fill_identity, pending in list(_pending_fill_events.items()):
+            tracked = state.order_tracker.get(str(pending.get("order_id") or ""))
             if tracked is None:
-                # Not our order — ignore silently
-                return
-            
-            # Use tracked order's side if WS didn't provide it
-            if not side:
-                side = tracked.side
-            
-            # ── GATE 2: Deduplicate (WS replays the same fill multiple times) ──
-            fill_key = f"{order_id}:{size}:{price}"
-            if _fill_dedup.check_and_add(fill_key):
-                return
-            
-            # Find market info for this token
-            market_question = ""
-            condition_id = None
-            for md in state.active_markets.values():
-                if md.token_id_yes == token_id or md.token_id_no == token_id:
-                    condition_id = md.condition_id
-                    market_question = md.question
-                    break
-            
-            dollar_value = size * price
-            
-            # Log fill details
-            logger.info(
-                "fill_confirmed",
-                token_id=token_id[:16] if token_id else "?",
+                continue
+            condition_id = str(pending.get("condition_id") or tracked.condition_id or "")
+            market_md = state.active_markets.get(condition_id) if condition_id else None
+            fee, fee_known, fee_source = _fill_fee_details(
+                pending,
+                market_md,
+                price=float(pending.get("price", 0.0) or 0.0),
+                size=float(pending.get("size", 0.0) or 0.0),
+            )
+            if not fee_known:
+                fee, fee_source = await _lookup_trade_fee(pending)
+                fee_known = fee is not None
+            if not fee_known or fee is None:
+                continue
+            applied = await _apply_fill_once(
+                pending,
+                tracked=tracked,
+                fee=float(fee),
+                fee_known=True,
+                fee_source=fee_source,
+                pending_fill_id=int(pending.get("pending_fill_id", 0) or 0) or None,
+            )
+            if applied:
+                _pending_fill_events.pop(fill_identity, None)
+
+    def _schedule_pending_fill_drain(trigger: str) -> None:
+        nonlocal _pending_fill_drain_task
+        if _pending_fill_drain_task is not None and not _pending_fill_drain_task.done():
+            return
+        _pending_fill_drain_task = asyncio.create_task(_drain_pending_fill_events(trigger))
+        _pending_fill_drain_task.add_done_callback(_task_done_callback)
+    unknown_fill_reconciliation_inflight: set[str] = set()
+
+    def _resolve_fill_fee(
+        fill_msg: dict[str, Any],
+        market_md: MarketMetadata | None,
+        *,
+        price: float,
+        size: float,
+    ) -> tuple[float | None, bool, str]:
+        payload_fee = fill_msg.get("fee_amount")
+        if payload_fee is not None:
+            return float(payload_fee), True, str(fill_msg.get("fee_source") or "payload")
+
+        if market_md is None:
+            return None, False, "market_missing"
+
+        if not getattr(market_md, "fees_enabled", False):
+            return 0.0, True, "zero_fee_market"
+
+        if getattr(market_md, "fee_known", False):
+            return (
+                price * size * float(getattr(market_md, "fee_rate", 0.0) or 0.0),
+                True,
+                "market_metadata",
+            )
+
+        return None, False, "fee_unknown"
+
+    async def _record_pending_fill(
+        fill_msg: dict[str, Any],
+        *,
+        ingest_state: str,
+        tracked: Any | None = None,
+    ) -> None:
+        order_id = str(fill_msg.get("order_id") or "")
+        token_id = str(
+            fill_msg.get("token_id")
+            or (getattr(tracked, "token_id", "") if tracked else "")
+            or ""
+        )
+        condition_id = str(
+            fill_msg.get("condition_id")
+            or (getattr(tracked, "condition_id", "") if tracked else "")
+            or ""
+        )
+        side = str(
+            fill_msg.get("side")
+            or (getattr(tracked, "side", "") if tracked else "")
+            or ""
+        ).upper()
+        price = float(fill_msg.get("price", 0.0) or 0.0)
+        size = float(fill_msg.get("size", 0.0) or 0.0)
+        market_md = (
+            state.active_markets.get(condition_id)
+            if condition_id else None
+        )
+        fee_amount, fee_known, fee_source = _resolve_fill_fee(
+            fill_msg,
+            market_md,
+            price=price,
+            size=size,
+        )
+        book = state.book_manager.get(token_id)
+        mid_at_fill = book.get_midpoint() if book else None
+        await fill_recorder.record_fill(
+            ts=datetime.now(UTC),
+            condition_id=condition_id,
+            token_id=token_id,
+            order_id=order_id,
+            side=side,
+            price=price,
+            size=size,
+            fee=fee_amount,
+            mid_at_fill=mid_at_fill,
+            is_scoring=bool(getattr(tracked, "is_scoring", False)),
+            reward_eligible=(
+                market_md.reward_eligible
+                if market_md
+                else condition_id in state.reward_eligible
+            ),
+            exchange_trade_id=str(fill_msg.get("exchange_trade_id") or ""),
+            fill_identity=str(fill_msg.get("fill_identity") or ""),
+            fee_known=fee_known,
+            fee_source=fee_source,
+            ingest_state=ingest_state,
+            raw_event_json=fill_msg.get("raw_msg") or {},
+        )
+        logger.warning(
+            "pending_fill_recorded",
+            order_id=order_id[:16] if order_id else "?",
+            token_id=token_id[:16] if token_id else "?",
+            condition_id=condition_id[:16] if condition_id else "?",
+            fill_identity=str(fill_msg.get("fill_identity") or "")[:16],
+            ingest_state=ingest_state,
+        )
+        await emit_spine_event(
+            event_type=(
+                "unknown_order_fill"
+                if ingest_state == "pending_unknown_order"
+                else "fill_fee_unknown"
+            ),
+            strategy=(getattr(tracked, "strategy", "") if tracked else "ops") or "ops",
+            condition_id=condition_id or None,
+            token_id=token_id or None,
+            order_id=order_id or None,
+            payload_json={
+                "exchange_trade_id": fill_msg.get("exchange_trade_id"),
+                "fill_identity": fill_msg.get("fill_identity"),
+                "side": side,
+                "price": price,
+                "size": size,
+                "fee_amount": fee_amount,
+                "fee_known": fee_known,
+                "fee_source": fee_source,
+                "ingest_state": ingest_state,
+            },
+        )
+        alert_title = (
+            "UNKNOWN ORDER FILL"
+            if ingest_state == "pending_unknown_order"
+            else "FILL FEE UNKNOWN"
+        )
+        alert_key = (
+            "unknown_fill"
+            if ingest_state == "pending_unknown_order"
+            else "unknown_fill_fee"
+        )
+        await alert_manager.warning(
+            alert_title,
+            f"order_id={order_id[:16] or '?'}"
+            f" token={token_id[:16] or '?'}"
+            f" size={size:.4f} price={price:.4f}",
+            dedupe_key=f"{alert_key}:{fill_msg.get('fill_identity', order_id)}",
+        )
+
+    async def _record_pending_unknown_fill(fill_msg: dict[str, Any]) -> None:
+        await _record_pending_fill(fill_msg, ingest_state="pending_unknown_order")
+
+    async def _apply_fill_effects(
+        fill_msg: dict[str, Any],
+        tracked: Any,
+        *,
+        existing_fill_id: int | None = None,
+        send_fill_notification: bool = True,
+    ) -> None:
+        order_id = str(fill_msg.get("order_id") or "")
+        token_id = str(fill_msg.get("token_id") or tracked.token_id or "")
+        condition_id = str(fill_msg.get("condition_id") or tracked.condition_id or "")
+        side = str(fill_msg.get("side") or tracked.side or "").upper()
+        price = float(fill_msg.get("price", 0.0) or 0.0)
+        size = float(fill_msg.get("size", 0.0) or 0.0)
+        market_md = state.active_markets.get(condition_id) if condition_id else None
+        market_question = market_md.question if market_md else (condition_id or "")
+        fee_amount, fee_known, fee_source = _resolve_fill_fee(
+            fill_msg,
+            market_md,
+            price=price,
+            size=size,
+        )
+        if not fee_known:
+            fee_amount, fee_source = await _lookup_trade_fee(fill_msg)
+            fee_known = fee_amount is not None
+        if not fee_known:
+            if existing_fill_id is None:
+                await _record_pending_fill(
+                    fill_msg,
+                    ingest_state="pending_fee_truth",
+                    tracked=tracked,
+                )
+            return
+        fee_for_state = float(fee_amount or 0.0)
+        dollar_value = size * price
+
+        logger.info(
+            "fill_confirmed",
+            token_id=token_id[:16] if token_id else "?",
+            order_id=order_id[:16] if order_id else "?",
+            side=side,
+            price=price,
+            size=size,
+            dollar_value=round(dollar_value, 2),
+            market=market_question[:40] if market_question else "?",
+            fee_known=fee_known,
+            fee_source=fee_source,
+        )
+
+        if not fee_known:
+            logger.warning(
+                "fill_fee_unknown",
                 order_id=order_id[:16] if order_id else "?",
+                token_id=token_id[:16] if token_id else "?",
+                condition_id=condition_id[:16] if condition_id else "?",
+                fee_source=fee_source,
+            )
+
+        if condition_id:
+            pos = (
+                state.position_tracker.get(condition_id)
+                or state.position_tracker.get_by_token(token_id)
+            )
+            if pos:
+                pos.apply_fill(
+                    token_id, "BUY" if side == "BUY" else "SELL",
+                    size, price, fee=fee_for_state,
+                )
+            else:
+                logger.warning(
+                    "fill_position_untracked",
+                    order_id=order_id[:16],
+                    condition_id=condition_id[:16] if condition_id else "?",
+                    token_id=token_id[:16] if token_id else "?",
+                )
+
+        is_scoring = bool(getattr(tracked, "is_scoring", False))
+        reward_eligible = (
+            market_md.reward_eligible
+            if market_md
+            else condition_id in state.reward_eligible
+        )
+        book = state.book_manager.get(token_id)
+        mid_at_fill = book.get_midpoint() if book else None
+
+        if existing_fill_id is None:
+            existing_fill_id = await fill_recorder.record_fill(
+                ts=datetime.now(UTC),
+                condition_id=condition_id,
+                token_id=token_id,
+                order_id=order_id,
                 side=side,
                 price=price,
                 size=size,
-                dollar_value=round(dollar_value, 2),
-                market=market_question[:40] if market_question else "?",
+                fee=fee_amount,
+                mid_at_fill=mid_at_fill,
+                is_scoring=is_scoring,
+                reward_eligible=reward_eligible,
+                exchange_trade_id=str(fill_msg.get("exchange_trade_id") or ""),
+                fill_identity=str(fill_msg.get("fill_identity") or ""),
+                fee_known=fee_known,
+                fee_source=fee_source,
+                ingest_state="applied",
+                raw_event_json=fill_msg.get("raw_msg") or {},
             )
-            
-            # Compute actual fee from market's fee_rate, default 0.2%
-            market_md = state.active_markets.get(condition_id) if condition_id else None
-            if market_md and hasattr(market_md, 'fee_rate') and market_md.fee_rate > 0:
-                fee = price * size * market_md.fee_rate
-            else:
-                fee = price * size * 0.002  # Default 0.2% fee rate
+        else:
+            await fill_recorder.resolve_pending_fill(
+                existing_fill_id,
+                condition_id=condition_id,
+                token_id=token_id,
+                order_id=order_id,
+                side=side,
+                fee=fee_amount,
+                fee_known=fee_known,
+                fee_source=fee_source,
+                mid_at_fill=mid_at_fill,
+                is_scoring=is_scoring,
+                reward_eligible=reward_eligible,
+                raw_event_json=fill_msg.get("raw_msg") or {},
+            )
 
-            # Update position tracker
-            if condition_id:
-                pos = state.position_tracker.get(condition_id)
-                if pos:
-                    fill_side = "BUY" if side == "BUY" else "SELL"
-                    pos.apply_fill(token_id, fill_side, size, price, fee=fee)
-            
-            # ── PMM-2: Record fill with markout tracking (S1-2) ──
-            if condition_id and token_id:
-                tracked_order = state.order_tracker.get(order_id)
-                is_scoring = tracked_order.is_scoring if tracked_order else False
-                
-                # Check if market is reward-eligible
-                market_md = state.active_markets.get(condition_id)
-                reward_eligible = market_md.reward_eligible if market_md else False
-                
-                # Get book midpoint at fill time
-                book = state.book_manager.get(token_id)
-                mid_at_fill = book.get_midpoint() if book else None
-                
-                _t = asyncio.create_task(
-                    fill_recorder.record_fill(
-                        ts=datetime.now(timezone.utc),
-                        condition_id=condition_id,
-                        token_id=token_id,
-                        order_id=order_id,
-                        side=side,
-                        price=price,
-                        size=size,
-                        fee=fee,
-                        mid_at_fill=mid_at_fill,
-                        is_scoring=is_scoring,
-                        reward_eligible=reward_eligible,
-                    )
+        event_type = (
+            "order_filled"
+            if tracked.state == OrderState.FILLED
+            else "order_partially_filled"
+        )
+        realized_spread_capture = None
+        adverse_selection_estimate = None
+        if mid_at_fill is not None:
+            if side == "BUY":
+                realized_spread_capture = mid_at_fill - price
+            else:
+                realized_spread_capture = price - mid_at_fill
+            adverse_selection_estimate = -realized_spread_capture
+        await emit_spine_event(
+            event_type=event_type,
+            strategy=tracked.strategy or "mm",
+            condition_id=condition_id,
+            token_id=token_id,
+            order_id=order_id,
+            payload_json={
+                "side": side,
+                "price": price,
+                "size": size,
+                "fee": fee_amount,
+                "fee_known": fee_known,
+                "fee_source": fee_source,
+                "exchange_trade_id": fill_msg.get("exchange_trade_id"),
+                "fill_identity": fill_msg.get("fill_identity"),
+                "dollar_value": dollar_value,
+                "mid_at_fill": mid_at_fill,
+                "is_scoring": is_scoring,
+                "reward_eligible": reward_eligible,
+                "fee_usdc": fee_amount,
+                "dollar_value_usdc": dollar_value,
+                "realized_spread_capture": realized_spread_capture,
+                "adverse_selection_estimate": adverse_selection_estimate,
+            },
+        )
+
+        # Paper 2 §5: record fill for edge validation
+        if edge_tracker and mid_at_fill is not None:
+            edge_tracker.record_trade(
+                predicted_p=mid_at_fill,
+                market_p=price,
+                outcome=1.0 if side == "BUY" else 0.0,
+                pnl=realized_spread_capture or 0.0,
+                side=side,
+                condition_id=condition_id,
+            )
+
+        # Paper 2: record fill for FV calibration
+        if fv_calibrator and mid_at_fill is not None:
+            fv_calibrator.record_sample(
+                predicted_p=mid_at_fill,
+                market_p=price,
+                outcome=(
+                    1.0 if side == "BUY" else 0.0
+                ),
+            )
+
+        pnl_text = ""
+        if side == "SELL" and condition_id:
+            pos = (
+                state.position_tracker.get(condition_id)
+                or state.position_tracker.get_by_token(token_id)
+            )
+            avg_entry = (
+                pos.yes_avg_price
+                if pos and pos.yes_avg_price > 0 else 0
+            )
+            if not avg_entry and pos:
+                avg_entry = pos.no_avg_price
+            if avg_entry > 0:
+                pnl = (price - avg_entry) * size
+                pnl_pct = ((price / avg_entry) - 1) * 100
+                pnl_emoji = "📈" if pnl >= 0 else "📉"
+                pnl_text = (
+                    f"\n{pnl_emoji} PnL:"
+                    f" ${pnl:+.2f} ({pnl_pct:+.1f}%)"
                 )
-                _t.add_done_callback(_task_done_callback)
-            
-            # Compute PnL for SELL fills
-            pnl_text = ""
-            if side == "SELL" and condition_id:
-                pos = state.position_tracker.get(condition_id)
-                avg_entry = pos.yes_avg_price if pos and pos.yes_avg_price > 0 else 0
-                if not avg_entry and pos:
-                    avg_entry = pos.no_avg_price
-                if avg_entry > 0:
-                    pnl = (price - avg_entry) * size
-                    pnl_pct = ((price / avg_entry) - 1) * 100
-                    pnl_emoji = "📈" if pnl >= 0 else "📉"
-                    pnl_text = f"\n{pnl_emoji} PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)"
-            
-            # Send ONE Telegram notification per fill
-            # Check if order was scoring for rewards (S0-5)
-            tracked_order = state.order_tracker.get(order_id)
-            is_scoring = tracked_order.is_scoring if tracked_order else False
+
+        if send_fill_notification:
             scoring_badge = " 💰" if is_scoring else ""
-            
             emoji = "🟢" if side == "BUY" else "🔴"
             market_line = f"\n📊 {market_question[:50]}" if market_question else ""
             notification = (
@@ -905,40 +1917,135 @@ async def run(settings: Settings | None = None) -> None:
                 f"{pnl_text}"
                 f"{market_line}"
             )
-            _t = asyncio.create_task(send_telegram(notification))
-            _t.add_done_callback(_task_done_callback)
-            
-            # Record fill for escalation ladder
-            if hasattr(state, 'fill_escalator'):
-                state.fill_escalator.record_fill()
-            
-            # Record fill for PnL attribution
-            book = state.book_manager.get(token_id)
-            mid_at_fill_pnl = None
-            if book:
-                bb = book.get_best_bid()
-                ba = book.get_best_ask()
-                if bb and ba:
-                    mid_at_fill_pnl = (bb.price_float + ba.price_float) / 2
-            
-            from pmm1.analytics.pnl import FillRecord as PnLFillRecord
-            pnl_fill = PnLFillRecord(
-                order_id=order_id,
-                token_id=token_id,
-                condition_id=condition_id or "",
-                side=side,
+            notify_task = asyncio.create_task(send_telegram(notification))
+            notify_task.add_done_callback(_task_done_callback)
+
+        if hasattr(state, "fill_escalator"):
+            state.fill_escalator.record_fill()
+
+        mid_at_fill_pnl = None
+        if book:
+            bb = book.get_best_bid()
+            ba = book.get_best_ask()
+            if bb and ba:
+                mid_at_fill_pnl = (bb.price_float + ba.price_float) / 2
+
+        from pmm1.analytics.pnl import FillRecord as PnLFillRecord
+
+        pnl_fill = PnLFillRecord(
+            order_id=order_id,
+            token_id=token_id,
+            condition_id=condition_id or "",
+            side=side,
+            price=price,
+            size=size,
+            fee=fee_for_state,
+            strategy=tracked.strategy or "mm",
+            fill_timestamp=time.time(),
+            mid_at_fill=mid_at_fill_pnl or price,
+        )
+        if hasattr(state, "pnl_tracker"):
+            state.pnl_tracker.record_fill(pnl_fill)
+
+        pmm2_on_fill(
+            pmm2_runtime,
+            order_id,
+            size,
+            price,
+            token_id=token_id,
+            condition_id=condition_id,
+        )
+
+    async def _replay_pending_fills(order_id: str | None = None) -> None:
+        pending_rows = await fill_recorder.get_pending_fills(order_id)
+        for row in pending_rows:
+            tracked = state.order_tracker.get(str(row.get("order_id") or ""))
+            if tracked is None:
+                continue
+            raw_event_json = row.get("raw_event_json") or "{}"
+            try:
+                raw_event = json.loads(raw_event_json) if raw_event_json else {}
+            except json.JSONDecodeError:
+                raw_event = {}
+            await _apply_fill_effects(
+                {
+                    "order_id": row.get("order_id"),
+                    "exchange_trade_id": row.get("exchange_trade_id"),
+                    "fill_identity": row.get("fill_identity"),
+                    "token_id": row.get("token_id"),
+                    "condition_id": row.get("condition_id"),
+                    "side": row.get("side"),
+                    "price": row.get("price"),
+                    "size": row.get("size"),
+                    "fee_amount": row.get("fee"),
+                    "fee_source": row.get("fee_source") or "unknown",
+                    "raw_msg": raw_event,
+                },
+                tracked,
+                existing_fill_id=int(row.get("id") or 0),
+                send_fill_notification=False,
+            )
+
+    async def _reconcile_unknown_fill(order_id: str) -> None:
+        try:
+            if not reconciler:
+                return
+            recovery = await reconciler.full_reconciliation()
+            if recovery.success:
+                await _replay_pending_fills(order_id)
+        finally:
+            unknown_fill_reconciliation_inflight.discard(order_id)
+
+    async def on_fill(msg: dict[str, Any]) -> None:
+        """Callback when a fill/trade is received from UserWebSocket."""
+        try:
+            order_id = str(msg.get("order_id", "") or "")
+            price = float(msg.get("price", 0.0) or 0.0)
+            size = float(msg.get("size", 0.0) or 0.0)
+            if not order_id or size <= 0 or price <= 0:
+                return
+
+            fill_identity = str(msg.get("fill_identity") or "")
+            if not fill_identity:
+                raw = msg.get("raw_msg") or msg
+                fill_identity = hashlib.sha256(
+                    json.dumps(raw, sort_keys=True, default=str)
+                    .encode("utf-8")
+                ).hexdigest()
+            if _fill_dedup.check_and_add(fill_identity):
+                return
+
+            tracked = state.order_tracker.get(order_id)
+            if tracked is None:
+                await _record_pending_unknown_fill(msg)
+                if reconciler is not None and order_id not in unknown_fill_reconciliation_inflight:
+                    unknown_fill_reconciliation_inflight.add(order_id)
+                    reconcile_task = asyncio.create_task(_reconcile_unknown_fill(order_id))
+                    reconcile_task.add_done_callback(_task_done_callback)
+                return
+
+            condition_id = str(msg.get("condition_id") or tracked.condition_id or "")
+            market_md = state.active_markets.get(condition_id) if condition_id else None
+            _, fee_known, _ = _resolve_fill_fee(
+                msg,
+                market_md,
                 price=price,
                 size=size,
-                fee=fee,
-                strategy=tracked.strategy if tracked else "mm",
-                fill_timestamp=time.time(),
-                mid_at_fill=mid_at_fill_pnl or price,
             )
-            if hasattr(state, 'pnl_tracker'):
-                state.pnl_tracker.record_fill(pnl_fill)
-            
-            # PMM-2: forward fill to queue estimator + persistence
-            pmm2_on_fill(pmm2_runtime, order_id, size, price)
+            if not fee_known:
+                await _record_pending_fill(
+                    msg,
+                    ingest_state="pending_fee_truth",
+                    tracked=tracked,
+                )
+                if reconciler is not None and order_id not in unknown_fill_reconciliation_inflight:
+                    unknown_fill_reconciliation_inflight.add(order_id)
+                    reconcile_task = asyncio.create_task(_reconcile_unknown_fill(order_id))
+                    reconcile_task.add_done_callback(_task_done_callback)
+                return
+
+            await _replay_pending_fills(order_id)
+            await _apply_fill_effects(msg, tracked)
         except Exception as e:
             logger.error("on_fill_callback_error", error=str(e))
 
@@ -947,19 +2054,60 @@ async def run(settings: Settings | None = None) -> None:
         try:
             order_id = msg.get("orderID") or msg.get("order_id") or msg.get("id", "")
             status = msg.get("status", "").upper()
-            
+            tracked = state.order_tracker.get(order_id) if order_id else None
+
             logger.info(
                 "order_status_change",
                 order_id=order_id[:16] if order_id else "?",
                 status=status,
             )
-            
+
+            token_id = (
+                msg.get("asset_id")
+                or msg.get("token_id", "")
+                or (tracked.token_id if tracked else "")
+            )
+            side = msg.get("side", "").upper() or (tracked.side if tracked else "")
+            price = float(msg.get("price", 0) or (tracked.price_float if tracked else 0))
+            size = float(
+                msg.get("original_size")
+                or msg.get("size", 0)
+                or (tracked.original_size_float if tracked else 0)
+            )
+            condition_id = (
+                msg.get("market")
+                or msg.get("condition_id", "")
+                or (tracked.condition_id if tracked else "")
+            )
+
+            event_type = {
+                "LIVE": "order_live",
+                "FAILED": "order_rejected",
+                "EXPIRED": "order_expired",
+                "CANCELED": "order_canceled",
+                "CANCELLED": "order_canceled",
+            }.get(status)
+            if event_type:
+                await emit_spine_event(
+                    event_type=event_type,
+                    strategy=(tracked.strategy if tracked else "mm") or "mm",
+                    condition_id=condition_id or None,
+                    token_id=token_id or None,
+                    order_id=order_id or None,
+                    payload_json={
+                        "status": status,
+                        "side": side,
+                        "price": price,
+                        "size": size,
+                        "source": "user_ws",
+                    },
+                )
+
+            if tracked is not None:
+                await _replay_pending_fills(order_id)
+
             # PMM-2: forward order lifecycle events
             if status == "LIVE":
-                token_id = msg.get("asset_id") or msg.get("token_id", "")
-                side = msg.get("side", "").upper()
-                price = float(msg.get("price", 0))
-                size = float(msg.get("original_size") or msg.get("size", 0))
                 # Estimate book depth at this price (rough)
                 book = state.book_manager.get(token_id) if token_id else None
                 book_depth = 0.0
@@ -969,7 +2117,16 @@ async def run(settings: Settings | None = None) -> None:
                         if abs(float(lvl_price) - price) < 0.001:
                             book_depth = float(lvl_size)
                             break
-                pmm2_on_order_live(pmm2_runtime, order_id, token_id, side, price, size, book_depth)
+                pmm2_on_order_live(
+                    pmm2_runtime,
+                    order_id,
+                    token_id,
+                    side,
+                    price,
+                    size,
+                    book_depth,
+                    condition_id=condition_id,
+                )
             elif status in ("CANCELED", "CANCELLED"):
                 pmm2_on_order_canceled(pmm2_runtime, order_id)
         except Exception as e:
@@ -979,7 +2136,10 @@ async def run(settings: Settings | None = None) -> None:
         ws_url=settings.api.ws_market_url,
         book_manager=state.book_manager,
         on_book_update=on_book_update,
+        on_book_delta=on_book_delta,
         on_trade=on_trade,
+        on_tick_change=on_tick_change,
+        on_reconnect=on_market_reconnect,
     )
 
     user_ws: UserWebSocket | None = None
@@ -991,7 +2151,7 @@ async def run(settings: Settings | None = None) -> None:
             api_passphrase=settings.api.api_passphrase,
             wallet_address=settings.wallet.address,
             order_tracker=state.order_tracker,
-            on_reconnect=on_reconnect,
+            on_reconnect=on_user_reconnect,
             on_trade_update=on_fill,
             on_order_update=on_order_status,
         )
@@ -1006,15 +2166,39 @@ async def run(settings: Settings | None = None) -> None:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    market_ws_task = market_ws.start(all_token_ids)
+    _market_ws_task = market_ws.start(all_token_ids)
     if user_ws:
-        user_ws_task = user_ws.start()
+        _user_ws_task = user_ws.start()
     if heartbeat:
-        heartbeat_task = heartbeat.start()
+        _heartbeat_task = heartbeat.start()
     if reconciler:
-        reconcile_task = reconciler.start()
-    recorder_task = recorder.start()
-    
+        _reconcile_task = reconciler.start()
+    _recorder_task = recorder.start()
+    order_fact_materializer_task = None
+    if state.order_fact_materializer is not None:
+        order_fact_materializer_task = await state.order_fact_materializer.start()
+        order_fact_materializer_task.add_done_callback(_task_done_callback)
+    fill_fact_materializer_task = None
+    if state.fill_fact_materializer is not None:
+        fill_fact_materializer_task = await state.fill_fact_materializer.start()
+        fill_fact_materializer_task.add_done_callback(_task_done_callback)
+    book_snapshot_fact_materializer_task = None
+    if state.book_snapshot_fact_materializer is not None:
+        book_snapshot_fact_materializer_task = await state.book_snapshot_fact_materializer.start()
+        book_snapshot_fact_materializer_task.add_done_callback(_task_done_callback)
+    quote_fact_materializer_task = None
+    if state.quote_fact_materializer is not None:
+        quote_fact_materializer_task = await state.quote_fact_materializer.start()
+        quote_fact_materializer_task.add_done_callback(_task_done_callback)
+    shadow_cycle_fact_materializer_task = None
+    if state.shadow_cycle_fact_materializer is not None:
+        shadow_cycle_fact_materializer_task = await state.shadow_cycle_fact_materializer.start()
+        shadow_cycle_fact_materializer_task.add_done_callback(_task_done_callback)
+    canary_cycle_fact_materializer_task = None
+    if state.canary_cycle_fact_materializer is not None:
+        canary_cycle_fact_materializer_task = await state.canary_cycle_fact_materializer.start()
+        canary_cycle_fact_materializer_task.add_done_callback(_task_done_callback)
+
     # ── Scoring check loop (S0-2) ──
     async def scoring_check_loop() -> None:
         """Background task to check order scoring status every 30 seconds."""
@@ -1023,7 +2207,7 @@ async def run(settings: Settings | None = None) -> None:
                 await asyncio.sleep(30)
                 if paper_mode:
                     continue
-                
+
                 # Get all live order IDs
                 live_orders = [
                     order for order in state.order_tracker.get_active_orders()
@@ -1031,12 +2215,12 @@ async def run(settings: Settings | None = None) -> None:
                 ]
                 if not live_orders:
                     continue
-                
+
                 order_ids = [order.order_id for order in live_orders]
-                
+
                 # Check scoring status
                 scoring_status = await check_orders_scoring(clob_private, order_ids)
-                
+
                 # Update tracked orders
                 scoring_count = 0
                 for order in live_orders:
@@ -1044,15 +2228,15 @@ async def run(settings: Settings | None = None) -> None:
                     order.is_scoring = is_scoring
                     if is_scoring:
                         scoring_count += 1
-                
+
                 logger.info(
                     "order_scoring_check",
                     scoring_count=scoring_count,
                     total_checked=len(order_ids),
                 )
-                
+
                 # ── PMM-2: Persist scoring history (S1-4) ──
-                ts = datetime.now(timezone.utc).isoformat()
+                ts = datetime.now(UTC).isoformat()
                 scoring_records = []
                 for order in live_orders:
                     # Find condition_id for this order
@@ -1063,16 +2247,17 @@ async def run(settings: Settings | None = None) -> None:
                         condition_id,
                         1 if order.is_scoring else 0,
                     ))
-                
+
                 if scoring_records:
                     sql = """
-                        INSERT OR REPLACE INTO scoring_history (ts, order_id, condition_id, is_scoring)
+                        INSERT OR REPLACE INTO scoring_history
+                        (ts, order_id, condition_id, is_scoring)
                         VALUES (?, ?, ?, ?)
                     """
                     await db.execute_many(sql, scoring_records)
             except Exception as e:
                 logger.error("scoring_check_loop_error", error=str(e))
-    
+
     if not paper_mode:
         scoring_check_task = asyncio.create_task(scoring_check_loop())
         scoring_check_task.add_done_callback(_task_done_callback)
@@ -1085,14 +2270,52 @@ async def run(settings: Settings | None = None) -> None:
                 await asyncio.sleep(10)
                 if state.mode not in ("QUOTING", "PAUSED"):
                     continue
-                
+
                 # Snapshot all active market books
                 await book_recorder.snapshot_books(state.active_markets, state.book_manager)
+                for condition_id, market in state.active_markets.items():
+                    for token_id in (market.token_id_yes, market.token_id_no):
+                        if not token_id:
+                            continue
+                        book = state.book_manager.get(token_id)
+                        if not book:
+                            continue
+                        best_bid = book.get_best_bid()
+                        best_ask = book.get_best_ask()
+                        await emit_spine_event(
+                            event_type="book_snapshot",
+                            strategy="market_data",
+                            condition_id=condition_id,
+                            token_id=token_id,
+                            payload_json={
+                                "best_bid": best_bid.price_float if best_bid else None,
+                                "best_ask": best_ask.price_float if best_ask else None,
+                                "mid": book.get_midpoint(),
+                                "spread": book.get_spread(),
+                                "spread_cents": book.get_spread_cents(),
+                                "depth_best_bid": best_bid.size_float if best_bid else None,
+                                "depth_best_ask": best_ask.size_float if best_ask else None,
+                                "depth_within_1c": book.get_depth_within(1.0),
+                                "depth_within_2c": book.get_depth_within(2.0),
+                                "depth_within_5c": book.get_depth_within(5.0),
+                                "is_stale": book.is_stale,
+                                "tick_size": str(book.tick_size),
+                            },
+                        )
             except Exception as e:
                 logger.error("book_snapshot_loop_error", error=str(e))
-    
+
     book_snapshot_task = asyncio.create_task(book_snapshot_loop())
     book_snapshot_task.add_done_callback(_task_done_callback)
+
+    def _build_cached_rest_book(token_id: str, rest_book: Any) -> Any:
+        """Build an OrderBook from REST snapshot levels using the live book API."""
+        return build_order_book_from_snapshot(
+            token_id,
+            bids=list(getattr(rest_book, "bids", []) or []),
+            asks=list(getattr(rest_book, "asks", []) or []),
+            tick_size=state.tick_sizes.get(token_id, Decimal("0.01")),
+        )
 
     def _build_price_oracle() -> dict[str, float]:
         """Build price oracle from current book midpoints for MTM NAV."""
@@ -1112,6 +2335,8 @@ async def run(settings: Settings | None = None) -> None:
                     elif ba:
                         oracle[tid] = ba.price_float
         return oracle
+
+    state.risk_limits.set_price_oracle_provider(_build_price_oracle)
 
     def _add_suppression_reason(intent: Any, side: str, reason: str) -> None:
         """Attach a side-specific suppression reason to a QuoteIntent."""
@@ -1155,6 +2380,33 @@ async def run(settings: Settings | None = None) -> None:
                 "errors": ["order_manager_unavailable"],
             }
 
+        if bid_reasons:
+            await emit_spine_event(
+                event_type="quote_side_suppressed",
+                strategy="mm",
+                condition_id=condition_id,
+                token_id=token_id,
+                payload_json={
+                    "stage": "clear_quotes",
+                    "side": "BUY",
+                    "reasons": list(dict.fromkeys(bid_reasons)),
+                    "neg_risk": neg_risk,
+                },
+            )
+        if ask_reasons:
+            await emit_spine_event(
+                event_type="quote_side_suppressed",
+                strategy="mm",
+                condition_id=condition_id,
+                token_id=token_id,
+                payload_json={
+                    "stage": "clear_quotes",
+                    "side": "SELL",
+                    "reasons": list(dict.fromkeys(ask_reasons)),
+                    "neg_risk": neg_risk,
+                },
+            )
+
         return await order_manager.diff_and_apply(
             QuoteIntent(
                 token_id=token_id,
@@ -1185,28 +2437,33 @@ async def run(settings: Settings | None = None) -> None:
     if not paper_mode and reconciler:
         logger.info("startup_reconciliation_before_drawdown")
         await reconciler.full_reconciliation()
+        _mark_resume_token_valid("startup")
 
     # Initialize drawdown with current NAV (mark-to-market)
     if paper_mode and paper_engine:
         nav = paper_engine.get_nav(state.book_manager)
     else:
         nav = state.inventory_manager.get_total_nav_estimate(price_oracle=_build_price_oracle())
+    state.nav = nav
     state.drawdown.initialize(nav)
     state.risk_limits.update_nav(nav)
 
-    state.mode = "QUOTING"
-    logger.info("pmm1_entering_quoting_mode", markets=len(state.active_markets))
+    state.mode = "QUOTING" if paper_mode or state.resume_token_valid else "PAUSED"
+    logger.info("pmm1_runtime_mode_initialized", mode=state.mode, markets=len(state.active_markets))
     ops_monitor.write_lifecycle_status(
         mode=state.mode,
         paper_mode=paper_mode,
         note="quoting",
         kill_switch=state.kill_switch.get_status(),
+        config_context=config_context,
+        runtime_safety=_runtime_safety_context(),
     )
 
     # ── Main quote loop ──
     cycle_count = 0
     quote_interval = settings.bot.quote_cycle_ms / 1000.0
     last_rebate_check = 0.0  # S0-3: track last rebate check time
+    last_nav_snapshot_emit = 0.0
     summary_lifecycle_counts = zero_lifecycle_counts()
     summary_replacement_reason_counts: dict[str, int] = defaultdict(int)
     summary_market_telemetry_counts: dict[str, int] = defaultdict(int)
@@ -1215,11 +2472,11 @@ async def run(settings: Settings | None = None) -> None:
         while not shutdown_event.is_set():
             cycle_start = time.time()
             cycle_count += 1
-            
+
             # ── Rebate check (S0-3) — every hour ──
             if not paper_mode and (time.time() - last_rebate_check) >= 3600:
                 try:
-                    rebate_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    rebate_date = datetime.now(UTC).strftime("%Y-%m-%d")
                     rewards_client_rebate = RewardsClient(base_url=settings.api.clob_url)
                     rebate_data = await rewards_client_rebate.fetch_rebates(
                         maker_address=settings.wallet.address,
@@ -1239,10 +2496,16 @@ async def run(settings: Settings | None = None) -> None:
 
             # ── Kill switch check (skip in paper mode) ──
             if not paper_mode:
-                state.kill_switch.check_stale_feed(market_ws.seconds_since_last_message)
-                state.kill_switch.check_heartbeat(
-                    heartbeat.is_healthy, heartbeat.consecutive_failures
+                stale_triggered = state.kill_switch.check_stale_feed(
+                    market_ws.seconds_since_last_message
                 )
+                if stale_triggered:
+                    _invalidate_resume_token("stale_market_feed")
+                if heartbeat is not None:
+                    state.kill_switch.check_heartbeat(
+                        heartbeat.is_healthy,
+                        heartbeat.consecutive_failures,
+                    )
 
                 if state.kill_switch.is_triggered:
                     if state.mode != "FLATTEN_ONLY":
@@ -1258,29 +2521,53 @@ async def run(settings: Settings | None = None) -> None:
                         paper_mode=paper_mode,
                         note="kill_switch_active",
                         kill_switch=state.kill_switch.get_status(),
+                        config_context=config_context,
+                        runtime_safety=_runtime_safety_context(),
                     )
                     await asyncio.sleep(1.0)
                     continue
                 else:
                     # Kill switch cleared — resume quoting
-                    if state.mode == "FLATTEN_ONLY":
+                    if state.mode in {"FLATTEN_ONLY", "PAUSED"} and state.resume_token_valid:
                         logger.info("kill_switch_cleared_resuming_quoting")
                         state.mode = "QUOTING"
+                    elif state.mode == "FLATTEN_ONLY":
+                        state.mode = "PAUSED"
 
             # ── Drawdown check ──
             if state.drawdown.should_check_daily_reset():
                 if paper_mode and paper_engine:
                     nav = paper_engine.get_nav(state.book_manager)
                 else:
-                    nav = state.inventory_manager.get_total_nav_estimate(price_oracle=_build_price_oracle())
+                    nav = state.inventory_manager.get_total_nav_estimate(
+                        price_oracle=_build_price_oracle()
+                    )
+                state.nav = nav
                 state.drawdown.reset_daily(nav)
 
             if paper_mode and paper_engine:
                 nav = paper_engine.get_nav(state.book_manager)
             else:
-                nav = state.inventory_manager.get_total_nav_estimate(price_oracle=_build_price_oracle())
+                nav = state.inventory_manager.get_total_nav_estimate(
+                    price_oracle=_build_price_oracle()
+                )
+            state.nav = nav
             dd_state = state.drawdown.update(nav)
             state.risk_limits.update_nav(nav)
+            now_ts = time.time()
+            if now_ts - last_nav_snapshot_emit >= 60.0:
+                await emit_spine_event(
+                    event_type="nav_snapshot",
+                    strategy="ops",
+                    payload_json={
+                        "nav": nav,
+                        "mode": state.mode,
+                        "drawdown_pct": dd_state.drawdown_pct,
+                        "daily_pnl": dd_state.daily_pnl,
+                        "tier": dd_state.tier.value,
+                    },
+                )
+                last_nav_snapshot_emit = now_ts
 
             if dd_state.should_flatten_only:
                 if state.mode != "FLATTEN_ONLY":
@@ -1296,6 +2583,8 @@ async def run(settings: Settings | None = None) -> None:
                     paper_mode=paper_mode,
                     note="drawdown_flatten_only",
                     kill_switch=state.kill_switch.get_status(),
+                    config_context=config_context,
+                    runtime_safety=_runtime_safety_context(),
                 )
                 await asyncio.sleep(1.0)
                 continue
@@ -1352,21 +2641,19 @@ async def run(settings: Settings | None = None) -> None:
                     try:
                         rest_book = await clob_public.get_order_book(tid)
                         if rest_book and rest_book.bids and rest_book.asks:
-                            from pmm1.state.books import OrderBook
-                            cb = OrderBook(tid, tick_size=state.tick_sizes.get(tid, Decimal("0.01")))
-                            for bid in rest_book.bids:
-                                cb.update_level("bid", Decimal(bid.price), Decimal(bid.size))
-                            for ask in rest_book.asks:
-                                cb.update_level("ask", Decimal(ask.price), Decimal(ask.size))
+                            cb = _build_cached_rest_book(tid, rest_book)
                             ck = f"rest_book_{tid}"
                             state.rest_book_cache[ck] = cb
                             state.rest_book_cache_ts[ck] = time.time()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("rest_book_prefetch_failed", token_id=tid[:16], error=str(e))
 
                 # Fetch up to 5 books in parallel per cycle
                 batch = stale_tokens[:5]
                 await asyncio.gather(*[_fetch_rest_book(t) for t in batch])
+
+            # ── Per-cycle Paper 2 edge confidence ──
+            _edge_confidence = edge_tracker.get_edge_confidence() if edge_tracker else 1.0
 
             # ── Quote each market ──
             markets_quoted = 0
@@ -1388,7 +2675,10 @@ async def run(settings: Settings | None = None) -> None:
             for md in state.eligible_markets():
                 question = md.question or md.slug or md.condition_id
                 token_id = md.token_id_yes
-                tick_size = state.tick_sizes.get(token_id, Decimal("0.01")) if token_id else Decimal("0.01")
+                tick_size = (
+                    state.tick_sizes.get(token_id, Decimal("0.01"))
+                    if token_id else Decimal("0.01")
+                )
 
                 # Hard stop: cancel quotes when resolution risk says stop
                 if not state.resolution_risk.should_quote(md.condition_id):
@@ -1410,11 +2700,13 @@ async def run(settings: Settings | None = None) -> None:
                         reason="resolution_quote_halt",
                         condition_id=md.condition_id,
                         question=question,
-                        hours_to_end=round(
-                            state.resolution_risk.get(md.condition_id).hours_remaining, 2
-                        )
-                        if state.resolution_risk.get(md.condition_id) is not None
-                        else None,
+                        hours_to_end=(
+                            round(res_state.hours_remaining, 2)
+                            if (res_state := state.resolution_risk.get(
+                                md.condition_id
+                            )) is not None
+                            else None
+                        ),
                     )
                     continue
 
@@ -1443,16 +2735,15 @@ async def run(settings: Settings | None = None) -> None:
                         try:
                             rest_book = await clob_public.get_order_book(token_id)
                             if rest_book and rest_book.bids and rest_book.asks:
-                                from pmm1.state.books import OrderBook
-                                cached_book = OrderBook(token_id, tick_size=state.tick_sizes.get(token_id, Decimal("0.01")))
-                                for bid in rest_book.bids:
-                                    cached_book.update_level("bid", Decimal(bid.price), Decimal(bid.size))
-                                for ask in rest_book.asks:
-                                    cached_book.update_level("ask", Decimal(ask.price), Decimal(ask.size))
+                                cached_book = _build_cached_rest_book(token_id, rest_book)
                                 state.rest_book_cache[rest_cache_key] = cached_book
                                 state.rest_book_cache_ts[rest_cache_key] = time.time()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning(
+                                "rest_book_refresh_failed",
+                                token_id=token_id[:16],
+                                error=str(e),
+                            )
                     book = state.rest_book_cache.get(rest_cache_key)
 
                 if book is None or (not book._bids and not book._asks):
@@ -1474,7 +2765,10 @@ async def run(settings: Settings | None = None) -> None:
                             ["book_missing"],
                             ["book_missing"],
                         )
-                        _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
+                        _merge_replacement_reasons(
+                            cycle_replacement_reason_counts,
+                            suppress_result_no,
+                        )
                     _emit_market_telemetry(
                         state.market_telemetry,
                         kind="quote_market_suppressed",
@@ -1532,13 +2826,19 @@ async def run(settings: Settings | None = None) -> None:
                             live_assessment.reasons,
                             live_assessment.reasons,
                         )
-                        _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
+                        _merge_replacement_reasons(
+                            cycle_replacement_reason_counts,
+                            suppress_result_no,
+                        )
                     continue
 
                 # ── Check arb opportunities first ──
                 if settings.strategy.enable_binary_parity:
                     book_no = state.book_manager.get(md.token_id_no)
-                    book_no_fresh = book_no and book_no.age_seconds <= stale_threshold if book_no else False
+                    book_no_fresh = (
+                        book_no and book_no.age_seconds <= stale_threshold
+                        if book_no else False
+                    )
                     if book and book_no and book_no_fresh:
                         arb_orders = state.parity_detector.scan(
                             book, book_no, md.condition_id,
@@ -1589,15 +2889,15 @@ async def run(settings: Settings | None = None) -> None:
                                 b = state.book_manager.get(tid)
                                 if b:
                                     books[tid] = b
-                        arb_orders = state.neg_risk_detector.scan_event(
+                        neg_arb_orders = state.neg_risk_detector.scan_event(
                             outcomes, books, md.event_id
                         )
-                        if arb_orders and not dd_state.should_pause_taker:
+                        if neg_arb_orders and not dd_state.should_pause_taker:
                             if paper_mode and paper_engine and paper_logger:
                                 paper_logger.log_arb(
                                     arb_type="neg_risk",
                                     event_id=md.event_id,
-                                    details={"num_orders": len(arb_orders)},
+                                    details={"num_orders": len(neg_arb_orders)},
                                 )
                                 paper_engine.submit_arb_orders([
                                     {
@@ -1608,7 +2908,7 @@ async def run(settings: Settings | None = None) -> None:
                                         "size": o.size,
                                         "neg_risk": True,
                                     }
-                                    for o in arb_orders
+                                    for o in neg_arb_orders
                                 ])
                             elif order_manager:
                                 arb_reqs = [
@@ -1621,7 +2921,7 @@ async def run(settings: Settings | None = None) -> None:
                                         neg_risk=True,
                                         post_only=False,
                                     )
-                                    for o in arb_orders
+                                    for o in neg_arb_orders
                                 ]
                                 await order_manager.execute_arb(arb_reqs)
                             continue
@@ -1643,6 +2943,18 @@ async def run(settings: Settings | None = None) -> None:
                                 base_fair_value = blended_fv
                         except Exception as v3_err:
                             logger.debug("v3_blend_error", error=str(v3_err))
+
+                    # Embedded Opus reasoning (if enabled)
+                    if llm_reasoner and llm_reasoner.config.enabled:
+                        llm_fv, llm_meta = (
+                            llm_reasoner.get_blended_fair_value(
+                                md.condition_id,
+                                base_fair_value,
+                            )
+                        )
+                        if llm_meta.get("llm_used"):
+                            fv_estimate.fair_value = llm_fv
+                            base_fair_value = llm_fv
 
                     # Skip extreme prices — no counterparty flow below 15c or above 85c
                     if base_fair_value < 0.15 or base_fair_value > 0.85:
@@ -1675,15 +2987,22 @@ async def run(settings: Settings | None = None) -> None:
                                 ["extreme_fair_value"],
                                 ["extreme_fair_value"],
                             )
-                            _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
+                            _merge_replacement_reasons(
+                            cycle_replacement_reason_counts,
+                            suppress_result_no,
+                        )
                         continue
 
                     # Inventory (YES position)
                     pos = state.position_tracker.get(md.condition_id)
-                    yes_inventory = pos.yes_size if pos else 0.0
+                    _yes_inventory = pos.yes_size if pos else 0.0
                     no_inventory = pos.no_size if pos else 0.0
                     market_inv = pos.net_exposure if pos else 0.0
-                    cluster_inv = state.position_tracker.get_event_net_exposure(md.event_id) if md.event_id else 0.0
+                    cluster_inv = (
+                        state.position_tracker.get_event_net_exposure(
+                            md.event_id
+                        ) if md.event_id else 0.0
+                    )
 
                     # Position age for dynamic γ
                     position_age_hours = 0.0
@@ -1705,7 +3024,10 @@ async def run(settings: Settings | None = None) -> None:
                         bid_block_reasons.extend(concentration_reasons)
 
                     # Reward EV
-                    reward_ev = state.reward_estimator.compute_reward_ev_for_universe(md.condition_id)
+                    reward_ev = (
+                        state.reward_estimator
+                        .compute_reward_ev_for_universe(md.condition_id)
+                    )
                     market_inventory_yes, cluster_inventory_yes = inventory_context_for_token(
                         is_no_token=False,
                         market_inventory=market_inv,
@@ -1726,6 +3048,9 @@ async def run(settings: Settings | None = None) -> None:
                         neg_risk=md.neg_risk,
                         condition_id=md.condition_id,
                         position_age_hours=position_age_hours,
+                        market_price=features.midpoint,
+                        nav=nav,
+                        edge_confidence=_edge_confidence,
                     )
                     apply_quote_book_guards(
                         quote_intent,
@@ -1791,15 +3116,27 @@ async def run(settings: Settings | None = None) -> None:
                             quote_intent.ask_size *= res_mult
 
                     # Final min-size enforcement (after all multipliers)
-                    MIN_SHARES_FINAL = 5.0
-                    if quote_intent.bid_size is not None and quote_intent.bid_size < MIN_SHARES_FINAL:
+                    min_shares_final = 5.0
+                    if (
+                        quote_intent.bid_size is not None and
+                        quote_intent.bid_size < min_shares_final
+                    ):
                         quote_intent.bid_size = None
                         quote_intent.bid_price = None
-                        _add_suppression_reason(quote_intent, "BUY", "size_below_min_after_adjustment")
-                    if quote_intent.ask_size is not None and quote_intent.ask_size < MIN_SHARES_FINAL:
+                        _add_suppression_reason(
+                            quote_intent, "BUY",
+                            "size_below_min_after_adjustment",
+                        )
+                    if (
+                        quote_intent.ask_size is not None and
+                        quote_intent.ask_size < min_shares_final
+                    ):
                         quote_intent.ask_size = None
                         quote_intent.ask_price = None
-                        _add_suppression_reason(quote_intent, "SELL", "size_below_min_after_adjustment")
+                        _add_suppression_reason(
+                            quote_intent, "SELL",
+                            "size_below_min_after_adjustment",
+                        )
 
                     # Execute
                     if token_id in tokens_under_exit:
@@ -1839,6 +3176,14 @@ async def run(settings: Settings | None = None) -> None:
                                 inventory=round(market_inv, 2),
                             )
 
+                    await emit_quote_intent_events(
+                        quote_intent,
+                        fair_value=fv_estimate.fair_value,
+                        inventory=market_inv,
+                        question=question,
+                        stage="yes_quote",
+                    )
+
                     if paper_mode and paper_engine and paper_logger:
                         if quote_intent.has_bid or quote_intent.has_ask:
                             # Paper mode: submit to paper engine, log the quote
@@ -1865,7 +3210,10 @@ async def run(settings: Settings | None = None) -> None:
                                 half_spread=quote_intent.half_spread,
                                 inventory=market_inv,
                             )
-                            orders_submitted += (1 if quote_intent.has_bid else 0) + (1 if quote_intent.has_ask else 0)
+                            orders_submitted += (
+                                (1 if quote_intent.has_bid else 0)
+                                + (1 if quote_intent.has_ask else 0)
+                            )
                             markets_quoted += 1
                         else:
                             paper_engine.cancel_all_orders(token_id)
@@ -1901,7 +3249,10 @@ async def run(settings: Settings | None = None) -> None:
                     if md.token_id_no and settings.strategy.enable_market_making:
                         token_id_no = md.token_id_no
                         book_no = state.book_manager.get(token_id_no)
-                        book_no_usable = book_no is not None and book_no.age_seconds <= stale_threshold
+                        book_no_usable = (
+                            book_no is not None and
+                            book_no.age_seconds <= stale_threshold
+                        )
 
                         # REST fallback for NO token book
                         if not book_no_usable:
@@ -1911,16 +3262,17 @@ async def run(settings: Settings | None = None) -> None:
                                 try:
                                     rest_book_no = await clob_public.get_order_book(token_id_no)
                                     if rest_book_no and rest_book_no.bids and rest_book_no.asks:
-                                        from pmm1.state.books import OrderBook
-                                        cached_book_no = OrderBook(token_id_no, tick_size=state.tick_sizes.get(token_id_no, Decimal("0.01")))
-                                        for bid in rest_book_no.bids:
-                                            cached_book_no.update_level("bid", Decimal(bid.price), Decimal(bid.size))
-                                        for ask in rest_book_no.asks:
-                                            cached_book_no.update_level("ask", Decimal(ask.price), Decimal(ask.size))
+                                        cached_book_no = _build_cached_rest_book(
+                                            token_id_no, rest_book_no,
+                                        )
                                         state.rest_book_cache[rest_cache_key_no] = cached_book_no
                                         state.rest_book_cache_ts[rest_cache_key_no] = time.time()
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.warning(
+                                        "rest_book_refresh_failed",
+                                        token_id=token_id_no[:16],
+                                        error=str(e),
+                                    )
                             book_no = state.rest_book_cache.get(rest_cache_key_no)
 
                         tick_size_no = state.tick_sizes.get(token_id_no, Decimal("0.01"))
@@ -1934,7 +3286,10 @@ async def run(settings: Settings | None = None) -> None:
                                 ["book_missing"],
                                 ["book_missing"],
                             )
-                            _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
+                            _merge_replacement_reasons(
+                            cycle_replacement_reason_counts,
+                            suppress_result_no,
+                        )
                             _emit_market_telemetry(
                                 state.market_telemetry,
                                 kind="quote_market_suppressed",
@@ -1981,7 +3336,10 @@ async def run(settings: Settings | None = None) -> None:
                                 live_assessment_no.reasons,
                                 live_assessment_no.reasons,
                             )
-                            _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
+                            _merge_replacement_reasons(
+                            cycle_replacement_reason_counts,
+                            suppress_result_no,
+                        )
                             continue
 
                         no_fair_value = 1.0 - base_fair_value
@@ -2004,7 +3362,10 @@ async def run(settings: Settings | None = None) -> None:
                                 ["extreme_fair_value"],
                                 ["extreme_fair_value"],
                             )
-                            _merge_replacement_reasons(cycle_replacement_reason_counts, suppress_result_no)
+                            _merge_replacement_reasons(
+                            cycle_replacement_reason_counts,
+                            suppress_result_no,
+                        )
                             continue
 
                         no_token_inventory = no_inventory
@@ -2021,7 +3382,12 @@ async def run(settings: Settings | None = None) -> None:
                             block_new_buys_no = True
                             bid_block_reasons_no.extend(concentration_reasons)
 
-                        reward_ev_no = state.reward_estimator.compute_reward_ev_for_universe(md.condition_id)
+                        reward_ev_no = (
+                            state.reward_estimator
+                            .compute_reward_ev_for_universe(
+                                md.condition_id
+                            )
+                        )
                         market_inventory_no, cluster_inventory_no = inventory_context_for_token(
                             is_no_token=True,
                             market_inventory=market_inv,
@@ -2041,6 +3407,13 @@ async def run(settings: Settings | None = None) -> None:
                             neg_risk=md.neg_risk,
                             condition_id=md.condition_id,
                             position_age_hours=position_age_hours_no,
+                            market_price=(
+                                features_no.midpoint
+                                if hasattr(features_no, 'midpoint')
+                                else 0.0
+                            ),
+                            nav=nav,
+                            edge_confidence=_edge_confidence,
                         )
                         apply_quote_book_guards(
                             quote_intent_no,
@@ -2053,9 +3426,15 @@ async def run(settings: Settings | None = None) -> None:
                             if no_token_inventory <= 0:
                                 quote_intent_no.ask_size = None
                                 quote_intent_no.ask_price = None
-                                _add_suppression_reason(quote_intent_no, "SELL", "no_inventory_to_offer")
+                                _add_suppression_reason(
+                                    quote_intent_no, "SELL",
+                                    "no_inventory_to_offer",
+                                )
                             else:
-                                if quote_intent_no.ask_size and quote_intent_no.ask_size > no_token_inventory:
+                                if (
+                                    quote_intent_no.ask_size and
+                                    quote_intent_no.ask_size > no_token_inventory
+                                ):
                                     quote_intent_no.ask_size = no_token_inventory
                                 if quote_intent_no.ask_size and quote_intent_no.ask_size < 5.0:
                                     if no_token_inventory >= 5.0:
@@ -2081,8 +3460,12 @@ async def run(settings: Settings | None = None) -> None:
                             if quote_intent_no.ask_size:
                                 quote_intent_no.ask_size *= dd_state.size_multiplier
 
-                        quote_intent_no, risk_diag_no = state.risk_limits.apply_to_quote_with_diagnostics(
-                            quote_intent_no, event_id=md.event_id
+                        quote_intent_no, risk_diag_no = (
+                            state.risk_limits
+                            .apply_to_quote_with_diagnostics(
+                                quote_intent_no,
+                                event_id=md.event_id,
+                            )
                         )
                         for reason in risk_diag_no.bid_reasons:
                             _add_suppression_reason(quote_intent_no, "BUY", reason)
@@ -2096,14 +3479,26 @@ async def run(settings: Settings | None = None) -> None:
                             if quote_intent_no.ask_size:
                                 quote_intent_no.ask_size *= res_mult_no
 
-                        if quote_intent_no.bid_size is not None and quote_intent_no.bid_size < 5.0:
+                        if (
+                            quote_intent_no.bid_size is not None and
+                            quote_intent_no.bid_size < 5.0
+                        ):
                             quote_intent_no.bid_size = None
                             quote_intent_no.bid_price = None
-                            _add_suppression_reason(quote_intent_no, "BUY", "size_below_min_after_adjustment")
-                        if quote_intent_no.ask_size is not None and quote_intent_no.ask_size < 5.0:
+                            _add_suppression_reason(
+                                quote_intent_no, "BUY",
+                                "size_below_min_after_adjustment",
+                            )
+                        if (
+                            quote_intent_no.ask_size is not None and
+                            quote_intent_no.ask_size < 5.0
+                        ):
                             quote_intent_no.ask_size = None
                             quote_intent_no.ask_price = None
-                            _add_suppression_reason(quote_intent_no, "SELL", "size_below_min_after_adjustment")
+                            _add_suppression_reason(
+                                quote_intent_no, "SELL",
+                                "size_below_min_after_adjustment",
+                            )
 
                         if token_id_no in tokens_under_exit:
                             quote_intent_no.bid_price = None
@@ -2113,7 +3508,10 @@ async def run(settings: Settings | None = None) -> None:
                             _add_suppression_reason(quote_intent_no, "BUY", "exit_in_progress")
                             _add_suppression_reason(quote_intent_no, "SELL", "exit_in_progress")
 
-                        if quote_intent_no.bid_price is None and quote_intent_no.bid_suppression_reasons:
+                        if (
+                            quote_intent_no.bid_price is None and
+                            quote_intent_no.bid_suppression_reasons
+                        ):
                             for reason in quote_intent_no.bid_suppression_reasons:
                                 _emit_market_telemetry(
                                     state.market_telemetry,
@@ -2127,7 +3525,10 @@ async def run(settings: Settings | None = None) -> None:
                                     fair_value=round(no_fair_value, 4),
                                     inventory=round(-market_inv, 2),
                                 )
-                        if quote_intent_no.ask_price is None and quote_intent_no.ask_suppression_reasons:
+                        if (
+                            quote_intent_no.ask_price is None and
+                            quote_intent_no.ask_suppression_reasons
+                        ):
                             for reason in quote_intent_no.ask_suppression_reasons:
                                 _emit_market_telemetry(
                                     state.market_telemetry,
@@ -2141,6 +3542,14 @@ async def run(settings: Settings | None = None) -> None:
                                     fair_value=round(no_fair_value, 4),
                                     inventory=round(-market_inv, 2),
                                 )
+
+                        await emit_quote_intent_events(
+                            quote_intent_no,
+                            fair_value=no_fair_value,
+                            inventory=-market_inv,
+                            question=question,
+                            stage="no_quote",
+                        )
 
                         if paper_mode and paper_engine and paper_logger:
                             if quote_intent_no.has_bid or quote_intent_no.has_ask:
@@ -2167,14 +3576,20 @@ async def run(settings: Settings | None = None) -> None:
                                     half_spread=quote_intent_no.half_spread,
                                     inventory=-market_inv,
                                 )
-                                orders_submitted += (1 if quote_intent_no.has_bid else 0) + (1 if quote_intent_no.has_ask else 0)
+                                orders_submitted += (
+                                    (1 if quote_intent_no.has_bid else 0)
+                                    + (1 if quote_intent_no.has_ask else 0)
+                                )
                             else:
                                 paper_engine.cancel_all_orders(token_id_no)
                         elif order_manager:
                             quote_result_no = await order_manager.diff_and_apply(
                                 quote_intent_no, tick_size_no
                             )
-                            _merge_replacement_reasons(cycle_replacement_reason_counts, quote_result_no)
+                            _merge_replacement_reasons(
+                                cycle_replacement_reason_counts,
+                                quote_result_no,
+                            )
 
                         if quote_intent_no.has_bid or quote_intent_no.has_ask:
                             recorder.record_quote_intent(
@@ -2189,9 +3604,19 @@ async def run(settings: Settings | None = None) -> None:
                                 inventory=-market_inv,
                             )
 
-                            if quote_intent_no.bid_price and quote_intent_no.ask_price:
-                                spread_cents_no = (quote_intent_no.ask_price - quote_intent_no.bid_price) * 100
-                                state.metrics.record_quote(token_id_no, md.condition_id, spread_cents_no)
+                            if (
+                                quote_intent_no.bid_price and
+                                quote_intent_no.ask_price
+                            ):
+                                spread_cents_no = (
+                                    (quote_intent_no.ask_price
+                                     - quote_intent_no.bid_price) * 100
+                                )
+                                state.metrics.record_quote(
+                                    token_id_no,
+                                    md.condition_id,
+                                    spread_cents_no,
+                                )
 
             # ── Exit Manager: evaluate all sell/exit signals ──
             if not paper_mode and order_manager:
@@ -2215,7 +3640,9 @@ async def run(settings: Settings | None = None) -> None:
                                 urgency=exit_sig.urgency,
                                 neg_risk=sig_neg_risk,
                             )
-                            for reason, count in result.get("replacement_reason_counts", {}).items():
+                            for reason, count in result.get(
+                                "replacement_reason_counts", {}
+                            ).items():
                                 cycle_replacement_reason_counts[reason] += count
                             if result.get("submitted"):
                                 logger.info(
@@ -2226,7 +3653,7 @@ async def run(settings: Settings | None = None) -> None:
                                     price=exit_sig.price,
                                     urgency=exit_sig.urgency,
                                 )
-                                
+
                                 # Send Telegram notification for exit signal
                                 notification = format_exit_notification(
                                     exit_type=exit_sig.reason,
@@ -2266,7 +3693,11 @@ async def run(settings: Settings | None = None) -> None:
                             # Sort by volume (or use universe scoring if available)
                             best_market = max(
                                 eligible,
-                                key=lambda m: m.volume_24h_usd if hasattr(m, 'volume_24h_usd') else 0.0
+                                key=lambda m: (
+                                    m.volume_24h_usd
+                                    if hasattr(m, 'volume_24h_usd')
+                                    else 0.0
+                                )
                             )
 
                             token_id_taker = best_market.token_id_yes
@@ -2276,30 +3707,54 @@ async def run(settings: Settings | None = None) -> None:
                                 ba_taker = book_taker.get_best_ask()
                                 if ba_taker and ba_taker.price_float > 0:
                                     # Submit small FAK BUY at best ask
-                                    taker_size = max(5.0, state.fill_escalator.config.taker_min_shares)
+                                    taker_size = max(
+                                        5.0,
+                                        state.fill_escalator.config.taker_min_shares,
+                                    )
                                     taker_price = ba_taker.price_float
 
                                     # Ensure dollar value meets minimum
-                                    MIN_DOLLAR = 1.5
-                                    if taker_price * taker_size < MIN_DOLLAR:
-                                        taker_size = max(taker_size, MIN_DOLLAR / taker_price)
+                                    min_dollar = 1.5
+                                    if taker_price * taker_size < min_dollar:
+                                        taker_size = max(taker_size, min_dollar / taker_price)
 
                                     # Per-market risk check
                                     market_cost = taker_price * taker_size
                                     market_exposure = 0.0
                                     pos = state.position_tracker.get(best_market.condition_id)
                                     if pos:
-                                        market_exposure = pos.gross_exposure if hasattr(pos, 'gross_exposure') else (pos.yes_size * pos.yes_avg_price + pos.no_size * pos.no_avg_price)
-                                    taker_nav = state.inventory_manager.get_total_nav_estimate(price_oracle=_build_price_oracle())
-                                    if taker_nav > 0 and (market_exposure + market_cost) / taker_nav > settings.risk.per_market_gross_nav:
-                                        logger.info("taker_bootstrap_blocked_risk_limit",
-                                                    market_exposure=f"{market_exposure:.2f}",
-                                                    market_cost=f"{market_cost:.2f}",
-                                                    nav=f"{taker_nav:.2f}")
+                                        market_exposure = (
+                                            pos.gross_exposure
+                                            if hasattr(pos, 'gross_exposure')
+                                            else (
+                                                pos.yes_size * pos.yes_avg_price
+                                                + pos.no_size * pos.no_avg_price
+                                            )
+                                        )
+                                    taker_nav = (
+                                        state.inventory_manager
+                                        .get_total_nav_estimate(
+                                            price_oracle=_build_price_oracle()
+                                        )
+                                    )
+                                    if (
+                                        taker_nav > 0 and
+                                        (market_exposure + market_cost)
+                                        / taker_nav
+                                        > settings.risk.per_market_gross_nav
+                                    ):
+                                        logger.info(
+                                            "taker_bootstrap_blocked_risk_limit",
+                                            market_exposure=f"{market_exposure:.2f}",
+                                            market_cost=f"{market_cost:.2f}",
+                                            nav=f"{taker_nav:.2f}",
+                                        )
                                         taker_blocked = True
 
                                     if not taker_blocked:
-                                        tick_taker = state.tick_sizes.get(token_id_taker, Decimal("0.01"))
+                                        tick_taker = state.tick_sizes.get(
+                                            token_id_taker, Decimal("0.01"),
+                                        )
 
                                         taker_req = CreateOrderRequest(
                                             token_id=token_id_taker,
@@ -2329,16 +3784,26 @@ async def run(settings: Settings | None = None) -> None:
                                             if submit_result.get("success"):
                                                 logger.info(
                                                     "taker_bootstrap_submitted",
-                                                    order_id=submit_result["order_id"][:16] if submit_result["order_id"] else "?",
+                                                    order_id=(
+                                                        submit_result["order_id"][:16]
+                                                        if submit_result["order_id"]
+                                                        else "?"
+                                                    ),
                                                     token_id=token_id_taker[:16],
                                                 )
                                             else:
                                                 logger.warning(
                                                     "taker_bootstrap_failed",
-                                                    error=submit_result.get("error") or "no response",
+                                                    error=(
+                                                        submit_result.get("error")
+                                                        or "no response"
+                                                    ),
                                                 )
                                         except Exception as taker_err:
-                                            logger.error("taker_bootstrap_error", error=str(taker_err))
+                                            logger.error(
+                                                "taker_bootstrap_error",
+                                                error=str(taker_err),
+                                            )
                     except Exception as e:
                         logger.error("taker_bootstrap_outer_error", error=str(e), exc_info=True)
 
@@ -2379,6 +3844,18 @@ async def run(settings: Settings | None = None) -> None:
                 cycle_lifecycle_counts=cycle_lifecycle_counts,
                 cycle_duration_ms=cycle_duration,
                 pmm2_status=pmm2_runtime.get_status() if pmm2_runtime else None,
+                config_context=config_context,
+                runtime_safety=_runtime_safety_context(),
+                edge_tracker_summary=edge_tracker.get_summary() if edge_tracker else None,
+                kelly_state={
+                    "enabled": settings.pricing.kelly_enabled,
+                    "fraction": settings.pricing.kelly_fraction,
+                    "edge_confidence": _edge_confidence,
+                } if settings.pricing.kelly_enabled else None,
+                calibration_state=(
+                    fv_calibrator.get_calibration_metrics()
+                    if fv_calibrator else None
+                ),
             )
 
             if cycle_count % 100 == 0:
@@ -2386,7 +3863,7 @@ async def run(settings: Settings | None = None) -> None:
                     # Paper mode summary with PnL snapshot
                     snap = paper_engine.snapshot(state.book_manager)
                     paper_logger.log_pnl(snap.to_dict())
-                    pos_summary = paper_engine.get_position_summary()
+                    _pos_summary = paper_engine.get_position_summary()
                     log_stats = paper_logger.get_stats()
 
                     logger.info(
@@ -2454,6 +3931,8 @@ async def run(settings: Settings | None = None) -> None:
             paper_mode=paper_mode,
             note="shutdown",
             kill_switch=state.kill_switch.get_status(),
+            config_context=config_context,
+            runtime_safety=_runtime_safety_context(),
         )
 
         # Cancel all orders
@@ -2467,7 +3946,7 @@ async def run(settings: Settings | None = None) -> None:
         if paper_mode and paper_engine and paper_logger:
             snap = paper_engine.snapshot(state.book_manager)
             paper_logger.log_pnl(snap.to_dict())
-            pos_summary = paper_engine.get_position_summary()
+            _pos_summary = paper_engine.get_position_summary()
             log_stats = paper_logger.get_stats()
 
             print()
@@ -2493,6 +3972,18 @@ async def run(settings: Settings | None = None) -> None:
         if reconciler:
             await reconciler.stop()
         await recorder.stop()
+        if state.order_fact_materializer is not None:
+            await state.order_fact_materializer.stop()
+        if state.fill_fact_materializer is not None:
+            await state.fill_fact_materializer.stop()
+        if state.book_snapshot_fact_materializer is not None:
+            await state.book_snapshot_fact_materializer.stop()
+        if state.quote_fact_materializer is not None:
+            await state.quote_fact_materializer.stop()
+        if state.shadow_cycle_fact_materializer is not None:
+            await state.shadow_cycle_fact_materializer.stop()
+        if state.canary_cycle_fact_materializer is not None:
+            await state.canary_cycle_fact_materializer.stop()
 
         # Close clients
         await gamma.close()
@@ -2500,6 +3991,10 @@ async def run(settings: Settings | None = None) -> None:
         await clob_private.close()
         await data_api.close()
         await db.close()
+        if state.spine_store is not None:
+            await state.spine_store.close()
+        if state.spine_stream_store is not None:
+            await state.spine_stream_store.close()
 
         # Final metrics
         bot_metrics = state.metrics.get_bot_metrics()

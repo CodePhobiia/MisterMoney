@@ -8,9 +8,10 @@ S6: Discrete Capital Allocator
 - Circuit breaker (toxic market detection)
 """
 
-from pmm2.allocator.allocator import AllocationPlan, CapitalAllocator
+from pmm2.allocator.allocator import CapitalAllocator as CapitalAllocator
 from pmm2.allocator.circuit_breaker import CircuitBreaker, MarketCircuitState
 from pmm2.allocator.constraints import AllocationConstraints, ConstraintChecker
+from pmm2.allocator.greedy import AllocationPlan as AllocationPlan
 from pmm2.allocator.greedy import GreedyAllocator
 from pmm2.allocator.hysteresis import MarketAllocationState, ReallocationHysteresis
 from pmm2.allocator.scoring import AdjustedScore, AdjustedScorer

@@ -14,6 +14,8 @@ STATUS: DISABLED — framework stub for future implementation.
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 from pydantic import BaseModel
 
@@ -65,7 +67,11 @@ class NegRiskArbV2:
     - Disabled by default in config
     """
 
-    def __init__(self, clob_client=None, risk_limits=None, enabled: bool = False):
+    def __init__(
+        self, clob_client: Any = None,
+        risk_limits: Any = None,
+        enabled: bool = False,
+    ) -> None:
         self.clob_client = clob_client
         self.risk_limits = risk_limits
         self.enabled = enabled

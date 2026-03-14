@@ -9,8 +9,8 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 
 import structlog
 from pydantic import BaseModel, Field
@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 logger = structlog.get_logger(__name__)
 
 
-class ResolutionState(str, Enum):
+class ResolutionState(StrEnum):
     """Resolution lifecycle states."""
 
     ACTIVE = "active"
@@ -78,7 +78,7 @@ class ResolutionRiskManager:
         resolved_outcome: str | None = None,
     ) -> MarketResolutionState:
         """Update resolution state for a market."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         # Calculate hours remaining
         hours_remaining = float("inf")

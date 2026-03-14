@@ -146,7 +146,9 @@ def market_context_from_object(
             volume_24h=_safe_float(data.get("volume_24h") or data.get("volume_24hr")),
             liquidity=_safe_float(data.get("liquidity")),
             reward_eligible=bool(data.get("reward_eligible", False)),
-            reward_daily_rate=_safe_float(data.get("reward_daily_rate") or data.get("daily_reward_rate")),
+            reward_daily_rate=_safe_float(
+                data.get("reward_daily_rate") or data.get("daily_reward_rate")
+            ),
             reward_min_size=_safe_float(data.get("reward_min_size") or data.get("min_size")),
             reward_max_spread=_safe_float(data.get("reward_max_spread") or data.get("max_spread")),
             fees_enabled=bool(data.get("fees_enabled", False)),
@@ -309,7 +311,12 @@ def evaluate_quote_set(
         evaluation.valid_for_ev = True
         return evaluation
 
-    valid_quotes = [q for q in quotes if q.quote_role in {"bid", "ask"} and 0.0 < q.price < 1.0 and q.size > 0.0]
+    valid_quotes = [
+        q for q in quotes
+        if q.quote_role in {"bid", "ask"}
+        and 0.0 < q.price < 1.0
+        and q.size > 0.0
+    ]
     if len(valid_quotes) != len(quotes):
         evaluation.invalid_reasons.append("dropped_invalid_quotes")
 
@@ -440,7 +447,13 @@ def aggregate_market_evaluations(
         "total_spread_ev_usdc": sum(evaluation.spread_ev_usdc for evaluation in valid_evals),
         "total_reward_ev_usdc": sum(evaluation.reward_ev_usdc for evaluation in valid_evals),
         "total_rebate_ev_usdc": sum(evaluation.rebate_ev_usdc for evaluation in valid_evals),
-        "reward_market_count": sum(1 for evaluation in evaluations if evaluation.reward_ev_usdc > 0.0),
-        "scoring_market_count": sum(1 for evaluation in evaluations if evaluation.scoring_quote_count > 0),
+        "reward_market_count": sum(
+            1 for evaluation in evaluations
+            if evaluation.reward_ev_usdc > 0.0
+        ),
+        "scoring_market_count": sum(
+            1 for evaluation in evaluations
+            if evaluation.scoring_quote_count > 0
+        ),
         "reward_pair_mass_total": sum(evaluation.reward_pair_mass for evaluation in evaluations),
     }

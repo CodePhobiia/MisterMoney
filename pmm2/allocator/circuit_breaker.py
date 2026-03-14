@@ -64,7 +64,7 @@ class CircuitBreaker:
             min_fills_for_baseline=min_fills_for_baseline,
         )
 
-    def record_fill_markout(self, condition_id: str, markout_1s: float):
+    def record_fill_markout(self, condition_id: str, markout_1s: float) -> None:
         """Record a new 1s markout for circuit breaker tracking.
 
         Args:
@@ -203,7 +203,7 @@ class CircuitBreaker:
 
         return False
 
-    def force_reset(self, condition_id: str):
+    def force_reset(self, condition_id: str) -> None:
         """Force reset circuit breaker (manual override).
 
         Args:

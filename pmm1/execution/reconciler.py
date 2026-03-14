@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -18,6 +18,9 @@ from pmm1.api.clob_private import ClobPrivateClient
 from pmm1.api.data_api import DataApiClient
 from pmm1.state.orders import OrderTracker
 from pmm1.state.positions import PositionTracker
+
+if TYPE_CHECKING:
+    from pmm1.storage.spine import SpineEmitter
 
 logger = structlog.get_logger(__name__)
 
@@ -53,6 +56,7 @@ class Reconciler:
         wallet_address: str = "",
         reconcile_orders_s: float = 30.0,
         reconcile_positions_s: float = 60.0,
+        spine_emitter: SpineEmitter | None = None,
     ) -> None:
         self._clob = clob_client
         self._data = data_client
@@ -65,23 +69,60 @@ class Reconciler:
         self._last_order_reconcile: float = 0.0
         self._last_position_reconcile: float = 0.0
         self._is_running = False
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
         self._reconcile_count: int = 0
         self._order_mismatch_streak: int = 0
         self._position_mismatch_streak: int = 0
         self._total_mismatch_events: int = 0
         self._last_mismatch_at: float = 0.0
         self._last_mismatch_details: str = ""
+        self._resume_epoch: int = 0
+        self._resume_ready_epoch: int = -1
+        self._resume_invalid_reason: str = "startup"
+        self._last_resume_invalidated_at: float = time.time()
+        self._last_successful_full_reconciliation_at: float = 0.0
         self._kill_switch = None  # Set via set_kill_switch()
         self._on_mismatch = None
+        self._spine = spine_emitter
 
-    def set_kill_switch(self, kill_switch) -> None:
+    def set_kill_switch(self, kill_switch: Any) -> None:
         """Set the kill switch for escalation on persistent mismatches."""
         self._kill_switch = kill_switch
 
-    def set_on_mismatch(self, callback) -> None:
+    def set_on_mismatch(self, callback: Any) -> None:
         """Register an optional callback for mismatch events."""
         self._on_mismatch = callback
+
+    @property
+    def resume_token_valid(self) -> bool:
+        return self._resume_ready_epoch == self._resume_epoch and self._resume_ready_epoch >= 0
+
+    @property
+    def resume_invalid_reason(self) -> str:
+        return self._resume_invalid_reason
+
+    def invalidate_resume_token(self, reason: str) -> None:
+        """Invalidate quote resume until a clean full reconciliation succeeds."""
+        normalized_reason = (reason or "unknown").strip() or "unknown"
+        if self.resume_token_valid:
+            self._resume_epoch += 1
+        self._resume_invalid_reason = normalized_reason
+        self._last_resume_invalidated_at = time.time()
+        logger.info(
+            "resume_token_invalidated",
+            epoch=self._resume_epoch,
+            reason=normalized_reason,
+        )
+
+    def _mark_resume_token_valid(self) -> None:
+        self._resume_ready_epoch = self._resume_epoch
+        self._resume_invalid_reason = ""
+        self._last_successful_full_reconciliation_at = time.time()
+        logger.info(
+            "resume_token_valid",
+            epoch=self._resume_epoch,
+            last_successful_full_reconciliation_at=self._last_successful_full_reconciliation_at,
+        )
 
     async def _emit_mismatch(
         self,
@@ -116,6 +157,26 @@ class Reconciler:
             and self._position_mismatch_streak == 0
         ):
             self._kill_switch.report_reconciliation_clean()
+
+    async def _emit_reconciliation_event(
+        self,
+        *,
+        event_type: str,
+        kind: str,
+        success: bool,
+        payload_json: dict[str, Any],
+    ) -> None:
+        if self._spine is None:
+            return
+        await self._spine.emit_event(
+            event_type=event_type,
+            strategy="ops",
+            payload_json={
+                "kind": kind,
+                "success": success,
+                **payload_json,
+            },
+        )
 
     async def reconcile_orders(self) -> ReconciliationResult:
         """Reconcile local order state with exchange open orders."""
@@ -173,12 +234,33 @@ class Reconciler:
                     details=details,
                     streak=self._order_mismatch_streak,
                 )
+                await self._emit_reconciliation_event(
+                    event_type="position_mismatch_detected",
+                    kind="orders",
+                    success=result.success,
+                    payload_json={
+                        "unknown_count": len(unknown),
+                        "imported_count": len(imported),
+                        "missing_count": len(missing),
+                        "streak": self._order_mismatch_streak,
+                        "details": details,
+                    },
+                )
             else:
                 self._order_mismatch_streak = 0
                 self._maybe_clear_kill_switch()
                 logger.debug(
                     "order_reconciliation_clean",
                     matched=mismatches.get("matched", 0),
+                )
+                await self._emit_reconciliation_event(
+                    event_type="position_reconciled",
+                    kind="orders",
+                    success=result.success,
+                    payload_json={
+                        "matched": mismatches.get("matched", 0),
+                        "imported_count": len(imported),
+                    },
                 )
 
             self._last_order_reconcile = time.time()
@@ -187,6 +269,13 @@ class Reconciler:
             result.success = False
             result.errors.append(f"order_reconcile_error: {e}")
             logger.error("order_reconciliation_failed", error=str(e))
+            self.invalidate_resume_token("order_reconciliation_failed")
+            await self._emit_reconciliation_event(
+                event_type="position_mismatch_detected",
+                kind="orders",
+                success=False,
+                payload_json={"errors": list(result.errors)},
+            )
 
         return result
 
@@ -233,10 +322,26 @@ class Reconciler:
                     details=details,
                     streak=self._position_mismatch_streak,
                 )
+                await self._emit_reconciliation_event(
+                    event_type="position_mismatch_detected",
+                    kind="positions",
+                    success=result.success,
+                    payload_json={
+                        "count": mismatch_count,
+                        "streak": self._position_mismatch_streak,
+                        "details": details,
+                    },
+                )
             else:
                 self._position_mismatch_streak = 0
                 self._maybe_clear_kill_switch()
                 logger.debug("position_reconciliation_clean")
+                await self._emit_reconciliation_event(
+                    event_type="position_reconciled",
+                    kind="positions",
+                    success=result.success,
+                    payload_json={"count": 0},
+                )
 
             self._last_position_reconcile = time.time()
 
@@ -244,6 +349,13 @@ class Reconciler:
             result.success = False
             result.errors.append(f"position_reconcile_error: {e}")
             logger.error("position_reconciliation_failed", error=str(e))
+            self.invalidate_resume_token("position_reconciliation_failed")
+            await self._emit_reconciliation_event(
+                event_type="position_mismatch_detected",
+                kind="positions",
+                success=False,
+                payload_json={"errors": list(result.errors)},
+            )
 
         return result
 
@@ -272,6 +384,30 @@ class Reconciler:
             errors=combined.errors,
             reconcile_count=self._reconcile_count,
         )
+        order_unknown = list(combined.order_mismatches.get("unknown_on_exchange", []))
+        order_missing = list(combined.order_mismatches.get("missing_from_exchange", []))
+        position_mismatch_count = int(combined.position_mismatches.get("count", 0) or 0)
+        if (
+            combined.success
+            and not combined.errors
+            and not order_unknown
+            and not order_missing
+            and position_mismatch_count == 0
+        ):
+            self._mark_resume_token_valid()
+        else:
+            self.invalidate_resume_token("full_reconciliation_not_clean")
+        await self._emit_reconciliation_event(
+            event_type="position_reconciled" if combined.success else "position_mismatch_detected",
+            kind="full",
+            success=combined.success,
+            payload_json={
+                "order_mismatches": combined.order_mismatches,
+                "position_mismatches": combined.position_mismatches,
+                "errors": list(combined.errors),
+                "reconcile_count": self._reconcile_count,
+            },
+        )
 
         return combined
 
@@ -297,7 +433,7 @@ class Reconciler:
             # Sleep for the shorter interval
             await asyncio.sleep(min(self._reconcile_orders_s, self._reconcile_positions_s) / 2)
 
-    def start(self) -> asyncio.Task:
+    def start(self) -> asyncio.Task[None]:
         """Start the reconciliation loop."""
         self._is_running = True
         self._task = asyncio.create_task(self._reconcile_loop())
@@ -327,8 +463,16 @@ class Reconciler:
                 now - self._last_order_reconcile if self._last_order_reconcile else float("inf")
             ),
             "seconds_since_position_reconcile": (
-                now - self._last_position_reconcile if self._last_position_reconcile else float("inf")
+                now - self._last_position_reconcile
+                if self._last_position_reconcile
+                else float("inf")
             ),
+            "last_successful_full_reconciliation_at": self._last_successful_full_reconciliation_at,
+            "resume_token_valid": self.resume_token_valid,
+            "resume_invalid_reason": self._resume_invalid_reason,
+            "resume_epoch": self._resume_epoch,
+            "resume_ready_epoch": self._resume_ready_epoch,
+            "last_resume_invalidated_at": self._last_resume_invalidated_at,
             "reconcile_count": self._reconcile_count,
             "is_running": self._is_running,
         }

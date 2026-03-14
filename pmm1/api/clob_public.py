@@ -171,7 +171,7 @@ class ClobPublicClient:
     async def get_spread(self, token_id: str) -> dict[str, Any]:
         """Get spread for a token ID."""
         data = await self._get("/spread", params={"token_id": token_id})
-        return data
+        return dict(data) if data else {}
 
     async def get_price(self, token_id: str, side: str = "BUY") -> float:
         """Get price for a token ID and side."""

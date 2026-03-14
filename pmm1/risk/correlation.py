@@ -6,6 +6,8 @@ preventing over-concentration on correlated events.
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -60,7 +62,7 @@ class ThematicCorrelation:
     def get_theme(self, condition_id: str) -> str:
         return self._market_themes.get(condition_id, "uncorrelated")
 
-    def get_theme_exposure(self, theme: str, position_tracker) -> float:
+    def get_theme_exposure(self, theme: str, position_tracker: Any) -> float:
         """Get total gross exposure for a theme across all markets."""
         total = 0.0
         for cid, t in self._market_themes.items():
@@ -70,12 +72,41 @@ class ThematicCorrelation:
                     total += pos.total_cost_basis
         return total
 
+    def get_theme_exposure_mark_to_market(
+        self,
+        theme: str,
+        position_tracker: Any,
+        price_oracle: dict[str, float] | None = None,
+    ) -> float:
+        """Get total marked gross exposure for a theme across all markets."""
+        total = 0.0
+        for cid, t in self._market_themes.items():
+            if t != theme:
+                continue
+            pos = position_tracker.get(cid)
+            if pos is None:
+                continue
+            yes_price = (
+                float(price_oracle.get(pos.token_id_yes, pos.yes_avg_price) or 0.0)
+                if price_oracle
+                else pos.yes_avg_price
+            )
+            no_price = (
+                float(price_oracle.get(pos.token_id_no, pos.no_avg_price) or 0.0)
+                if price_oracle
+                else pos.no_avg_price
+            )
+            total += pos.yes_size * yes_price
+            total += pos.no_size * no_price
+        return total
+
     def check_theme_limit(
         self,
         condition_id: str,
         proposed_additional: float,
         nav: float,
-        position_tracker,
+        position_tracker: Any,
+        price_oracle: dict[str, float] | None = None,
     ) -> tuple[bool, float]:
         """Check if adding exposure would breach theme limit.
 
@@ -85,7 +116,11 @@ class ThematicCorrelation:
         if theme == "uncorrelated":
             return True, float("inf")
 
-        current = self.get_theme_exposure(theme, position_tracker)
+        current = self.get_theme_exposure_mark_to_market(
+            theme,
+            position_tracker,
+            price_oracle=price_oracle,
+        )
         limit = self.per_theme_nav * nav
 
         if current + proposed_additional > limit:

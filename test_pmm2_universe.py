@@ -11,10 +11,10 @@ Tests all major components:
 
 from pmm2.universe import (
     EnrichedMarket,
-    compute_ambiguity_score,
-    RewardSurface,
     FeeSurface,
+    RewardSurface,
     UniverseScorer,
+    compute_ambiguity_score,
 )
 
 
@@ -58,7 +58,7 @@ def test_reward_surface():
     from pmm1.api.rewards import RewardInfo
 
     surface = RewardSurface()
-    
+
     # Manually populate for testing
     surface.by_condition = {
         "cond1": RewardInfo(
@@ -94,7 +94,7 @@ def test_reward_surface():
 def test_fee_surface():
     """Test FeeSurface."""
     surface = FeeSurface()
-    
+
     # Mock market data
     markets = [
         {
@@ -107,9 +107,9 @@ def test_fee_surface():
             "fees_enabled": False,
         },
     ]
-    
+
     surface.update_from_markets(markets)
-    
+
     assert surface.is_fee_enabled("fee_market_1") is True
     assert surface.get_fee_rate("fee_market_1") == 0.01
     assert surface.is_fee_enabled("no_fee_market") is False
@@ -121,7 +121,7 @@ def test_fee_surface():
 def test_universe_scorer():
     """Test UniverseScorer."""
     scorer = UniverseScorer()
-    
+
     # High-quality market
     good_market = EnrichedMarket(
         condition_id="good",
@@ -138,7 +138,7 @@ def test_universe_scorer():
         hours_to_resolution=72.0,
         ambiguity_score=0.1,
     )
-    
+
     # Low-quality market
     bad_market = EnrichedMarket(
         condition_id="bad",
@@ -153,32 +153,32 @@ def test_universe_scorer():
         hours_to_resolution=2.0,
         ambiguity_score=0.8,
     )
-    
+
     score_good = scorer.score_market(good_market)
     score_bad = scorer.score_market(bad_market)
-    
+
     assert score_good > score_bad, f"Good market should score higher: {score_good} vs {score_bad}"
-    
+
     # Test selection
     markets = [bad_market, good_market]
     selected = scorer.select_top(markets, max_markets=1)
-    
+
     assert len(selected) == 1
     assert selected[0].condition_id == "good"
-    
+
     print(f"✓ UniverseScorer works: good={score_good:.2f}, bad={score_bad:.2f}")
 
 
 def main():
     """Run all tests."""
     print("Testing pmm2 universe layer...\n")
-    
+
     test_enriched_market()
     test_ambiguity_scoring()
     test_reward_surface()
     test_fee_surface()
     test_universe_scorer()
-    
+
     print("\n✅ All tests passed!")
 
 

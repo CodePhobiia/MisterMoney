@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -50,7 +50,15 @@ def _make_order(order_id: str, side: str, price: float, scoring: bool = False):
     )
 
 
-def _v1_state(ev: float, reward_markets: int, reward_ev: float, cancel_rate_seed: float) -> dict:
+def _v1_state(
+    ev: float,
+    reward_markets: int,
+    reward_ev: float,
+    cancel_rate_seed: float,
+    *,
+    fill_count_recent: int = 0,
+    unique_fill_markets_recent: list[str] | None = None,
+) -> dict:
     order_minutes = 10.0
     return {
         "markets": ["market1", "market2"],
@@ -65,6 +73,8 @@ def _v1_state(ev: float, reward_markets: int, reward_ev: float, cancel_rate_seed
         "cancel_count_recent": cancel_rate_seed,
         "live_order_minutes": order_minutes,
         "cycle_minutes": 1.0,
+        "fill_count_recent": fill_count_recent,
+        "unique_fill_markets_recent": unique_fill_markets_recent or [],
     }
 
 
@@ -95,7 +105,9 @@ def test_v1_state_snapshot_captures_realistic_ev_state():
         nav=100.0,
         reward_eligible={"cid1"},
         active_markets={"cid1": market},
-        order_tracker=SimpleNamespace(get_active_orders=lambda token_id=None: [bid_order, ask_order]),
+        order_tracker=SimpleNamespace(
+            get_active_orders=lambda token_id=None: [bid_order, ask_order]
+        ),
         position_tracker=SimpleNamespace(get_active_positions=lambda: []),
     )
     queue_estimator = SimpleNamespace(
@@ -129,7 +141,8 @@ def test_counterfactual_engine_uses_recent_window_not_lifetime_average(tmp_path:
             _pmm2_plan(ev=0.05, reward_markets=2, reward_ev=0.007, cancel_rate_seed=1.0),
         )
 
-    assert engine.is_ready_for_live() is True
+    assert engine.get_gate_diagnostics()["diagnostic_ready"] is True
+    assert engine.is_ready_for_live() is False
 
     for _ in range(100):
         engine.compare_cycle(
@@ -143,6 +156,60 @@ def test_counterfactual_engine_uses_recent_window_not_lifetime_average(tmp_path:
     assert summary["ready_for_live"] is False
     assert "gate_ev_positive" in diagnostics["blocking_gates"]
     assert diagnostics["gates"]["gate_sample_size"]["pass"] is True
+
+
+def test_counterfactual_promotion_gate_requires_10_day_window(tmp_path: Path):
+    logger = ShadowLogger(db=None, log_dir=str(tmp_path))
+    engine = CounterfactualEngine(logger)
+
+    for _ in range(100):
+        engine.compare_cycle(
+            _v1_state(
+                ev=0.02,
+                reward_markets=1,
+                reward_ev=0.003,
+                cancel_rate_seed=4.0,
+                fill_count_recent=60,
+                unique_fill_markets_recent=["market1", "market2", "market3", "market4"],
+            ),
+            _pmm2_plan(ev=0.05, reward_markets=2, reward_ev=0.007, cancel_rate_seed=1.0),
+        )
+
+    assert engine.get_gate_diagnostics()["diagnostic_ready"] is True
+    assert engine.get_promotion_diagnostics()["promotion_ready"] is False
+    assert "gate_shadow_duration" in engine.get_promotion_diagnostics()["blocking_gates"]
+
+    engine.first_cycle_ts = engine.last_cycle_ts - engine.PROMOTION_MIN_SHADOW_SEC
+
+    assert engine.get_promotion_diagnostics()["promotion_ready"] is True
+    assert engine.is_ready_for_live() is True
+
+
+def test_counterfactual_promotion_gate_blocks_without_fill_samples_or_market_variety(
+    tmp_path: Path,
+):
+    logger = ShadowLogger(db=None, log_dir=str(tmp_path))
+    engine = CounterfactualEngine(logger)
+
+    for _ in range(100):
+        engine.compare_cycle(
+            _v1_state(
+                ev=0.02,
+                reward_markets=1,
+                reward_ev=0.003,
+                cancel_rate_seed=4.0,
+                fill_count_recent=0,
+                unique_fill_markets_recent=["market1"],
+            ),
+            _pmm2_plan(ev=0.05, reward_markets=2, reward_ev=0.007, cancel_rate_seed=1.0),
+        )
+
+    engine.first_cycle_ts = engine.last_cycle_ts - engine.PROMOTION_MIN_SHADOW_SEC
+    diagnostics = engine.get_promotion_diagnostics()
+
+    assert diagnostics["promotion_ready"] is False
+    assert "gate_fill_samples" in diagnostics["blocking_gates"]
+    assert "gate_market_variety" in diagnostics["blocking_gates"]
 
 
 def test_shadow_logger_persists_cycle_diagnostics_to_sqlite(tmp_path: Path):

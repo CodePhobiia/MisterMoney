@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, cast
 
 import structlog
 
@@ -38,7 +39,7 @@ class RuntimeStatusWriter:
     def load(self) -> dict[str, Any] | None:
         if not self.path.exists():
             return None
-        return json.loads(self.path.read_text(encoding="utf-8"))
+        return cast(dict[str, Any], json.loads(self.path.read_text(encoding="utf-8")))
 
 
 def load_runtime_status(path: str | Path) -> dict[str, Any] | None:
@@ -61,7 +62,7 @@ def evaluate_runtime_health(
 ) -> dict[str, Any]:
     """Evaluate a runtime snapshot into warning/critical health signals."""
     current_time = time.time() if now is None else now
-    report = {
+    report: dict[str, Any] = {
         "severity": AlertSeverity.INFO.value,
         "issues": [],
         "checked_at": current_time,
@@ -78,7 +79,11 @@ def evaluate_runtime_health(
         )
 
     if snapshot is None:
-        add_issue(AlertSeverity.CRITICAL, "service_down", "runtime status file is missing")
+        add_issue(
+            AlertSeverity.CRITICAL,
+            "service_down",
+            "runtime status file is missing",
+        )
         return report
 
     updated_at = float(snapshot.get("updated_at") or 0.0)
@@ -124,20 +129,42 @@ def evaluate_runtime_health(
         add_issue(
             AlertSeverity.WARNING,
             "reconciliation",
-            f"reconciliation mismatch streaks order={order_streak} position={position_streak}: {details}",
+            f"reconciliation mismatch streaks "
+            f"order={order_streak} position={position_streak}: {details}",
         )
+
+    runtime_safety = snapshot.get("runtime_safety", {})
+    if runtime_safety and not runtime_safety.get("resume_token_valid", True):
+        if str(snapshot.get("mode", "") or "") == "QUOTING":
+            add_issue(
+                AlertSeverity.WARNING,
+                "resume_gate",
+                "resume token invalid while bot reports QUOTING",
+            )
 
     ops = snapshot.get("ops", {})
     conditions = ops.get("conditions", {})
     if conditions.get("reconnect_storm", {}).get("active"):
         count = conditions["reconnect_storm"].get("count", 0)
-        add_issue(AlertSeverity.WARNING, "reconnect_storm", f"websocket reconnect storm ({count} reconnects)")
+        add_issue(
+            AlertSeverity.WARNING,
+            "reconnect_storm",
+            f"websocket reconnect storm ({count} reconnects)",
+        )
     if conditions.get("no_active_quotes", {}).get("active"):
         duration = float(conditions["no_active_quotes"].get("duration_s", 0.0))
-        add_issue(AlertSeverity.WARNING, "no_active_quotes", f"no active quotes for {duration:.0f}s")
+        add_issue(
+            AlertSeverity.WARNING,
+            "no_active_quotes",
+            f"no active quotes for {duration:.0f}s",
+        )
     if conditions.get("excessive_churn", {}).get("active"):
         ratio = float(conditions["excessive_churn"].get("ratio", 0.0))
-        add_issue(AlertSeverity.WARNING, "excessive_churn", f"quote churn ratio {ratio:.2f}")
+        add_issue(
+            AlertSeverity.WARNING,
+            "excessive_churn",
+            f"quote churn ratio {ratio:.2f}",
+        )
 
     last_db_failure = ops.get("last_db_write_failure") or {}
     if last_db_failure:
@@ -157,6 +184,55 @@ def evaluate_runtime_health(
                 AlertSeverity.WARNING,
                 "fill_recorder_failure",
                 last_fill_failure.get("message", "recent fill recorder failure"),
+            )
+
+    runtime_safety = snapshot.get("runtime_safety", {})
+    if runtime_safety and not bool(runtime_safety.get("resume_token_valid", True)):
+        add_issue(
+            AlertSeverity.WARNING,
+            "resume_gate",
+            "quote resume blocked: "
+            + (runtime_safety.get('resume_blocked_reason')
+               or 'awaiting clean reconciliation'),
+        )
+
+    # Paper 1/2: absolute drawdown kill switch
+    drawdown_abs = drawdown.get("absolute_drawdown_pct", 0.0)
+    if drawdown.get("absolute_kill_triggered"):
+        add_issue(
+            AlertSeverity.CRITICAL,
+            "absolute_drawdown",
+            f"absolute drawdown kill triggered"
+            f" ({float(drawdown_abs)*100:.1f}%)",
+        )
+    elif float(drawdown_abs) > 0.10:
+        add_issue(
+            AlertSeverity.WARNING,
+            "absolute_drawdown",
+            f"approaching absolute drawdown limit"
+            f" ({float(drawdown_abs)*100:.1f}%)",
+        )
+
+    # Paper 2: edge validation
+    edge_val = snapshot.get("edge_validation", {})
+    if edge_val:
+        sprt = edge_val.get("sprt_decision", "")
+        if sprt == "no_edge" and edge_val.get("total_trades", 0) > 200:
+            add_issue(
+                AlertSeverity.WARNING,
+                "edge_lost",
+                f"SPRT shows no statistical edge after"
+                f" {edge_val['total_trades']} trades",
+            )
+        sharpe = float(edge_val.get("rolling_sharpe", 0))
+        if (
+            edge_val.get("total_trades", 0) > 50
+            and sharpe < 0.5
+        ):
+            add_issue(
+                AlertSeverity.WARNING,
+                "low_sharpe",
+                f"rolling Sharpe {sharpe:.2f} below 0.5",
             )
 
     return report
@@ -204,7 +280,9 @@ class OpsMonitor:
             cooldown_s=self.config.alert_cooldown_s,
         )
 
-    async def record_db_write_failure(self, operation: str, error: str, sql: str = "") -> None:
+    async def record_db_write_failure(
+        self, operation: str, error: str, sql: str = "",
+    ) -> None:
         """Record and alert on database write failures."""
         now = self._clock()
         message = f"{operation} failed: {error}"
@@ -236,7 +314,8 @@ class OpsMonitor:
         now = self._clock()
         suffix = f", delay={delay_sec}s" if delay_sec is not None else ""
         message = (
-            f"{stage} failed for token={token_id[:16] or '?'} order={order_id[:16] or '?'}: {error}{suffix}"
+            f"{stage} failed for token={token_id[:16] or '?'} "
+            f"order={order_id[:16] or '?'}: {error}{suffix}"
         )
         self._fill_recorder_failures += 1
         self._last_fill_recorder_failure = {
@@ -274,6 +353,8 @@ class OpsMonitor:
         paper_mode: bool,
         note: str = "",
         kill_switch: dict[str, Any] | None = None,
+        config_context: dict[str, Any] | None = None,
+        runtime_safety: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Write a minimal status snapshot during startup or shutdown."""
         snapshot = {
@@ -283,6 +364,8 @@ class OpsMonitor:
             "mode": mode,
             "paper_mode": paper_mode,
             "note": note,
+            "config": dict(config_context or {}),
+            "runtime_safety": dict(runtime_safety or {}),
             "kill_switch": kill_switch or {"is_triggered": False, "active_reasons": []},
             "ops": {
                 "db_write_failures": self._db_write_failures,
@@ -302,18 +385,24 @@ class OpsMonitor:
     async def observe_cycle(
         self,
         *,
-        state,
+        state: Any,
         paper_mode: bool,
         nav: float,
-        dd_state,
-        market_ws,
-        user_ws,
-        heartbeat,
-        reconciler,
+        dd_state: Any,
+        market_ws: Any,
+        user_ws: Any,
+        heartbeat: Any,
+        reconciler: Any,
         markets_quoted: int,
         cycle_lifecycle_counts: dict[str, int],
         cycle_duration_ms: float,
         pmm2_status: dict[str, Any] | None = None,
+        config_context: dict[str, Any] | None = None,
+        runtime_safety: dict[str, Any] | None = None,
+        edge_tracker_summary: dict[str, Any] | None = None,
+        kelly_state: dict[str, Any] | None = None,
+        v3_state: dict[str, Any] | None = None,
+        calibration_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Update rolling operational state after a quote cycle."""
         now = self._clock()
@@ -332,9 +421,15 @@ class OpsMonitor:
         self._last_reconnect_total = reconnect_total
         for _ in range(new_reconnects):
             self._recent_reconnects.append(now)
-        while self._recent_reconnects and (now - self._recent_reconnects[0]) > self.config.reconnect_storm_window_s:
+        while (
+            self._recent_reconnects
+            and (now - self._recent_reconnects[0]) > self.config.reconnect_storm_window_s
+        ):
             self._recent_reconnects.popleft()
-        reconnect_storm_active = len(self._recent_reconnects) >= self.config.reconnect_storm_threshold
+        reconnect_storm_active = (
+            len(self._recent_reconnects)
+            >= self.config.reconnect_storm_threshold
+        )
         if reconnect_storm_active:
             await self._send_alert(
                 AlertSeverity.WARNING,
@@ -379,7 +474,10 @@ class OpsMonitor:
         canceled = int(cycle_lifecycle_counts.get("canceled", 0))
         submitted = int(cycle_lifecycle_counts.get("submitted", 0))
         self._recent_churn.append((now, canceled, submitted))
-        while self._recent_churn and (now - self._recent_churn[0][0]) > self.config.excessive_churn_window_s:
+        while (
+            self._recent_churn
+            and (now - self._recent_churn[0][0]) > self.config.excessive_churn_window_s
+        ):
             self._recent_churn.popleft()
         churn_cancels = sum(sample[1] for sample in self._recent_churn)
         churn_submits = sum(sample[2] for sample in self._recent_churn)
@@ -406,6 +504,7 @@ class OpsMonitor:
             "started_at": self._started_at,
             "mode": state.mode,
             "paper_mode": paper_mode,
+            "config": dict(config_context or {}),
             "nav": nav,
             "cycle_duration_ms": cycle_duration_ms,
             "eligible_markets": eligible_markets,
@@ -420,12 +519,18 @@ class OpsMonitor:
                 "drawdown_pct": dd_state.drawdown_pct,
                 "daily_pnl": dd_state.daily_pnl,
                 "daily_high_watermark": dd_state.daily_high_watermark,
+                "absolute_drawdown_pct": dd_state.absolute_drawdown_pct,
+                "session_peak_nav": dd_state.session_peak_nav,
+                "absolute_kill_triggered": (
+                    dd_state.absolute_kill_triggered
+                ),
             },
             "kill_switch": state.kill_switch.get_status(),
             "market_ws": market_ws_stats,
             "user_ws": user_ws_stats,
             "heartbeat": heartbeat_stats,
             "reconciler": reconciler_stats,
+            "runtime_safety": dict(runtime_safety or {}),
             "fill_escalator": state.fill_escalator.get_status(),
             "ops": {
                 "db_write_failures": self._db_write_failures,
@@ -453,6 +558,15 @@ class OpsMonitor:
                 },
             },
         }
+        # Paper 2 observability: edge validation + Kelly + V3 + calibration
+        if edge_tracker_summary is not None:
+            snapshot["edge_validation"] = edge_tracker_summary
+        if kelly_state is not None:
+            snapshot["kelly"] = kelly_state
+        if v3_state is not None:
+            snapshot["v3"] = v3_state
+        if calibration_state is not None:
+            snapshot["calibration"] = calibration_state
         if pmm2_status is not None:
             snapshot["pmm2"] = pmm2_status
         self._status_writer.write(snapshot)

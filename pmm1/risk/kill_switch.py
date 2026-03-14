@@ -12,7 +12,8 @@ Kill switches trigger on:
 from __future__ import annotations
 
 import time
-from enum import Enum
+from enum import StrEnum
+from typing import Any
 
 import structlog
 from pydantic import BaseModel, Field
@@ -20,7 +21,7 @@ from pydantic import BaseModel, Field
 logger = structlog.get_logger(__name__)
 
 
-class KillSwitchReason(str, Enum):
+class KillSwitchReason(StrEnum):
     """Reasons for triggering the kill switch."""
 
     STALE_MARKET_FEED = "stale_market_feed"
@@ -66,7 +67,7 @@ class KillSwitch:
         self._reconciliation_mismatch_count = 0
         self._on_trigger = None  # Optional async callback on trigger
 
-    def set_on_trigger(self, callback) -> None:
+    def set_on_trigger(self, callback: Any) -> None:
         """Set an optional callback invoked on every trigger event.
 
         Callback signature: async def cb(reason: str, message: str) -> None
@@ -84,7 +85,12 @@ class KillSwitch:
     def active_reasons(self) -> list[KillSwitchReason]:
         return list(self._active_reasons.keys())
 
-    def _trigger(self, reason: KillSwitchReason, message: str = "", auto_clear_s: float = 0.0) -> None:
+    def _trigger(
+        self,
+        reason: KillSwitchReason,
+        message: str = "",
+        auto_clear_s: float = 0.0,
+    ) -> None:
         """Trigger the kill switch."""
         event = KillSwitchEvent(
             reason=reason,
@@ -223,7 +229,7 @@ class KillSwitch:
             del self._active_reasons[reason]
             logger.info("kill_switch_cleared", reason=reason.value)
 
-    def get_status(self) -> dict:
+    def get_status(self) -> dict[str, Any]:
         return {
             "is_triggered": self.is_triggered,
             "active_reasons": [r.value for r in self._active_reasons],

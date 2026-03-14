@@ -7,8 +7,8 @@ Order State Machine:
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 import structlog
@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 logger = structlog.get_logger(__name__)
 
 
-class OrderState(str, Enum):
+class OrderState(StrEnum):
     """Order lifecycle states from §11."""
 
     INTENT = "INTENT"
@@ -83,8 +83,15 @@ _VALID_TRANSITIONS: dict[OrderState, set[OrderState]] = {
     OrderState.FAILED: set(),
 }
 
-TERMINAL_STATES = {OrderState.FILLED, OrderState.CANCELED, OrderState.EXPIRED, OrderState.FAILED}
-ACTIVE_STATES = {OrderState.SUBMITTED, OrderState.LIVE, OrderState.PARTIAL, OrderState.MATCHED, OrderState.DELAYED}
+TERMINAL_STATES = {
+    OrderState.FILLED, OrderState.CANCELED,
+    OrderState.EXPIRED, OrderState.FAILED,
+}
+ACTIVE_STATES = {
+    OrderState.SUBMITTED, OrderState.LIVE,
+    OrderState.PARTIAL, OrderState.MATCHED,
+    OrderState.DELAYED,
+}
 
 LIFECYCLE_COUNTER_NAMES = (
     "submitted",
@@ -320,7 +327,7 @@ class OrderTracker:
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
             if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
+                parsed = parsed.replace(tzinfo=UTC)
             return parsed.timestamp()
         except ValueError:
             return time.time()
@@ -353,16 +360,25 @@ class OrderTracker:
         elif isinstance(exchange_order, dict):
             data = dict(exchange_order)
         else:
-            logger.warning("sync_exchange_order_invalid_payload", payload_type=type(exchange_order).__name__)
+            logger.warning(
+            "sync_exchange_order_invalid_payload",
+            payload_type=type(exchange_order).__name__,
+        )
             return None, False
 
-        order_id = str(data.get("orderID") or data.get("order_id") or data.get("id") or "").strip()
+        order_id = str(
+            data.get("orderID") or data.get("order_id")
+            or data.get("id") or ""
+        ).strip()
         if not order_id:
             logger.warning("sync_exchange_order_missing_id", source=source)
             return None, False
 
         state = self._exchange_status_to_state(str(data.get("status", "")))
-        original_size = str(data.get("originalSize") or data.get("original_size") or data.get("size") or "0")
+        original_size = str(
+            data.get("originalSize") or data.get("original_size")
+            or data.get("size") or "0"
+        )
         filled_size = str(data.get("sizeMatched") or data.get("size_matched") or "0")
         try:
             remaining_size = str(max(0.0, float(original_size) - float(filled_size)))
@@ -538,7 +554,11 @@ class OrderTracker:
             if (oid := str(o.get("orderID") or o.get("order_id") or o.get("id") or "").strip())
         }
         exchange_ids = set(exchange_by_id)
-        local_active_ids = {o.order_id.strip() for o in self.get_active_orders() if o.order_id.strip()}
+        local_active_ids = {
+            o.order_id.strip()
+            for o in self.get_active_orders()
+            if o.order_id.strip()
+        }
 
         # Orders on exchange but not tracked locally
         unknown_on_exchange = exchange_ids - local_active_ids

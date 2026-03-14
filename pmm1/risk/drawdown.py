@@ -10,7 +10,9 @@
 from __future__ import annotations
 
 import time
-from enum import Enum
+from collections.abc import Callable
+from enum import StrEnum
+from typing import Any
 
 import structlog
 from pydantic import BaseModel, Field
@@ -20,7 +22,7 @@ from pmm1.settings import RiskConfig
 logger = structlog.get_logger(__name__)
 
 
-class DrawdownTier(str, Enum):
+class DrawdownTier(StrEnum):
     """Drawdown severity levels."""
 
     NORMAL = "normal"
@@ -40,6 +42,10 @@ class DrawdownState(BaseModel):
     day_start_nav: float = 0.0
     day_start_time: float = Field(default_factory=time.time)
     tier_changed_at: float = 0.0
+    # Absolute drawdown tracking (Paper 1: 15% cumulative kill)
+    session_peak_nav: float = 0.0
+    absolute_drawdown_pct: float = 0.0
+    absolute_kill_triggered: bool = False
 
     @property
     def is_normal(self) -> bool:
@@ -62,7 +68,15 @@ class DrawdownState(BaseModel):
 
     @property
     def should_flatten_only(self) -> bool:
-        return self.tier == DrawdownTier.TIER3_FLATTEN_ONLY
+        return (
+            self.tier == DrawdownTier.TIER3_FLATTEN_ONLY
+            or self.absolute_kill_triggered
+        )
+
+    @property
+    def should_absolute_kill(self) -> bool:
+        """Paper 1: 15% cumulative drawdown → full shutdown."""
+        return self.absolute_kill_triggered
 
     @property
     def size_multiplier(self) -> float:
@@ -94,9 +108,9 @@ class DrawdownGovernor:
         self.config = config
         self._state = DrawdownState()
         self._day_boundary_hour = 0  # UTC midnight
-        self._on_tier_change = None  # Optional async callback
+        self._on_tier_change: Callable[..., Any] | None = None
 
-    def set_on_tier_change(self, callback) -> None:
+    def set_on_tier_change(self, callback: Callable[..., Any] | None) -> None:
         """Set an optional callback invoked when drawdown tier changes.
 
         Callback signature: async def cb(old_tier: str, new_tier: str, dd_pct: float) -> None
@@ -109,11 +123,16 @@ class DrawdownGovernor:
 
     def initialize(self, starting_nav: float) -> None:
         """Initialize at the start of a trading day."""
+        # Preserve session peak across daily resets
+        session_peak = max(
+            starting_nav, self._state.session_peak_nav,
+        )
         self._state = DrawdownState(
             daily_high_watermark=starting_nav,
             current_nav=starting_nav,
             day_start_nav=starting_nav,
             day_start_time=time.time(),
+            session_peak_nav=session_peak,
         )
         logger.info("drawdown_governor_initialized", nav=starting_nav)
 
@@ -141,20 +160,44 @@ class DrawdownGovernor:
 
         self._state.current_nav = current_nav
 
-        # Update high watermark
+        # Update high watermarks
         if current_nav > self._state.daily_high_watermark:
             self._state.daily_high_watermark = current_nav
+        if current_nav > self._state.session_peak_nav:
+            self._state.session_peak_nav = current_nav
 
         # Daily PnL
         self._state.daily_pnl = current_nav - self._state.day_start_nav
 
-        # Drawdown from high-water mark (as percentage of peak NAV)
+        # Daily drawdown from intraday high-water mark
         if self._state.daily_high_watermark > 0:
             self._state.drawdown_pct = (
-                (self._state.daily_high_watermark - current_nav) / self._state.daily_high_watermark
+                (self._state.daily_high_watermark - current_nav)
+                / self._state.daily_high_watermark
             )
         else:
             self._state.drawdown_pct = 0.0
+
+        # Absolute drawdown from session peak (Paper 1: 15%)
+        if self._state.session_peak_nav > 0:
+            self._state.absolute_drawdown_pct = (
+                (self._state.session_peak_nav - current_nav)
+                / self._state.session_peak_nav
+            )
+        else:
+            self._state.absolute_drawdown_pct = 0.0
+
+        abs_dd = self._state.absolute_drawdown_pct
+        abs_limit = self.config.absolute_max_drawdown_nav
+        if abs_dd >= abs_limit and not self._state.absolute_kill_triggered:
+            self._state.absolute_kill_triggered = True
+            logger.critical(
+                "absolute_drawdown_kill_triggered",
+                absolute_drawdown_pct=f"{abs_dd*100:.2f}%",
+                session_peak_nav=f"{self._state.session_peak_nav:.2f}",
+                current_nav=f"{current_nav:.2f}",
+                limit=f"{abs_limit*100:.1f}%",
+            )
 
         # Determine tier
         dd = self._state.drawdown_pct
@@ -198,9 +241,9 @@ class DrawdownGovernor:
         """Check if it's time for a daily reset (UTC midnight crossing)."""
         import datetime as dt
 
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         day_start = dt.datetime.fromtimestamp(
-            self._state.day_start_time, tz=dt.timezone.utc
+            self._state.day_start_time, tz=dt.UTC
         )
         return now.date() > day_start.date()
 

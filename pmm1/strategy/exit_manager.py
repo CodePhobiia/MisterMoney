@@ -12,14 +12,14 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from pmm1.settings import ExitConfig
-from pmm1.state.books import BookManager, OrderBook
+from pmm1.state.books import BookManager
 from pmm1.state.positions import MarketPosition, PositionTracker
 from pmm1.strategy.universe import MarketMetadata
 
@@ -127,13 +127,19 @@ class ExitManager:
 
                 # 4. TAKE-PROFIT
                 if self.config.take_profit.enabled and avg_price > 0 and current_price is not None:
-                    sig = self._check_take_profit(pos, token_id, inv_size, avg_price, current_price, now)
+                    sig = self._check_take_profit(
+                        pos, token_id, inv_size,
+                        avg_price, current_price, now,
+                    )
                     if sig:
                         signals.append(sig)
                         continue
 
                 # 5. ORPHAN (only check periodically)
-                if is_orphan and now - self._last_orphan_check >= self.config.orphan.check_interval_s:
+                if (
+                    is_orphan and
+                    now - self._last_orphan_check >= self.config.orphan.check_interval_s
+                ):
                     sig = await self._check_orphan(pos, token_id, inv_size, current_price)
                     if sig:
                         signals.append(sig)
@@ -161,10 +167,10 @@ class ExitManager:
         if not md or not md.end_date or not self.config.resolution.enabled:
             return None
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         end = md.end_date
         if end.tzinfo is None:
-            end = end.replace(tzinfo=timezone.utc)
+            end = end.replace(tzinfo=UTC)
 
         hours_left = (end - now).total_seconds() / 3600.0
         cfg = self.config.resolution
@@ -207,7 +213,11 @@ class ExitManager:
         if os.path.exists(self.config.flatten.config_flag_path):
             return True
         # Kill switch
-        if self.kill_switch and hasattr(self.kill_switch, "is_triggered") and self.kill_switch.is_triggered:
+        if (
+            self.kill_switch
+            and hasattr(self.kill_switch, "is_triggered")
+            and self.kill_switch.is_triggered
+        ):
             return True
         return False
 
@@ -292,10 +302,10 @@ class ExitManager:
         if not md.end_date:
             return None
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         end = md.end_date
         if end.tzinfo is None:
-            end = end.replace(tzinfo=timezone.utc)
+            end = end.replace(tzinfo=UTC)
 
         hours_left = (end - now).total_seconds() / 3600.0
         cfg = self.config.resolution

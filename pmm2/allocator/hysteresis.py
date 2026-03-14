@@ -138,7 +138,7 @@ class ReallocationHysteresis:
                 condition_id=condition_id,
             )
             return (True, "new_market")
-        
+
         # If we have no current capital, allow entry without history requirement
         if current_cap == 0.0 and target_cap > 0.0:
             logger.debug(
@@ -177,9 +177,14 @@ class ReallocationHysteresis:
                 history_len=len(state.rank_history),
                 required=self.min_persistence_cycles,
             )
-            return (False, f"insufficient_history: {len(state.rank_history)} < {self.min_persistence_cycles}")
+            return (
+                False,
+                f"insufficient_history: "
+                f"{len(state.rank_history)} < "
+                f"{self.min_persistence_cycles}",
+            )
 
-    def update_cycle(self, condition_id: str, target_cap: float, rank: int):
+    def update_cycle(self, condition_id: str, target_cap: float, rank: int) -> None:
         """Record this cycle's target and rank for hysteresis tracking.
 
         Args:
@@ -257,7 +262,7 @@ class ReallocationHysteresis:
 
         return False
 
-    def record_reallocation(self, condition_id: str, new_capital: float):
+    def record_reallocation(self, condition_id: str, new_capital: float) -> None:
         """Record that reallocation occurred.
 
         Args:

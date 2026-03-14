@@ -3,7 +3,8 @@ Dossier Route - Opus Adversarial Challenge Prompt (v1)
 Claude Opus 4.6 adversarial challenge to synthesis estimate
 """
 
-DOSSIER_CHALLENGE_SYSTEM = """You are an adversarial analyst reviewing a prediction market probability estimate.
+DOSSIER_CHALLENGE_SYSTEM = """You are an adversarial analyst \
+reviewing a prediction market probability estimate.
 
 You will see:
 1. A synthesis estimate from another analyst (Gemini)
@@ -47,14 +48,15 @@ def build_dossier_challenge_prompt(
 ) -> str:
     """
     Build the user prompt for Opus adversarial challenge
-    
+
     Args:
         question: Market question
         rules: Resolution rules
-        synthesis_estimate: Dict with keys: p_hat, uncertainty, reasoning_summary, contradictions, source_quality
+        synthesis_estimate: Dict with keys: p_hat, uncertainty,
+            reasoning_summary, contradictions, source_quality
         evidence: List of evidence item dicts
         clarifications: List of clarification texts
-        
+
     Returns:
         Formatted prompt string
     """
@@ -64,18 +66,18 @@ def build_dossier_challenge_prompt(
     synthesis_reasoning = synthesis_estimate.get("reasoning_summary", "(No reasoning provided)")
     synthesis_contradictions = synthesis_estimate.get("contradictions", [])
     synthesis_quality = synthesis_estimate.get("source_quality", 0.5)
-    
+
     contradictions_block = ""
     if synthesis_contradictions:
         contradictions_block = "\nContradictions noted:\n" + "\n".join(
             f"  - {c}" for c in synthesis_contradictions
         )
-    
+
     synthesis_block = f"""SYNTHESIS ESTIMATE:
 Probability: {synthesis_p:.2f} ± {synthesis_unc:.2f}
 Source Quality: {synthesis_quality:.2f}
 Reasoning: {synthesis_reasoning}{contradictions_block}"""
-    
+
     # Format evidence items
     evidence_lines = []
     for i, item in enumerate(evidence, 1):
@@ -84,20 +86,20 @@ Reasoning: {synthesis_reasoning}{contradictions_block}"""
         polarity = item.get("polarity", "NEUTRAL")
         reliability = item.get("reliability", 0.5)
         doc_id = item.get("doc_id", "unknown")
-        
+
         evidence_lines.append(
             f"[{eid}] (from {doc_id}, {polarity}, reliability={reliability:.2f}):\n  {claim}"
         )
-    
+
     evidence_block = "\n".join(evidence_lines) if evidence_lines else "(No evidence available)"
-    
+
     # Format clarifications
     clarifications_block = ""
     if clarifications:
         clarifications_block = "\n\nCLARIFICATIONS:\n" + "\n".join(
             f"- {c}" for c in clarifications
         )
-    
+
     prompt = f"""MARKET QUESTION:
 {question}
 
@@ -122,5 +124,5 @@ Consider:
 Your estimate should reflect genuine disagreement if warranted.
 
 Output ONLY the JSON object, nothing else."""
-    
+
     return prompt

@@ -57,6 +57,26 @@ class MarketPosition(BaseModel):
     def total_cost_basis(self) -> float:
         return self.yes_cost_basis + self.no_cost_basis
 
+    def marked_yes_price(self, price_oracle: dict[str, float] | None = None) -> float:
+        if price_oracle and self.token_id_yes:
+            return float(price_oracle.get(self.token_id_yes, self.yes_avg_price))
+        return float(self.yes_avg_price)
+
+    def marked_no_price(self, price_oracle: dict[str, float] | None = None) -> float:
+        if price_oracle and self.token_id_no:
+            return float(price_oracle.get(self.token_id_no, self.no_avg_price))
+        return float(self.no_avg_price)
+
+    def gross_exposure_usdc(self, price_oracle: dict[str, float] | None = None) -> float:
+        return (self.yes_size * self.marked_yes_price(price_oracle)) + (
+            self.no_size * self.marked_no_price(price_oracle)
+        )
+
+    def net_exposure_usdc(self, price_oracle: dict[str, float] | None = None) -> float:
+        return (self.yes_size * self.marked_yes_price(price_oracle)) - (
+            self.no_size * self.marked_no_price(price_oracle)
+        )
+
     @property
     def is_flat(self) -> bool:
         return self.yes_size == 0 and self.no_size == 0
@@ -131,7 +151,10 @@ class MarketPosition(BaseModel):
 
     def mark_to_market(self, yes_price: float, no_price: float) -> float:
         """Calculate unrealized PnL at current market prices."""
-        yes_unrealized = self.yes_size * (yes_price - self.yes_avg_price) if self.yes_size > 0 else 0.0
+        yes_unrealized = (
+            self.yes_size * (yes_price - self.yes_avg_price)
+            if self.yes_size > 0 else 0.0
+        )
         no_unrealized = self.no_size * (no_price - self.no_avg_price) if self.no_size > 0 else 0.0
         return yes_unrealized + no_unrealized
 
@@ -221,15 +244,87 @@ class PositionTracker:
 
     def get_event_gross_exposure(self, event_id: str) -> float:
         """Total gross exposure across all markets in an event."""
-        return sum(p.gross_exposure for p in self.get_event_positions(event_id))
+        return self.get_event_gross_exposure_usdc(event_id)
+
+    def get_event_gross_exposure_usdc(
+        self,
+        event_id: str,
+        price_oracle: dict[str, float] | None = None,
+    ) -> float:
+        return sum(p.gross_exposure_usdc(price_oracle) for p in self.get_event_positions(event_id))
+
+    def _mark_price(
+        self,
+        position: MarketPosition,
+        token_id: str,
+        price_oracle: dict[str, float] | None = None,
+    ) -> float:
+        if price_oracle and token_id in price_oracle:
+            return float(price_oracle[token_id] or 0.0)
+        if token_id == position.token_id_yes:
+            return position.yes_avg_price
+        if token_id == position.token_id_no:
+            return position.no_avg_price
+        return 0.0
+
+    def get_event_gross_exposure_mark_to_market(
+        self,
+        event_id: str,
+        price_oracle: dict[str, float] | None = None,
+    ) -> float:
+        """Total event gross exposure using current marks rather than share counts."""
+        total = 0.0
+        for position in self.get_event_positions(event_id):
+            yes_price = self._mark_price(position, position.token_id_yes, price_oracle)
+            no_price = self._mark_price(position, position.token_id_no, price_oracle)
+            total += position.yes_size * yes_price
+            total += position.no_size * no_price
+        return total
 
     def get_total_net_exposure(self) -> float:
         """Total net directional exposure across all positions."""
-        return sum(abs(p.net_exposure) for p in self._positions.values())
+        return self.get_total_net_exposure_usdc()
+
+    def get_total_net_exposure_usdc(
+        self,
+        price_oracle: dict[str, float] | None = None,
+    ) -> float:
+        return sum(abs(p.net_exposure_usdc(price_oracle)) for p in self._positions.values())
 
     def get_total_gross_exposure(self) -> float:
         """Total gross exposure across all positions."""
-        return sum(p.gross_exposure for p in self._positions.values())
+        return self.get_total_gross_exposure_usdc()
+
+    def get_total_gross_exposure_usdc(
+        self,
+        price_oracle: dict[str, float] | None = None,
+    ) -> float:
+        return sum(p.gross_exposure_usdc(price_oracle) for p in self._positions.values())
+
+    def get_total_gross_exposure_mark_to_market(
+        self,
+        price_oracle: dict[str, float] | None = None,
+    ) -> float:
+        """Total gross exposure across all positions using current marks."""
+        total = 0.0
+        for position in self._positions.values():
+            yes_price = self._mark_price(position, position.token_id_yes, price_oracle)
+            no_price = self._mark_price(position, position.token_id_no, price_oracle)
+            total += position.yes_size * yes_price
+            total += position.no_size * no_price
+        return total
+
+    def get_total_directional_exposure_mark_to_market(
+        self,
+        price_oracle: dict[str, float] | None = None,
+    ) -> float:
+        """Total directional exposure using current marks rather than share counts."""
+        total = 0.0
+        for position in self._positions.values():
+            yes_price = self._mark_price(position, position.token_id_yes, price_oracle)
+            no_price = self._mark_price(position, position.token_id_no, price_oracle)
+            total += abs((position.yes_size * yes_price) - (position.no_size * no_price))
+        return total
 
     def get_total_realized_pnl(self) -> float:
         """Sum of realized PnL across all positions."""
@@ -245,11 +340,11 @@ class PositionTracker:
         price_oracle: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         """Reconcile local positions with exchange data.
-        
+
         Also zeros out local positions that no longer exist on the exchange.
         """
         mismatches = []
-        
+
         # Build set of tokens the exchange reports we hold
         exchange_tokens: set[str] = set()
         for ep in exchange_positions:
@@ -257,7 +352,7 @@ class PositionTracker:
             exchange_size = float(ep.get("size", 0))
             if exchange_size > 0 and token_id:
                 exchange_tokens.add(token_id)
-        
+
         # Zero out local positions not on exchange
         for cid, pos in list(self._positions.items()):
             if pos.yes_size > 0 and pos.token_id_yes and pos.token_id_yes not in exchange_tokens:
@@ -276,13 +371,13 @@ class PositionTracker:
                             side="NO")
                 pos.no_size = 0.0
                 pos.no_cost_basis = 0.0
-        
+
         for ep in exchange_positions:
             token_id = ep.get("asset", "")
             exchange_size = float(ep.get("size", 0))
-            pos = self.get_by_token(token_id)
+            pos2: MarketPosition | None = self.get_by_token(token_id)
 
-            if pos is None:
+            if pos2 is None:
                 if exchange_size > 0:
                     mismatches.append({
                         "type": "unknown_position",
@@ -313,8 +408,8 @@ class PositionTracker:
                                 size=exchange_size)
                 continue
 
-            is_yes = token_id == pos.token_id_yes
-            local_size = pos.yes_size if is_yes else pos.no_size
+            is_yes = token_id == pos2.token_id_yes
+            local_size = pos2.yes_size if is_yes else pos2.no_size
 
             if abs(local_size - exchange_size) > 0.01:
                 mismatches.append({
@@ -326,9 +421,9 @@ class PositionTracker:
                 })
                 # Auto-correct to exchange truth
                 if is_yes:
-                    pos.yes_size = exchange_size
+                    pos2.yes_size = exchange_size
                 else:
-                    pos.no_size = exchange_size
+                    pos2.no_size = exchange_size
 
         if mismatches:
             logger.warning("position_reconciliation_mismatches", mismatches=mismatches)

@@ -4,12 +4,13 @@ Market metadata from external sources
 """
 
 from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
 class MarketMeta(BaseModel):
     """Market metadata from Polymarket Gamma API"""
-    
+
     condition_id: str
     question: str
     description: str
@@ -19,7 +20,7 @@ class MarketMeta(BaseModel):
     clarifications: list[str] = Field(default_factory=list)
     volume_24h: float
     current_mid: float
-    
+
     class Config:
         json_encoders = {
             datetime: lambda v: v.isoformat(),

@@ -15,6 +15,8 @@ falling time-to-catalyst, deepening drawdown, falling reward EV.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import structlog
 from pydantic import BaseModel, Field
 
@@ -59,6 +61,7 @@ class RiskLimits:
         self._nav: float = 0.0
         # Dynamic multiplier (1.0 = normal, <1.0 = tighter)
         self._dynamic_multiplier: float = 1.0
+        self._price_oracle_provider: Callable[[], dict[str, float]] | None = None
 
     def update_nav(self, nav: float) -> None:
         """Update current NAV for percentage-based limits."""
@@ -70,6 +73,18 @@ class RiskLimits:
         multiplier < 1.0 tightens limits (higher vol, drawdown, etc.)
         """
         self._dynamic_multiplier = max(0.1, min(1.0, multiplier))
+
+    def set_price_oracle_provider(
+        self,
+        provider: Callable[[], dict[str, float]] | None,
+    ) -> None:
+        """Provide current mark prices for exposure-based risk checks."""
+        self._price_oracle_provider = provider
+
+    def _current_price_oracle(self) -> dict[str, float] | None:
+        if self._price_oracle_provider is None:
+            return None
+        return self._price_oracle_provider()
 
     def _effective_limit(self, base_limit: float) -> float:
         """Apply dynamic multiplier to a base limit."""
@@ -87,9 +102,8 @@ class RiskLimits:
         if self._nav <= 0:
             return LimitCheckResult(passed=True)
 
-        # current_gross in dollars (approximate: shares * avg_entry or just use NAV fraction)
         pos = self.positions.get(condition_id)
-        current_gross = pos.total_cost_basis if pos else 0.0
+        current_gross = pos.gross_exposure_usdc(self._current_price_oracle()) if pos else 0.0
         new_gross = current_gross + proposed_additional_dollars
         limit = self._effective_limit(self.config.per_market_gross_nav) * self._nav
 
@@ -113,7 +127,10 @@ class RiskLimits:
         if self._nav <= 0:
             return LimitCheckResult(passed=True)
 
-        current_gross = self.positions.get_event_gross_exposure(event_id)
+        current_gross = self.positions.get_event_gross_exposure_mark_to_market(
+            event_id,
+            price_oracle=self._current_price_oracle(),
+        )
         new_gross = current_gross + proposed_additional
         limit = self._effective_limit(self.config.per_event_cluster_nav) * self._nav
 
@@ -136,7 +153,9 @@ class RiskLimits:
         if self._nav <= 0:
             return LimitCheckResult(passed=True)
 
-        current_net = self.positions.get_total_net_exposure()
+        current_net = self.positions.get_total_directional_exposure_mark_to_market(
+            price_oracle=self._current_price_oracle()
+        )
         new_net = current_net + abs(proposed_additional_net)
         limit = self._effective_limit(self.config.total_directional_nav) * self._nav
 
@@ -159,7 +178,9 @@ class RiskLimits:
             return LimitCheckResult(passed=True)
 
         # Count arb positions (simplified: all positions for now)
-        current_arb = self.positions.get_total_gross_exposure()
+        current_arb = self.positions.get_total_gross_exposure_mark_to_market(
+            price_oracle=self._current_price_oracle()
+        )
         new_arb = current_arb + proposed_additional
         limit = self._effective_limit(self.config.total_arb_gross_nav) * self._nav
 
@@ -228,7 +249,11 @@ class RiskLimits:
                     intent.bid_size = 0
                     intent.bid_price = None
                     diagnostics.bid_reasons.append("per_market_gross")
-                    logger.warning("risk_zeroed_bid", condition_id=intent.condition_id[:16], reason="per_market_gross")
+                    logger.warning(
+                        "risk_zeroed_bid",
+                        condition_id=intent.condition_id[:16],
+                        reason="per_market_gross",
+                    )
                 elif intent.bid_price and intent.bid_price > 0:
                     intent.bid_size = min(intent.bid_size, max_add / intent.bid_price)
                     diagnostics.bid_reasons.append("per_market_gross")
@@ -237,14 +262,22 @@ class RiskLimits:
             if self.correlation and intent.bid_size and intent.bid_size > 0:
                 bid_dollar = (intent.bid_size or 0) * (intent.bid_price or 0)
                 theme_passed, theme_max = self.correlation.check_theme_limit(
-                    intent.condition_id, bid_dollar, self._nav, self.positions,
+                    intent.condition_id,
+                    bid_dollar,
+                    self._nav,
+                    self.positions,
+                    price_oracle=self._current_price_oracle(),
                 )
                 if not theme_passed:
                     if theme_max <= 0:
                         intent.bid_size = 0
                         intent.bid_price = None
                         diagnostics.bid_reasons.append("theme_correlation")
-                        logger.warning("risk_zeroed_bid", condition_id=intent.condition_id[:16], reason="theme_correlation")
+                        logger.warning(
+                            "risk_zeroed_bid",
+                            condition_id=intent.condition_id[:16],
+                            reason="theme_correlation",
+                        )
                     elif intent.bid_price and intent.bid_price > 0:
                         intent.bid_size = min(intent.bid_size, theme_max / intent.bid_price)
                         diagnostics.bid_reasons.append("theme_correlation")
@@ -262,7 +295,11 @@ class RiskLimits:
                         intent.bid_size = 0
                         intent.bid_price = None
                         diagnostics.bid_reasons.append("event_cluster")
-                        logger.warning("risk_zeroed_bid", condition_id=intent.condition_id[:16], reason="event_cluster")
+                        logger.warning(
+                            "risk_zeroed_bid",
+                            condition_id=intent.condition_id[:16],
+                            reason="event_cluster",
+                        )
                     elif intent.bid_price and intent.bid_price > 0:
                         intent.bid_size = min(intent.bid_size, max_add / intent.bid_price)
                         diagnostics.bid_reasons.append("event_cluster")
@@ -272,7 +309,7 @@ class RiskLimits:
         intent.ask_size = saved_ask_size
 
         # Total directional check
-        net_add = (intent.bid_size or 0) - (intent.ask_size or 0)
+        net_add = (intent.bid_size or 0) * (intent.bid_price or 0.0)
         dir_check = self.check_total_directional(net_add)
         if not dir_check.passed:
             # Scale down proportionally
@@ -281,7 +318,11 @@ class RiskLimits:
             diagnostics.bid_reasons.append("total_directional")
             if intent.ask_size:
                 diagnostics.ask_reasons.append("total_directional")
-            logger.warning("risk_scaled_quote", condition_id=intent.condition_id[:16], reason="total_directional")
+            logger.warning(
+                "risk_scaled_quote",
+                condition_id=intent.condition_id[:16],
+                reason="total_directional",
+            )
 
         diagnostics.bid_reasons = list(dict.fromkeys(diagnostics.bid_reasons))
         diagnostics.ask_reasons = list(dict.fromkeys(diagnostics.ask_reasons))

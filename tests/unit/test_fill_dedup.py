@@ -1,9 +1,7 @@
 """Tests for LRU fill dedup — eviction, duplicate detection (T0-12)."""
 
-import sys
 import os
-
-import pytest
+import sys
 
 # The _LRUDedup class is defined inside pmm1/main.py.
 # Import it by adding path and importing module internals.

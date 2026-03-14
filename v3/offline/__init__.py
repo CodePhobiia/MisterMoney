@@ -8,8 +8,8 @@ Provides:
 """
 
 from .queue import EscalationQueue
-from .worker import OfflineWorker
 from .weekly_eval import WeeklyEvaluator
+from .worker import OfflineWorker
 
 __all__ = [
     "EscalationQueue",

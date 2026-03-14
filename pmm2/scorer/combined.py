@@ -7,7 +7,7 @@ Integrates all EV components and costs to compute marginal return per bundle.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import structlog
 
@@ -267,7 +267,7 @@ class MarketEVScorer:
         if not scored_bundles:
             return
 
-        ts_iso = datetime.now(timezone.utc).isoformat()
+        ts_iso = datetime.now(UTC).isoformat()
 
         rows = []
         for bundle in scored_bundles:

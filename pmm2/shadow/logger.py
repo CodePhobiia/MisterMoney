@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 
@@ -27,7 +28,7 @@ class ShadowLogger:
     Compares V1 actual vs PMM-2 recommended.
     """
 
-    def __init__(self, db, log_dir: str = "data/shadow"):
+    def __init__(self, db: Any, log_dir: str = "data/shadow") -> None:
         """Initialize shadow logger.
 
         Args:
@@ -46,14 +47,14 @@ class ShadowLogger:
 
         logger.info("shadow_logger_initialized", log_dir=log_dir)
 
-    def _rotate_log(self):
+    def _rotate_log(self) -> None:
         """Create new log file for today."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         self.log_file = os.path.join(self.log_dir, f"shadow_{today}.jsonl")
 
         logger.info("shadow_log_rotated", log_file=self.log_file)
 
-    def log_allocation_cycle(self, cycle_data: dict):
+    def log_allocation_cycle(self, cycle_data: dict[str, Any]) -> None:
         """Log a complete allocation cycle.
 
         cycle_data should include:
@@ -71,14 +72,14 @@ class ShadowLogger:
             cycle_data: dict with cycle details
         """
         # Check if we need to rotate log file
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         expected_file = os.path.join(self.log_dir, f"shadow_{today}.jsonl")
         if self.log_file != expected_file:
             self._rotate_log()
 
         # Add timestamp if not present
         if "timestamp" not in cycle_data:
-            cycle_data["timestamp"] = datetime.now(timezone.utc).isoformat()
+            cycle_data["timestamp"] = datetime.now(UTC).isoformat()
 
         # Write to JSONL file (compact single line per entry)
         try:
@@ -99,7 +100,7 @@ class ShadowLogger:
         except Exception as e:
             logger.error("shadow_log_write_failed", error=str(e), exc_info=True)
 
-    async def persist_allocation_cycle(self, cycle_data: dict):
+    async def persist_allocation_cycle(self, cycle_data: dict[str, Any]) -> None:
         """Persist the cycle to SQLite so readiness decisions are auditable."""
 
         if self.db is None or not hasattr(self.db, "execute"):
@@ -120,10 +121,16 @@ class ShadowLogger:
                 v1_total_ev_usdc, pmm2_total_ev_usdc, ev_delta_usdc,
                 v1_reward_market_count, pmm2_reward_market_count, reward_market_delta,
                 v1_reward_ev_usdc, pmm2_reward_ev_usdc, reward_ev_delta_usdc,
-                v1_cancel_rate_per_order_min, pmm2_cancel_rate_per_order_min, churn_delta_per_order_min,
+                v1_cancel_rate_per_order_min,
+                pmm2_cancel_rate_per_order_min,
+                churn_delta_per_order_min,
                 gate_blockers_json, gate_diagnostics_json, comparison_json, summary_json,
                 v1_state_json, pmm2_plan_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
             """,
             (
                 cycle_data.get("timestamp"),
@@ -162,7 +169,7 @@ class ShadowLogger:
             ),
         )
 
-    def log_divergence(self, divergence_type: str, details: dict):
+    def log_divergence(self, divergence_type: str, details: dict[str, Any]) -> None:
         """Log a specific divergence between V1 and PMM-2.
 
         Types:
@@ -179,7 +186,7 @@ class ShadowLogger:
         """
         divergence_entry = {
             "type": "divergence",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "divergence_type": divergence_type,
             "details": details,
         }
@@ -208,11 +215,11 @@ class ShadowLogger:
             Full path to log file
         """
         if date is None:
-            date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            date = datetime.now(UTC).strftime("%Y-%m-%d")
 
         return os.path.join(self.log_dir, f"shadow_{date}.jsonl")
 
-    def read_cycles(self, date: str | None = None) -> list[dict]:
+    def read_cycles(self, date: str | None = None) -> list[dict[str, Any]]:
         """Read all allocation cycles from a log file.
 
         Args:
@@ -229,7 +236,7 @@ class ShadowLogger:
 
         cycles = []
         try:
-            with open(log_path, "r") as f:
+            with open(log_path) as f:
                 for line in f:
                     if line.strip():
                         cycle = json.loads(line)

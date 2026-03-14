@@ -10,12 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Callable, Coroutine
 from decimal import Decimal
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 import structlog
 import websockets
-from websockets.client import WebSocketClientProtocol
 
 from pmm1.state.books import BookManager
 
@@ -42,8 +42,13 @@ class MarketWebSocket:
         reconnect_delay_s: float = 1.0,
         max_reconnect_delay_s: float = 30.0,
         on_book_update: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        on_book_delta: (
+            Callable[[str, float, float, float], Coroutine[Any, Any, None]]
+            | None
+        ) = None,
         on_trade: Callable[[str, float], Coroutine[Any, Any, None]] | None = None,
         on_tick_change: Callable[[str, Decimal], Coroutine[Any, Any, None]] | None = None,
+        on_reconnect: Callable[[], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
         self._ws_url = ws_url
         # IMPORTANT: don't use `book_manager or BookManager()` because an empty
@@ -54,14 +59,16 @@ class MarketWebSocket:
 
         # Callbacks
         self._on_book_update = on_book_update
+        self._on_book_delta = on_book_delta
         self._on_trade = on_trade
         self._on_tick_change = on_tick_change
+        self._on_reconnect = on_reconnect
 
-        self._ws: WebSocketClientProtocol | None = None
+        self._ws: Any = None
         self._subscribed_assets: set[str] = set()
         self._is_running = False
         self._reconnecting = False
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
         self._last_message_ts: float = 0.0
         self._message_count: int = 0
         self._connect_count: int = 0
@@ -89,6 +96,10 @@ class MarketWebSocket:
     def is_reconnecting(self) -> bool:
         """True while reconnect + resubscribe is in progress."""
         return self._reconnecting
+
+    @property
+    def subscribed_assets(self) -> list[str]:
+        return sorted(self._subscribed_assets)
 
     @property
     def seconds_since_last_message(self) -> float:
@@ -131,7 +142,11 @@ class MarketWebSocket:
 
         await self._ws.send(json.dumps(sub_msg))
         self._subscribed_assets.update(new_assets)
-        logger.info("market_ws_subscribed", count=len(new_assets), total=len(self._subscribed_assets))
+        logger.info(
+            "market_ws_subscribed",
+            count=len(new_assets),
+            total=len(self._subscribed_assets),
+        )
 
     async def unsubscribe(self, asset_ids: list[str]) -> None:
         """Unsubscribe from asset IDs."""
@@ -215,11 +230,23 @@ class MarketWebSocket:
             # or: [side, price, size]
             if isinstance(change, dict):
                 side = change.get("side", "")
+                if side not in {"bid", "bids", "ask", "asks"}:
+                    continue
+                price = float(change["price"])
+                old_size = book.get_level_size(side, change["price"])
                 book.apply_delta([change], side)
+                if self._on_book_delta:
+                    await self._on_book_delta(asset_id, price, old_size, float(change["size"]))
             elif isinstance(change, list) and len(change) >= 3:
                 side = change[0]  # "bids" or "asks"
+                if side not in {"bid", "bids", "ask", "asks"}:
+                    continue
                 delta = {"price": change[1], "size": change[2]}
+                price = float(change[1])
+                old_size = book.get_level_size(side, change[1])
                 book.apply_delta([delta], side)
+                if self._on_book_delta:
+                    await self._on_book_delta(asset_id, price, old_size, float(change[2]))
 
         if self._on_book_update:
             await self._on_book_update(asset_id)
@@ -311,6 +338,9 @@ class MarketWebSocket:
                         raise
 
                 self._reconnecting = False
+                if self._connect_count > 1 and self._on_reconnect:
+                    logger.info("market_ws_triggering_reconciliation")
+                    await self._on_reconnect()
                 await self._listen_loop()
 
             except Exception as e:
@@ -323,7 +353,7 @@ class MarketWebSocket:
             await asyncio.sleep(delay)
             delay = min(delay * 2, self._max_reconnect_delay)
 
-    def start(self, asset_ids: list[str] | None = None) -> asyncio.Task:
+    def start(self, asset_ids: list[str] | None = None) -> asyncio.Task[None]:
         """Start the WebSocket connection and message loop."""
         self._is_running = True
         if asset_ids:
@@ -348,6 +378,7 @@ class MarketWebSocket:
     def get_stats(self) -> dict[str, Any]:
         return {
             "is_connected": self.is_connected,
+            "is_reconnecting": self.is_reconnecting,
             "is_stale": self.is_stale,
             "subscribed_assets": len(self._subscribed_assets),
             "message_count": self._message_count,

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import os
 import signal
-from pathlib import Path
-from typing import Any, Callable
+from collections.abc import Callable
+from pathlib import Path, PurePosixPath
+from typing import Any
 
 import structlog
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+from pmm1.storage.spine import compute_config_hash
 
 _settings_logger = structlog.get_logger(__name__)
 
@@ -88,6 +91,12 @@ class PricingConfig(BaseModel):
     k_2: float = 0.3  # staleness
     k_3: float = 0.2  # resolution risk
     k_4: float = 0.1  # model error
+    # Kelly sizing parameters (Paper 2 §1)
+    kelly_enabled: bool = False
+    kelly_fraction: float = 0.25  # quarter-Kelly default
+    kelly_min_edge: float = 0.03  # 3% minimum edge to size
+    kelly_max_position_nav: float = 0.05  # 5% max per position
+    kelly_adverse_selection_lambda: float = 0.4  # edge discount
     # Fill model coefficients
     theta_0: float = -1.0
     theta_1: float = 5.0
@@ -107,6 +116,8 @@ class RiskConfig(BaseModel):
     daily_pause_drawdown_nav: float = 0.015
     daily_wider_drawdown_nav: float = 0.025
     daily_flatten_drawdown_nav: float = 0.04
+    # Absolute drawdown from session peak (Paper 1: 15%)
+    absolute_max_drawdown_nav: float = 0.15
 
 
 class ExecutionConfig(BaseModel):
@@ -198,7 +209,7 @@ class FlattenConfig(BaseModel):
     @classmethod
     def _validate_flag_path(cls, value: str) -> str:
         path = Path(value)
-        if not path.is_absolute():
+        if not path.is_absolute() and not PurePosixPath(value).is_absolute():
             raise ValueError("flatten.config_flag_path must be an absolute path")
         if path == Path("/"):
             raise ValueError("flatten.config_flag_path cannot be '/'")
@@ -275,6 +286,8 @@ class V3Config(BaseModel):
     redis_url: str = "redis://localhost:6379"
     min_confidence: float = 0.70  # Minimum confidence to use V3 signal
     signal_max_age_seconds: float = 300.0  # Max age before falling back to midpoint
+    # Paper 1: optimal ~67% market / ~33% AI blend
+    blend_weight: float = 0.0  # Start at 0 (disabled), ramp to 0.33
 
 
 class OpsConfig(BaseModel):
@@ -356,7 +369,12 @@ class Settings(BaseSettings):
     exit: ExitConfig = Field(default_factory=ExitConfig)
     v3: V3Config = Field(default_factory=V3Config)
     ops: OpsConfig = Field(default_factory=OpsConfig)
+    config_metadata: dict[str, Any] = Field(default_factory=dict, exclude=True)
     raw_config: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    config_base_path: str = Field(default="", exclude=True)
+    config_override_path: str = Field(default="", exclude=True)
+    resolved_config_path: str = Field(default="", exclude=True)
+    config_hash: str = Field(default="", exclude=True)
 
     model_config = {"env_prefix": "PMM1_", "env_nested_delimiter": "__"}
 
@@ -392,12 +410,14 @@ def load_settings(
     if config_path is None:
         config_path = project_root / "config" / "default.yaml"
     config_path = Path(config_path)
+    resolved_override_path: Path | None = None
 
     yaml_data: dict[str, Any] = {}
 
-    if config_path.exists():
-        with open(config_path) as f:
-            yaml_data = yaml.safe_load(f) or {}
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path, encoding="utf-8") as f:
+        yaml_data = yaml.safe_load(f) or {}
 
     if override_path is None:
         env_override = os.environ.get("PMM1_CONFIG_OVERRIDE", "").strip()
@@ -405,16 +425,17 @@ def load_settings(
             override_path = env_override
 
     if override_path is not None:
-        override_path = Path(override_path)
-        if override_path.exists():
-            with open(override_path) as f:
-                override_data = yaml.safe_load(f) or {}
-            yaml_data = _deep_merge(yaml_data, override_data)
+        resolved_override_path = Path(override_path)
+        if not resolved_override_path.exists():
+            raise FileNotFoundError(f"Override config file not found: {resolved_override_path}")
+        with open(resolved_override_path, encoding="utf-8") as f:
+            override_data = yaml.safe_load(f) or {}
+        yaml_data = _deep_merge(yaml_data, override_data)
 
     # Load .env file if present (dotenv-style)
     env_file = project_root / ".env"
     if env_file.exists():
-        with open(env_file) as f:
+        with open(env_file, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -453,15 +474,41 @@ def load_settings(
 
     # Preserve raw YAML for PMM-2 config loading (before stripping unknown keys)
     raw_config = dict(yaml_data)
-    
+    config_metadata = {
+        "base_config_path": (
+            str(config_path.resolve())
+            if config_path.exists() else str(config_path)
+        ),
+        "override_config_path": (
+            str(resolved_override_path.resolve())
+            if resolved_override_path is not None and resolved_override_path.exists()
+            else (str(resolved_override_path) if resolved_override_path is not None else "")
+        ),
+        "override_config_loaded": bool(
+            resolved_override_path is not None and resolved_override_path.exists()
+        ),
+    }
+
     # Strip keys not in Settings model (e.g. pmm2) to avoid pydantic extra_forbidden
     known_sections = set(Settings.model_fields.keys())
     for k in list(yaml_data.keys()):
         if k not in known_sections and k != "raw_config":
             del yaml_data[k]
-    
+
+    yaml_data["config_metadata"] = config_metadata
     yaml_data["raw_config"] = raw_config
     settings = Settings(**yaml_data)
+    resolved_base_str = str(config_path.resolve()) if config_path.exists() else str(config_path)
+    resolved_override_str = ""
+    if override_path is not None:
+        override_as_path = Path(override_path)
+        resolved_override_str = (
+            str(override_as_path.resolve()) if override_as_path.exists() else str(override_path)
+        )
+    settings.config_base_path = resolved_base_str
+    settings.config_override_path = resolved_override_str
+    settings.resolved_config_path = resolved_override_str or resolved_base_str
+    settings.config_hash = compute_config_hash(settings.raw_config)
     if enforce_runtime_guards:
         _validate_runtime_guards(settings)
     return settings
@@ -503,7 +550,7 @@ class SettingsManager:
 
     _instance: Settings | None = None
     _config_path: str = ""
-    _on_reload_callbacks: list[Callable] = []
+    _on_reload_callbacks: list[Callable[..., Any]] = []
 
     @classmethod
     def load(cls, config_path: str) -> Settings:
@@ -517,9 +564,9 @@ class SettingsManager:
     def _setup_signal_handler(cls) -> None:
         """Register SIGHUP handler for config hot-reload."""
         try:
-            def handle_sighup(signum, frame):
+            def handle_sighup(signum: int, frame: Any) -> None:
                 cls.reload()
-            signal.signal(signal.SIGHUP, handle_sighup)
+            signal.signal(signal.SIGHUP, handle_sighup)  # type: ignore[attr-defined]
         except (OSError, ValueError):
             # SIGHUP not available on this platform (e.g. Windows)
             pass
@@ -545,7 +592,7 @@ class SettingsManager:
             return None
 
     @classmethod
-    def on_reload(cls, callback: Callable) -> None:
+    def on_reload(cls, callback: Callable[..., Any]) -> None:
         """Register a callback for config reloads. Signature: (old, new) -> None."""
         cls._on_reload_callbacks.append(callback)
 

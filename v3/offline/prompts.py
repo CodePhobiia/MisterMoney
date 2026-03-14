@@ -77,14 +77,14 @@ def build_adjudication_prompt(
 ) -> str:
     """
     Build user prompt for offline adjudication
-    
+
     Args:
         question: Market question
         rules: Resolution rules/criteria
         evidence_items: List of evidence dicts with {claim, polarity, reliability}
         previous_estimates: List of {route, p_hat, uncertainty}
         current_mid: Current market midpoint price
-        
+
     Returns:
         Formatted prompt string
     """
@@ -96,7 +96,7 @@ def build_adjudication_prompt(
             f"(reliability: {ev['reliability']:.2f})"
         )
     evidence_text = "\n".join(evidence_lines) if evidence_lines else "No evidence available"
-    
+
     # Format previous estimates
     estimates_lines = []
     for est in previous_estimates:
@@ -104,7 +104,7 @@ def build_adjudication_prompt(
             f"- {est['route']}: p={est['p_hat']:.3f} ± {est['uncertainty']:.3f}"
         )
     estimates_text = "\n".join(estimates_lines) if estimates_lines else "No previous estimates"
-    
+
     prompt = f"""Market Question:
 {question}
 
@@ -129,12 +129,12 @@ def build_weekly_eval_prompt(
 ) -> str:
     """
     Build user prompt for weekly evaluation
-    
+
     Args:
         resolved_markets: List of dicts with {
             question, route, p_hat, outcome, brier_score
         }
-        
+
     Returns:
         Formatted prompt string
     """
@@ -145,7 +145,7 @@ def build_weekly_eval_prompt(
         if route not in by_route:
             by_route[route] = []
         by_route[route].append(market)
-    
+
     # Calculate route stats
     route_stats = []
     for route, markets in by_route.items():
@@ -153,7 +153,7 @@ def build_weekly_eval_prompt(
         route_stats.append(
             f"\n{route.upper()} ({len(markets)} markets, avg Brier: {avg_brier:.3f})"
         )
-        
+
         # Sample failures (Brier > 0.25)
         failures = [m for m in markets if m['brier_score'] > 0.25]
         if failures:
@@ -164,9 +164,9 @@ def build_weekly_eval_prompt(
                     f"(predicted {f['p_hat']:.2f}, actual {f['outcome']}, "
                     f"Brier {f['brier_score']:.3f})"
                 )
-    
+
     stats_text = "\n".join(route_stats)
-    
+
     prompt = f"""Resolved Markets Summary (Past 7 Days):
 
 Total markets: {len(resolved_markets)}

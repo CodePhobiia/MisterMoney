@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import statistics
+import time
 from typing import Any
 
 import structlog
@@ -14,14 +15,19 @@ class CounterfactualEngine:
     """Compare V1 actuals vs PMM-2 using real state and rolling diagnostics."""
 
     ROLLING_WINDOW = 100
+    PROMOTION_MIN_SHADOW_SEC = 10 * 24 * 60 * 60
     MIN_EV_SAMPLES = 60
     MIN_REWARD_SAMPLES = 60
     MIN_CHURN_SAMPLES = 60
+    PROMOTION_MIN_FILL_SAMPLES = 60
+    PROMOTION_MIN_UNIQUE_FILL_MARKETS = 4
     MIN_POSITIVE_EV_PCT = 55.0
 
-    def __init__(self, shadow_logger):
+    def __init__(self, shadow_logger: Any) -> None:
         self.shadow_logger = shadow_logger
         self.cycle_count: int = 0
+        self.first_cycle_ts: float | None = None
+        self.last_cycle_ts: float | None = None
         self.history: list[dict[str, Any]] = []
         self.metrics: dict[str, list[float]] = {
             "market_overlap_pct": [],
@@ -42,6 +48,10 @@ class CounterfactualEngine:
         """Compare one allocator cycle."""
 
         self.cycle_count += 1
+        now = time.time()
+        if self.first_cycle_ts is None:
+            self.first_cycle_ts = now
+        self.last_cycle_ts = now
 
         v1_markets = set(v1_state.get("markets", []))
         pmm2_markets = set(pmm2_plan.get("markets", []))
@@ -95,6 +105,7 @@ class CounterfactualEngine:
 
         comparison = {
             "cycle_num": self.cycle_count,
+            "observed_at": now,
             "market_overlap_pct": overlap_pct,
             "overlap_quote_distance_bps": quote_distance_bps,
             "v1_markets": sorted(v1_markets),
@@ -118,6 +129,10 @@ class CounterfactualEngine:
             "v1_cancel_rate_per_order_min": v1_cancel_rate,
             "pmm2_cancel_rate_per_order_min": pmm2_cancel_rate,
             "churn_delta_per_order_min": churn_delta,
+            "fill_count_recent": int(v1_state.get("fill_count_recent", 0) or 0),
+            "unique_fill_markets_recent": list(
+                v1_state.get("unique_fill_markets_recent", []) or []
+            ),
             "divergences": [],
         }
 
@@ -144,6 +159,7 @@ class CounterfactualEngine:
             reward_ev_delta_usdc=reward_ev_delta,
             churn_delta_per_order_min=churn_delta,
             ready_for_live=summary["ready_for_live"],
+            diagnostic_ready=summary["diagnostic_ready"],
         )
 
         return comparison
@@ -248,7 +264,7 @@ class CounterfactualEngine:
         avg_reward_ev_delta = self._mean([row["reward_ev_delta_usdc"] for row in reward_samples])
         avg_churn_delta = self._mean([row["churn_delta_per_order_min"] for row in churn_samples])
 
-        gates = {
+        gates: dict[str, dict[str, Any]] = {
             "gate_ev_positive": {
                 "pass": len(ev_samples) >= self.MIN_EV_SAMPLES
                 and avg_ev_delta > 0.0
@@ -289,7 +305,7 @@ class CounterfactualEngine:
         }
 
         blocking_gates = [name for name, details in gates.items() if not details["pass"]]
-        ready_for_live = all(details["pass"] for details in gates.values())
+        diagnostic_ready = all(details["pass"] for details in gates.values())
 
         return {
             "window_cycles": len(recent),
@@ -298,7 +314,55 @@ class CounterfactualEngine:
             "churn_sample_count": len(churn_samples),
             "gates": gates,
             "blocking_gates": blocking_gates,
-            "ready_for_live": ready_for_live,
+            "diagnostic_ready": diagnostic_ready,
+        }
+
+    def get_promotion_diagnostics(self) -> dict[str, Any]:
+        gate_diagnostics = self.get_gate_diagnostics()
+        recent = self._recent_history()
+        latest = recent[-1] if recent else {}
+        observed_duration_sec = 0.0
+        if self.first_cycle_ts is not None and self.last_cycle_ts is not None:
+            observed_duration_sec = max(0.0, self.last_cycle_ts - self.first_cycle_ts)
+        observed_fill_count = int(latest.get("fill_count_recent", 0) or 0)
+        observed_unique_fill_markets = sorted(
+            market
+            for market in list(latest.get("unique_fill_markets_recent", []) or [])
+            if market
+        )
+
+        promotion_gates: dict[str, dict[str, Any]] = {
+            "gate_shadow_duration": {
+                "pass": observed_duration_sec >= self.PROMOTION_MIN_SHADOW_SEC,
+                "observed_duration_sec": observed_duration_sec,
+                "threshold_duration_sec": self.PROMOTION_MIN_SHADOW_SEC,
+            },
+            "gate_fill_samples": {
+                "pass": observed_fill_count >= self.PROMOTION_MIN_FILL_SAMPLES,
+                "observed_fill_count": observed_fill_count,
+                "threshold_fill_count": self.PROMOTION_MIN_FILL_SAMPLES,
+            },
+            "gate_market_variety": {
+                "pass": len(observed_unique_fill_markets) >= self.PROMOTION_MIN_UNIQUE_FILL_MARKETS,
+                "observed_unique_markets": observed_unique_fill_markets,
+                "threshold_unique_markets": self.PROMOTION_MIN_UNIQUE_FILL_MARKETS,
+            }
+        }
+        blocking_gates = list(gate_diagnostics["blocking_gates"])
+        blocking_gates.extend(
+            gate_name
+            for gate_name, details in promotion_gates.items()
+            if not details["pass"]
+        )
+
+        promotion_ready = gate_diagnostics["diagnostic_ready"] and all(
+            details["pass"] for details in promotion_gates.values()
+        )
+        return {
+            "diagnostic_ready": gate_diagnostics["diagnostic_ready"],
+            "gates": promotion_gates,
+            "blocking_gates": blocking_gates,
+            "promotion_ready": promotion_ready,
         }
 
     def get_summary(self) -> dict[str, Any]:
@@ -313,8 +377,13 @@ class CounterfactualEngine:
                 "avg_reward_ev_delta_usdc": 0.0,
                 "avg_churn_delta_per_order_min": 0.0,
                 "avg_overlap_quote_distance_bps": 0.0,
+                "diagnostic_ready": False,
                 "ready_for_live": False,
                 "gate_blockers": [],
+                "promotion_blockers": [],
+                "shadow_days_observed": 0.0,
+                "fill_count_observed": 0,
+                "unique_fill_markets_observed": [],
                 "ev_sample_count": 0,
                 "reward_sample_count": 0,
                 "churn_sample_count": 0,
@@ -325,12 +394,16 @@ class CounterfactualEngine:
         reward_samples = [row for row in recent if row.get("reward_sample_valid", False)]
         churn_samples = [row for row in recent if row.get("churn_sample_valid", False)]
         gate_diagnostics = self.get_gate_diagnostics()
+        promotion_diagnostics = self.get_promotion_diagnostics()
 
         positive_ev_pct = (
             (sum(1 for row in ev_samples if row["ev_delta_usdc"] > 0.0) / len(ev_samples)) * 100.0
             if ev_samples
             else 0.0
         )
+        observed_shadow_days = 0.0
+        if self.first_cycle_ts is not None and self.last_cycle_ts is not None:
+            observed_shadow_days = max(0.0, self.last_cycle_ts - self.first_cycle_ts) / 86400.0
 
         return {
             "cycles_run": self.cycle_count,
@@ -350,15 +423,26 @@ class CounterfactualEngine:
             "avg_overlap_quote_distance_bps": self._mean(
                 [row["overlap_quote_distance_bps"] for row in recent]
             ),
-            "ready_for_live": gate_diagnostics["ready_for_live"],
+            "diagnostic_ready": gate_diagnostics["diagnostic_ready"],
+            "ready_for_live": promotion_diagnostics["promotion_ready"],
             "gate_blockers": gate_diagnostics["blocking_gates"],
+            "promotion_blockers": promotion_diagnostics["blocking_gates"],
+            "shadow_days_observed": observed_shadow_days,
+            "fill_count_observed": (
+                promotion_diagnostics["gates"]
+                ["gate_fill_samples"]["observed_fill_count"]
+            ),
+            "unique_fill_markets_observed": (
+                promotion_diagnostics["gates"]
+                ["gate_market_variety"]["observed_unique_markets"]
+            ),
             "ev_sample_count": len(ev_samples),
             "reward_sample_count": len(reward_samples),
             "churn_sample_count": len(churn_samples),
         }
 
     def is_ready_for_live(self) -> bool:
-        return self.get_gate_diagnostics()["ready_for_live"]
+        return bool(self.get_promotion_diagnostics()["promotion_ready"])
 
     def get_gates_status(self) -> dict[str, bool]:
         diagnostics = self.get_gate_diagnostics()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import structlog
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -46,7 +47,7 @@ class PMM2CanaryConfig(BaseModel):
         "min_hours_to_resolution",
     )
     @classmethod
-    def _validate_non_negative(cls, value: float, info) -> float:
+    def _validate_non_negative(cls, value: float, info: Any) -> float:
         if value < 0.0:
             raise ValueError(f"pmm2.canary.{info.field_name} must be non-negative")
         return value
@@ -183,7 +184,7 @@ class PMM2Config(BaseModel):
         return min(self.total_active_cap_nav, self.live_capital_pct)
 
 
-def load_pmm2_config(yaml_dict: dict) -> PMM2Config:
+def load_pmm2_config(yaml_dict: dict[str, Any]) -> PMM2Config:
     """Load PMM2Config from the 'pmm2' key of config YAML.
 
     If 'pmm2' key doesn't exist, returns default config (disabled).

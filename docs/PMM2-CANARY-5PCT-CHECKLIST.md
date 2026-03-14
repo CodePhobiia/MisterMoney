@@ -76,10 +76,11 @@ Notes:
 Before restart, export:
 
 ```bash
+export PMM1_CONFIG_OVERRIDE=config/prod.yaml
 export PMM1_ACK_PMM2_LIVE=YES
 ```
 
-Without this, PMM2 live mode should refuse to initialize.
+Without the config override, editing `config/prod.yaml` does nothing because `config/default.yaml` remains the active config. Without the acknowledgement, PMM2 live mode should refuse to initialize and the bot should fail startup rather than silently continuing V1-only.
 
 If using a systemd user service, ensure the environment is present in the service context before restart.
 
@@ -107,6 +108,7 @@ journalctl --user -u pmm1 --no-pager --since '10 min ago' \
 ```
 
 What you want to see:
+- `resolved_config_path` points at `config/prod.yaml`
 - `enabled: true`
 - `shadow_mode: false`
 - `live_enabled: true`

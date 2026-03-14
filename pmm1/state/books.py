@@ -7,7 +7,7 @@ from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Any
 
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 logger = structlog.get_logger(__name__)
 
@@ -104,6 +104,16 @@ class OrderBook:
                 book[price] = size
 
         self.last_update_ts = time.time()
+
+    def get_level_size(self, side: str, price: Decimal | float | str) -> float:
+        """Return the visible size at one price level."""
+        price_dec = Decimal(str(price))
+        normalized_side = side.lower()
+        if normalized_side in {"bid", "bids"}:
+            return float(self._bids.get(price_dec, Decimal("0")))
+        if normalized_side in {"ask", "asks"}:
+            return float(self._asks.get(price_dec, Decimal("0")))
+        raise ValueError(f"unknown book side: {side}")
 
     def set_tick_size(self, new_tick_size: Decimal) -> None:
         """Update tick size (from tick_size_change WS event)."""
@@ -309,3 +319,33 @@ class BookManager:
 
     def __len__(self) -> int:
         return len(self._books)
+
+
+def _normalize_snapshot_level(level: Any) -> dict[str, str]:
+    """Normalize a snapshot level object into apply_snapshot() format."""
+    if isinstance(level, dict):
+        return {
+            "price": str(level["price"]),
+            "size": str(level["size"]),
+        }
+
+    return {
+        "price": str(getattr(level, "price")),
+        "size": str(getattr(level, "size")),
+    }
+
+
+def build_order_book_from_snapshot(
+    token_id: str,
+    *,
+    bids: list[Any],
+    asks: list[Any],
+    tick_size: Decimal = Decimal("0.01"),
+) -> OrderBook:
+    """Build an OrderBook from snapshot-style bid/ask levels."""
+    book = OrderBook(token_id, tick_size=tick_size)
+    book.apply_snapshot(
+        [_normalize_snapshot_level(level) for level in bids],
+        [_normalize_snapshot_level(level) for level in asks],
+    )
+    return book

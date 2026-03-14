@@ -34,32 +34,32 @@ def build_simple_judge_prompt(
 ) -> str:
     """
     Build the user prompt for market-aware trading decision
-    
+
     Args:
         blind: Blind estimate dict with keys: p_hat, uncertainty, reasoning_summary
         market_state: Market state dict with keys: current_mid, volume_24h, spread
-        
+
     Returns:
         Formatted prompt string
     """
     p_hat = blind.get("p_hat", 0.5)
     uncertainty = blind.get("uncertainty", 0.1)
     reasoning = blind.get("reasoning_summary", "")
-    
+
     current_mid = market_state.get("current_mid", 0.5)
     volume_24h = market_state.get("volume_24h", 0.0)
     spread = market_state.get("spread", 0.02)
-    
+
     # Calculate raw edge
     raw_edge_cents = abs(p_hat - current_mid) * 100
-    
+
     # Calculate dynamic hurdle
     hurdle = 0.03  # base hurdle
     hurdle += spread / 2  # spread component
     if volume_24h < 10000:  # low volume threshold
         hurdle += 0.02
     hurdle_cents = hurdle * 100
-    
+
     prompt = f"""BLIND ESTIMATE:
 Probability: {p_hat:.3f}
 Uncertainty: ±{uncertainty:.3f}
@@ -76,5 +76,5 @@ Dynamic Hurdle: {hurdle_cents:.1f}¢
 
 Based on the above, decide whether to TRADE, pass (NO_EDGE), or WAIT for better information.
 Output ONLY the JSON object, nothing else."""
-    
+
     return prompt

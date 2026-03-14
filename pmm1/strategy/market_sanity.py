@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict, defaultdict
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Callable
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -27,9 +28,9 @@ def _hours_to_end(end_date: datetime | None, now: datetime | None = None) -> flo
     if end_date is None:
         return float("inf")
 
-    current_time = now or datetime.now(timezone.utc)
-    normalized_end = end_date if end_date.tzinfo else end_date.replace(tzinfo=timezone.utc)
-    normalized_now = current_time if current_time.tzinfo else current_time.replace(tzinfo=timezone.utc)
+    current_time = now or datetime.now(UTC)
+    normalized_end = end_date if end_date.tzinfo else end_date.replace(tzinfo=UTC)
+    normalized_now = current_time if current_time.tzinfo else current_time.replace(tzinfo=UTC)
     return max(0.0, (normalized_end - normalized_now).total_seconds() / 3600.0)
 
 
@@ -246,7 +247,10 @@ def compute_concentration_suppressions(
 
     for md in ranked_markets:
         question = md.question or md.slug or md.condition_id
-        theme = md.theme or (classify_theme(md.condition_id, question) if classify_theme else "uncorrelated")
+        theme = md.theme or (
+            classify_theme(md.condition_id, question)
+            if classify_theme else "uncorrelated"
+        )
 
         if (
             md.event_id
@@ -290,7 +294,11 @@ def assess_live_market(
 
     spread_cents = max(0.0, features.spread_cents)
     reward_capture_ok = True
-    if market.reward_eligible and market.reward_max_spread > 0 and spread_cents > market.reward_max_spread:
+    if (
+        market.reward_eligible and
+        market.reward_max_spread > 0 and
+        spread_cents > market.reward_max_spread
+    ):
         reward_capture_ok = False
         reasons.append("reward_spread_outside_scoring")
 

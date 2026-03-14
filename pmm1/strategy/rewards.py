@@ -13,8 +13,6 @@ Maker rebates:
 
 from __future__ import annotations
 
-import math
-
 import structlog
 from pydantic import BaseModel, Field
 
@@ -206,7 +204,10 @@ class RewardEstimator:
         liquidity_reward_ev = our_share * params.daily_reward_rate
 
         # Maker rebate EV
-        maker_rebate_ev = self._our_maker_share * self._daily_rebate_pool / max(1, len(self._reward_params))
+        maker_rebate_ev = (
+            self._our_maker_share * self._daily_rebate_pool
+            / max(1, len(self._reward_params))
+        )
 
         total_ev = liquidity_reward_ev + maker_rebate_ev
 

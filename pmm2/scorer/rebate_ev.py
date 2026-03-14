@@ -46,7 +46,7 @@ def compute_rebate_ev(
     # feeEq = size * price * fee_rate * (price * (1 - price)) ^ exp_m
     def fee_eq(size: float, price: float) -> float:
         variance = price * (1.0 - price)
-        return size * price * market.fee_rate * (variance**exp_m)
+        return float(size * price * market.fee_rate * (variance**exp_m))
 
     our_fee_eq_bid = fee_eq(bundle.bid_size, bundle.bid_price)
     our_fee_eq_ask = fee_eq(bundle.ask_size, bundle.ask_price)

@@ -7,11 +7,18 @@ CREATE TABLE IF NOT EXISTS fill_record (
     condition_id TEXT NOT NULL,
     token_id TEXT NOT NULL,
     order_id TEXT NOT NULL,
+    exchange_trade_id TEXT DEFAULT '',
+    fill_identity TEXT,
     side TEXT NOT NULL,                  -- BUY or SELL
     price REAL NOT NULL,
     size REAL NOT NULL,
     dollar_value REAL NOT NULL,
     fee REAL DEFAULT 0.0,
+    fee_known INTEGER DEFAULT 1,
+    fee_source TEXT DEFAULT 'unknown',
+    ingest_state TEXT DEFAULT 'applied',
+    raw_event_json TEXT,
+    resolved_at TEXT,
     -- Markout fields (filled asynchronously after fill)
     markout_1s REAL,                     -- price change at +1s
     markout_5s REAL,                     -- price change at +5s
@@ -154,6 +161,9 @@ CREATE TABLE IF NOT EXISTS shadow_cycle (
 -- Create indices for common queries
 CREATE INDEX IF NOT EXISTS idx_fill_record_ts ON fill_record(ts);
 CREATE INDEX IF NOT EXISTS idx_fill_record_condition ON fill_record(condition_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fill_record_identity
+ON fill_record(fill_identity)
+WHERE fill_identity IS NOT NULL AND fill_identity != '';
 CREATE INDEX IF NOT EXISTS idx_book_snapshot_ts ON book_snapshot(ts);
 CREATE INDEX IF NOT EXISTS idx_book_snapshot_condition ON book_snapshot(condition_id);
 CREATE INDEX IF NOT EXISTS idx_scoring_history_order ON scoring_history(order_id);

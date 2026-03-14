@@ -5,7 +5,8 @@ Sonnet 4.6 probability estimation without market price
 
 SIMPLE_BLIND_SYSTEM = """You are a probability estimation engine for prediction markets.
 
-Given a market question, resolution rules, and evidence items, estimate the probability that the market resolves YES.
+Given a market question, resolution rules, and evidence items, \
+estimate the probability that the market resolves YES.
 
 IMPORTANT RULES:
 1. Base your estimate ONLY on the provided evidence and rules
@@ -31,13 +32,13 @@ def build_simple_blind_prompt(
 ) -> str:
     """
     Build the user prompt for blind probability estimation
-    
+
     Args:
         question: Market question
         rules: Resolution rules
         evidence: List of evidence item dicts with keys: evidence_id, claim, polarity, reliability
         clarifications: List of clarification texts
-        
+
     Returns:
         Formatted prompt string
     """
@@ -48,20 +49,20 @@ def build_simple_blind_prompt(
         claim = item.get("claim", "")
         polarity = item.get("polarity", "NEUTRAL")
         reliability = item.get("reliability", 0.5)
-        
+
         evidence_lines.append(
             f"[{eid}] ({polarity}, reliability={reliability:.2f}): {claim}"
         )
-    
+
     evidence_block = "\n".join(evidence_lines) if evidence_lines else "(No evidence available)"
-    
+
     # Format clarifications
     clarifications_block = ""
     if clarifications:
         clarifications_block = "\n\nCLARIFICATIONS:\n" + "\n".join(
             f"- {c}" for c in clarifications
         )
-    
+
     prompt = f"""MARKET QUESTION:
 {question}
 
@@ -73,5 +74,5 @@ EVIDENCE:
 
 Based on the above, estimate the probability that this market resolves YES.
 Output ONLY the JSON object, nothing else."""
-    
+
     return prompt

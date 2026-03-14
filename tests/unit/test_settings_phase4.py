@@ -94,3 +94,21 @@ def test_pmm2_full_live_requires_canary_disabled(monkeypatch):
             live_capital_pct=1.0,
             canary={"enabled": True},
         )
+
+
+def test_load_settings_exposes_resolved_config_paths(tmp_path):
+    base_path = tmp_path / "base.yaml"
+    override_path = tmp_path / "override.yaml"
+    base_path.write_text("bot:\n  paper_mode: true\n", encoding="utf-8")
+    override_path.write_text("bot:\n  env: prod\n", encoding="utf-8")
+
+    settings = load_settings(
+        config_path=base_path,
+        override_path=override_path,
+        enforce_runtime_guards=False,
+    )
+
+    assert settings.config_base_path == str(base_path.resolve())
+    assert settings.config_override_path == str(override_path.resolve())
+    assert settings.resolved_config_path == str(override_path.resolve())
+    assert settings.config_hash

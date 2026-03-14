@@ -46,11 +46,11 @@ def build_rule_judge_prompt(
 ) -> str:
     """
     Build the user prompt for GPT-5.4 judge (rule-heavy variant)
-    
+
     Args:
         blind: Dict with p_hat, uncertainty, reasoning_summary, dispute_risk, rule_clarity
         market_state: Dict with current_mid, volume_24h, spread
-        
+
     Returns:
         User prompt string
     """
@@ -77,5 +77,5 @@ def build_rule_judge_prompt(
         "",
         "Output ONLY the JSON response, nothing else.",
     ]
-    
+
     return "\n".join(prompt_parts)

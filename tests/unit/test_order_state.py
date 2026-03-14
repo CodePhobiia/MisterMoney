@@ -1,13 +1,12 @@
 """Tests for order state machine — transitions, terminal rejection (T0-04)."""
 
-import pytest
 
 from pmm1.state.orders import (
-    OrderState,
-    TrackedOrder,
-    OrderTracker,
-    TERMINAL_STATES,
     ACTIVE_STATES,
+    TERMINAL_STATES,
+    OrderState,
+    OrderTracker,
+    TrackedOrder,
 )
 
 
@@ -162,6 +161,8 @@ class TestOrderTracker:
     def test_count_active(self):
         tracker = OrderTracker()
         tracker.track(TrackedOrder(order_id="a1", token_id="t1", side="BUY", state=OrderState.LIVE))
-        tracker.track(TrackedOrder(order_id="a2", token_id="t1", side="SELL", state=OrderState.LIVE))
+        tracker.track(
+            TrackedOrder(order_id="a2", token_id="t1", side="SELL", state=OrderState.LIVE)
+        )
         assert tracker.count_active("t1") == 2
         assert tracker.count_active("t1", "BUY") == 1

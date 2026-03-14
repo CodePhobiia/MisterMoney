@@ -14,9 +14,8 @@ import asyncio
 import csv
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 from pmm1.storage.database import Database
 
@@ -37,7 +36,7 @@ def parse_since(since_str: str) -> datetime:
     amount = int(match.group(1))
     unit = match.group(2)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     if unit == "h":
         return now - timedelta(hours=amount)

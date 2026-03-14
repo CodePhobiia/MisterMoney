@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -37,7 +37,7 @@ class DepletionCalculator:
         current_time = __import__("time").time()
         cutoff_time = current_time - lookback_sec
 
-        rows = await db.fetchall(
+        rows = await db.fetch_all(
             """
             SELECT timestamp, bid_depth_5, ask_depth_5
             FROM book_snapshot
@@ -59,15 +59,20 @@ class DepletionCalculator:
         # Calculate depletion rate from depth changes over time
         total_depletion = 0.0
         total_time = 0.0
-        prev_timestamp = None
-        prev_bid_depth = None
-        prev_ask_depth = None
+        prev_timestamp: float | None = None
+        prev_bid_depth: float | None = None
+        prev_ask_depth: float | None = None
 
-        for timestamp, bid_depth, ask_depth in rows:
+        for row in rows:
+            timestamp = float(row["timestamp"])
+            bid_depth = float(row["bid_depth_5"])
+            ask_depth = float(row["ask_depth_5"])
             if prev_timestamp is not None:
                 time_delta = timestamp - prev_timestamp
                 if time_delta > 0:
                     # Measure net depletion (positive = queue consumed)
+                    assert prev_bid_depth is not None
+                    assert prev_ask_depth is not None
                     bid_depletion = max(prev_bid_depth - bid_depth, 0.0)
                     ask_depletion = max(prev_ask_depth - ask_depth, 0.0)
                     avg_depletion = (bid_depletion + ask_depletion) / 2.0
@@ -103,7 +108,7 @@ class DepletionCalculator:
         return depletion_rate
 
     async def refresh_all(
-        self, db: Database, active_token_ids: list[str], hazard_calculator
+        self, db: Database, active_token_ids: list[str], hazard_calculator: Any
     ) -> None:
         """Batch update depletion rates for all active tokens.
 

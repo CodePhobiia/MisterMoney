@@ -12,14 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
 import json
 import time
-from typing import Any, Callable, Coroutine
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 import structlog
 import websockets
-from websockets.client import WebSocketClientProtocol
 
 from pmm1.state.orders import OrderState, OrderTracker
 
@@ -59,9 +58,9 @@ class UserWebSocket:
         self._on_settlement = on_settlement
         self._on_reconnect = on_reconnect
 
-        self._ws: WebSocketClientProtocol | None = None
+        self._ws: Any = None
         self._is_running = False
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
         self._last_message_ts: float = 0.0
         self._message_count: int = 0
         self._connect_count: int = 0
@@ -176,6 +175,30 @@ class UserWebSocket:
 
     async def _handle_trade_update(self, msg: dict[str, Any]) -> None:
         """Process trade/fill notification from WS."""
+        fill_event = self._normalize_trade_update(msg)
+        if fill_event is None:
+            logger.debug("user_ws_trade_update_skipped", keys=list(msg.keys()))
+            return
+
+        if fill_event["order_id"]:
+            self._orders.apply_fill(
+                fill_event["order_id"],
+                str(fill_event["size"]),
+                str(fill_event["price"]),
+            )
+
+        logger.info(
+            "user_ws_trade_update",
+            order_id=fill_event["order_id"][:16] if fill_event["order_id"] else "?",
+            size=fill_event["size"],
+            price=fill_event["price"],
+        )
+
+        if self._on_trade_update:
+            await self._on_trade_update(fill_event)
+
+    def _normalize_trade_update(self, msg: dict[str, Any]) -> dict[str, Any] | None:
+        """Normalize a raw trade payload into one canonical fill event."""
         # Trade payloads can carry a generic `id` that is the match/trade UUID,
         # not our order ID. Only use explicit order-id fields for tracker updates.
         order_id = (
@@ -187,21 +210,75 @@ class UserWebSocket:
             or msg.get("taker_order_id")
             or ""
         )
+
         fill_size = msg.get("size") or msg.get("matchSize", "0")
         fill_price = msg.get("price") or msg.get("matchPrice")
+        if not order_id or not fill_size or not fill_price:
+            return None
 
-        if order_id and fill_size:
-            self._orders.apply_fill(order_id, str(fill_size), str(fill_price) if fill_price else None)
-
-        logger.info(
-            "user_ws_trade_update",
-            order_id=order_id[:16] if order_id else "?",
-            size=fill_size,
-            price=fill_price,
+        tracked = self._orders.get(order_id)
+        token_id = (
+            msg.get("asset_id")
+            or msg.get("token_id", "")
+            or (tracked.token_id if tracked else "")
+        )
+        side = msg.get("side", "").upper() or (tracked.side if tracked else "")
+        condition_id = (
+            msg.get("market")
+            or msg.get("condition_id", "")
+            or (tracked.condition_id if tracked else "")
         )
 
-        if self._on_trade_update:
-            await self._on_trade_update(msg)
+        try:
+            size = float(fill_size)
+            price = float(fill_price)
+        except (TypeError, ValueError):
+            return None
+        if size <= 0 or price <= 0:
+            return None
+
+        exchange_trade_id = (
+            str(
+                msg.get("id")
+                or msg.get("tradeID")
+                or msg.get("trade_id")
+                or msg.get("matchID")
+                or msg.get("match_id")
+                or ""
+            ).strip()
+        )
+        try:
+            fee_amount = float(
+                msg.get("fee")
+                or msg.get("feeAmount")
+                or msg.get("fee_amount")
+                or msg.get("feePaid")
+                or msg.get("fee_paid")
+                or ""
+            )
+            fee_source = "payload"
+        except (TypeError, ValueError):
+            fee_amount = None
+            fee_source = "unknown"
+
+        fill_identity = exchange_trade_id
+        if not fill_identity:
+            normalized_payload = json.dumps(msg, sort_keys=True, default=str)
+            fill_identity = hashlib.sha256(normalized_payload.encode("utf-8")).hexdigest()
+
+        return {
+            "order_id": order_id,
+            "exchange_trade_id": exchange_trade_id,
+            "fill_identity": fill_identity,
+            "token_id": token_id,
+            "condition_id": condition_id,
+            "side": side,
+            "price": price,
+            "size": size,
+            "fee_amount": fee_amount,
+            "fee_source": fee_source,
+            "raw_msg": msg,
+        }
 
     async def _handle_settlement(self, msg: dict[str, Any]) -> None:
         """Process settlement/resolution notification."""
@@ -283,7 +360,7 @@ class UserWebSocket:
             await asyncio.sleep(delay)
             delay = min(delay * 2, self._max_reconnect_delay)
 
-    def start(self) -> asyncio.Task:
+    def start(self) -> asyncio.Task[None]:
         """Start the authenticated WebSocket connection."""
         self._is_running = True
         self._task = asyncio.create_task(self._run_with_reconnect())

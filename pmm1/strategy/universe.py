@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -45,6 +45,8 @@ class MarketMetadata(BaseModel):
     reward_min_size: float = 0.0
     reward_max_spread: float = 0.0
     fees_enabled: bool = False
+    fee_rate: float = 0.0
+    fee_known: bool = True
     # Computed during scoring
     toxicity_estimate: float = 0.0
     resolution_risk: float = 0.0
@@ -83,7 +85,7 @@ def check_eligibility(
     eligible_i = active_i ∧ orderbook_i ∧ clearRules_i ∧ liquid_i ∧ safeTime_i
     """
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
     reasons: list[str] = []
 
@@ -113,8 +115,11 @@ def check_eligibility(
 
     # Hard end_date check: if market ended in the past, it's dead
     if market.end_date:
-        end_date = market.end_date if market.end_date.tzinfo else market.end_date.replace(tzinfo=timezone.utc)
-        now_aware = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        end_date = (
+            market.end_date if market.end_date.tzinfo
+            else market.end_date.replace(tzinfo=UTC)
+        )
+        now_aware = now if now.tzinfo else now.replace(tzinfo=UTC)
         hours_remaining = (end_date - now_aware).total_seconds() / 3600
         if hours_remaining < 0:
             reasons.append("market_ended")
@@ -138,11 +143,18 @@ def check_eligibility(
     # Depth check — only apply if depth data is actually available.
     # Gamma API doesn't provide depth_within_2c, so 0.0 means "no data" not "empty book".
     if market.depth_within_2c > 0 and market.depth_within_2c < filters.min_depth_within_2c_shares:
-        reasons.append(f"depth_2c={market.depth_within_2c:.0f} < {filters.min_depth_within_2c_shares:.0f}")
+        reasons.append(
+            f"depth_2c={market.depth_within_2c:.0f}"
+            f" < {filters.min_depth_within_2c_shares:.0f}"
+        )
 
     # Midpoint filter: skip extreme prices where MM can't profit
     # Markets at $0.01 or $0.99 have no spread to capture
-    mid = (market.best_bid + market.best_ask) / 2 if market.best_bid > 0 and market.best_ask > 0 else 0
+    mid = (
+        (market.best_bid + market.best_ask) / 2
+        if market.best_bid > 0 and market.best_ask > 0
+        else 0
+    )
     if mid > 0 and (mid < 0.15 or mid > 0.85):
         reasons.append(f"extreme_price_mid={mid:.3f}")
 
@@ -280,7 +292,7 @@ def estimate_resolution_risk(
     Higher near resolution time, with disputes, or unclear rules.
     """
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
     risk = 0.0
 

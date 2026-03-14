@@ -7,14 +7,16 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from datetime import datetime, timezone
+import json
+from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 if TYPE_CHECKING:
-    from pmm1.storage.database import Database
     from pmm1.state.books import BookManager
+    from pmm1.storage.database import Database
 
 logger = structlog.get_logger(__name__)
 
@@ -31,9 +33,9 @@ class FillRecorder:
         """
         self.db = db
         self.book_manager = book_manager
-        self._on_failure = None
+        self._on_failure: Callable[..., Any] | None = None
 
-    def set_on_failure(self, callback) -> None:
+    def set_on_failure(self, callback: Callable[..., Any] | None) -> None:
         """Register an optional callback for fill recorder failures."""
         self._on_failure = callback
 
@@ -71,10 +73,17 @@ class FillRecorder:
         side: str,
         price: float,
         size: float,
-        fee: float,
+        fee: float | None,
         mid_at_fill: float | None,
         is_scoring: bool,
         reward_eligible: bool,
+        *,
+        exchange_trade_id: str = "",
+        fill_identity: str = "",
+        fee_known: bool = True,
+        fee_source: str = "unknown",
+        ingest_state: str = "applied",
+        raw_event_json: dict[str, Any] | None = None,
     ) -> int:
         """Record a fill to the database.
 
@@ -101,11 +110,12 @@ class FillRecorder:
             sql = """
                 INSERT INTO fill_record (
                     ts, condition_id, token_id, order_id, side,
-                    price, size, dollar_value, fee,
-                    mid_at_fill, is_scoring, reward_eligible
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exchange_trade_id, fill_identity,
+                    price, size, dollar_value, fee, fee_known, fee_source, ingest_state,
+                    raw_event_json, mid_at_fill, is_scoring, reward_eligible
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
-            
+
             await self.db.execute(
                 sql,
                 (
@@ -114,10 +124,16 @@ class FillRecorder:
                     token_id,
                     order_id,
                     side,
+                    exchange_trade_id,
+                    fill_identity,
                     price,
                     size,
                     dollar_value,
                     fee,
+                    1 if fee_known else 0,
+                    fee_source,
+                    ingest_state,
+                    json.dumps(raw_event_json or {}, sort_keys=True),
                     mid_at_fill,
                     1 if is_scoring else 0,
                     1 if reward_eligible else 0,
@@ -135,12 +151,14 @@ class FillRecorder:
                 price=price,
                 size=size,
                 is_scoring=is_scoring,
+                ingest_state=ingest_state,
             )
 
-            # Schedule markout calculations
-            asyncio.create_task(self._schedule_markout(fill_id, token_id, side, price, 1))
-            asyncio.create_task(self._schedule_markout(fill_id, token_id, side, price, 5))
-            asyncio.create_task(self._schedule_markout(fill_id, token_id, side, price, 30))
+            # Schedule markout calculations only once the fill has been fully applied.
+            if ingest_state == "applied":
+                asyncio.create_task(self._schedule_markout(fill_id, token_id, side, price, 1))
+                asyncio.create_task(self._schedule_markout(fill_id, token_id, side, price, 5))
+                asyncio.create_task(self._schedule_markout(fill_id, token_id, side, price, 30))
 
             return fill_id
 
@@ -158,6 +176,106 @@ class FillRecorder:
                 error=e,
             )
             return 0
+
+    async def get_pending_fills(self, order_id: str | None = None) -> list[dict[str, Any]]:
+        """Return pending fills that were persisted before order truth was available."""
+        sql = """
+            SELECT *
+            FROM fill_record
+            WHERE ingest_state != 'applied'
+        """
+        parameters: tuple[Any, ...] | None = None
+        if order_id:
+            sql += " AND order_id = ?"
+            parameters = (order_id,)
+        sql += " ORDER BY id ASC"
+        return await self.db.fetch_all(sql, parameters)
+
+    async def mark_fill_applied(self, fill_id: int) -> None:
+        """Mark a pending fill as fully resolved and applied exactly once."""
+        await self.db.execute(
+            """
+            UPDATE fill_record
+            SET ingest_state = 'applied',
+                resolved_at = ?
+            WHERE id = ?
+            """,
+            (datetime.now(UTC).isoformat(), fill_id),
+        )
+
+    async def resolve_pending_fill(
+        self,
+        fill_id: int,
+        *,
+        condition_id: str,
+        token_id: str,
+        order_id: str,
+        side: str,
+        fee: float | None,
+        fee_known: bool,
+        fee_source: str,
+        mid_at_fill: float | None,
+        is_scoring: bool,
+        reward_eligible: bool,
+        raw_event_json: dict[str, Any] | None = None,
+    ) -> None:
+        """Promote a pending fill into the normal applied state."""
+        resolved_at = datetime.now(UTC).isoformat()
+        await self.db.execute(
+            """
+            UPDATE fill_record
+            SET condition_id = ?,
+                token_id = ?,
+                order_id = ?,
+                side = ?,
+                fee = ?,
+                fee_known = ?,
+                fee_source = ?,
+                mid_at_fill = ?,
+                is_scoring = ?,
+                reward_eligible = ?,
+                ingest_state = 'applied',
+                raw_event_json = ?,
+                resolved_at = ?
+            WHERE id = ?
+            """,
+            (
+                condition_id,
+                token_id,
+                order_id,
+                side,
+                fee,
+                1 if fee_known else 0,
+                fee_source,
+                mid_at_fill,
+                1 if is_scoring else 0,
+                1 if reward_eligible else 0,
+                json.dumps(raw_event_json or {}, sort_keys=True),
+                resolved_at,
+                fill_id,
+            ),
+        )
+
+        row = await self.db.fetch_one(
+            "SELECT price, side, token_id FROM fill_record WHERE id = ?",
+            (fill_id,),
+        )
+        if row is None:
+            return
+
+        fill_price = float(row.get("price", 0.0) or 0.0)
+        fill_side = str(row.get("side", side) or side)
+        fill_token = str(row.get("token_id", token_id) or token_id)
+        if fill_price > 0.0 and fill_token:
+            asyncio.create_task(self._schedule_markout(
+                fill_id, fill_token, fill_side, fill_price, 1,
+            ))
+            asyncio.create_task(self._schedule_markout(
+                fill_id, fill_token, fill_side, fill_price, 5,
+            ))
+            asyncio.create_task(self._schedule_markout(
+                fill_id, fill_token, fill_side, fill_price, 30,
+            ))
 
     async def _schedule_markout(
         self,

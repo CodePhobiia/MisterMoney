@@ -6,7 +6,7 @@ scored EnrichedMarket objects ready for trading.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -77,7 +77,11 @@ async def build_enriched_universe(
             for event_market in event.markets:
                 if event_market.condition_id:
                     event_map[event_market.condition_id] = event.id
-        logger.info("gamma_event_map_built", events=len(active_events), mapped_conditions=len(event_map))
+        logger.info(
+            "gamma_event_map_built",
+            events=len(active_events),
+            mapped_conditions=len(event_map),
+        )
     except Exception as e:
         logger.warning("gamma_event_map_failed", error=str(e))
 
@@ -93,7 +97,7 @@ async def build_enriched_universe(
 
     # Step 5: Enrich each market
     enriched: list[EnrichedMarket] = []
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     for market in raw_markets:
         # Parse token IDs from clobTokenIds JSON
@@ -127,7 +131,7 @@ async def build_enriched_universe(
             end_dt = market.end_date
             # Ensure timezone-aware comparison
             if end_dt.tzinfo is None:
-                end_dt = end_dt.replace(tzinfo=timezone.utc)
+                end_dt = end_dt.replace(tzinfo=UTC)
             delta = end_dt - now
             hours_to_resolution = max(0.0, delta.total_seconds() / 3600.0)
 

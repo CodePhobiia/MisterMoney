@@ -1,11 +1,12 @@
 """Google provider adapter (Gemini 3.1 Pro) via Cloud Code Assist OAuth"""
 
 import asyncio
+import base64
 import json
 import os
 import time
-import base64
 from typing import Any
+
 import aiohttp
 import structlog
 
@@ -17,16 +18,16 @@ logger = structlog.get_logger(__name__)
 class GoogleProvider(BaseProvider):
     """
     Google provider using Cloud Code Assist OAuth token.
-    
+
     Supports:
     - Gemini 3.1 Pro
     - Automatic token refresh
     - Exponential backoff for 403 errors
     """
-    
+
     API_BASE = "https://cloudcode-pa.googleapis.com"
     TOKEN_URL = "https://oauth2.googleapis.com/token"
-    
+
     # OAuth credentials — read from env vars, with encoded defaults as fallback
     CLIENT_ID = os.getenv(
         "GOOGLE_CCA_CLIENT_ID",
@@ -40,7 +41,7 @@ class GoogleProvider(BaseProvider):
             "R09DU1BYLTR1SGdNUG0tMW83U2stZ2VWNkN1NWNsWEZzeGw="
         ).decode(),
     )
-    
+
     def __init__(
         self,
         config: ProviderConfig,
@@ -55,30 +56,30 @@ class GoogleProvider(BaseProvider):
         self.expires = expires
         self.project_id = project_id
         self.session: aiohttp.ClientSession | None = None
-        
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session"""
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession()
         return self.session
-    
+
     async def close(self):
         """Close the HTTP session"""
         if self.session and not self.session.closed:
             await self.session.close()
-    
+
     async def _refresh_token_if_needed(self):
         """Refresh access token if expired or within 5 minutes of expiry"""
         current_time = int(time.time() * 1000)
-        
+
         # Check if token needs refresh (expired or within 5 min)
         if self.expires > current_time + (5 * 60 * 1000):
             return  # Token still valid
-        
+
         logger.info("refreshing_google_token", project_id=self.project_id)
-        
+
         session = await self._get_session()
-        
+
         try:
             async with session.post(
                 self.TOKEN_URL,
@@ -92,24 +93,28 @@ class GoogleProvider(BaseProvider):
             ) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
-                
+
                 self.access_token = data["access_token"]
                 # Keep refresh token if new one not provided
                 if "refresh_token" in data:
                     self.refresh_token = data["refresh_token"]
-                # Calculate new expiry (current time + expires_in - 5 min buffer)
-                self.expires = int(time.time() * 1000) + (data["expires_in"] * 1000) - (5 * 60 * 1000)
-                
+                # New expiry (current time + expires_in - 5 min)
+                self.expires = (
+                    int(time.time() * 1000)
+                    + (data["expires_in"] * 1000)
+                    - (5 * 60 * 1000)
+                )
+
                 logger.info(
                     "google_token_refreshed",
                     expires_in_seconds=data["expires_in"],
                     project_id=self.project_id,
                 )
-                
+
         except Exception as e:
             logger.error("google_token_refresh_failed", error=str(e))
             raise
-    
+
     async def complete(
         self,
         messages: list[dict],
@@ -119,14 +124,14 @@ class GoogleProvider(BaseProvider):
         max_tokens: int | None = None,
     ) -> ProviderResponse:
         """Complete a prompt using Google Cloud Code Assist API"""
-        
+
         start_time = time.time()
-        
+
         # Refresh token if needed
         await self._refresh_token_if_needed()
-        
+
         session = await self._get_session()
-        
+
         # Convert messages to Gemini format
         system_parts = []
         contents = []
@@ -139,20 +144,20 @@ class GoogleProvider(BaseProvider):
                     "role": role,
                     "parts": [{"text": msg.get("content", "")}]
                 })
-        
+
         if not contents:
             contents = [{"role": "user", "parts": [{"text": ""}]}]
-        
+
         # Build generation config
         gen_config: dict[str, Any] = {
             "maxOutputTokens": max_tokens or self.config.max_tokens_out,
             "temperature": 0.1,
         }
-        
+
         # Add response format hint if requested
         if response_format:
             gen_config["responseMimeType"] = "application/json"
-        
+
         # Build inner request (CCA wraps in project/model/request)
         inner_request: dict[str, Any] = {
             "contents": contents,
@@ -160,7 +165,7 @@ class GoogleProvider(BaseProvider):
         }
         if system_parts:
             inner_request["systemInstruction"] = {"parts": system_parts}
-        
+
         # Build CCA outer body
         body: dict[str, Any] = {
             "project": self.project_id,
@@ -169,7 +174,7 @@ class GoogleProvider(BaseProvider):
             "userAgent": "mistermoney-v3",
             "requestId": f"mm-{int(time.time() * 1000)}",
         }
-        
+
         # Make request with exponential backoff for 403 errors
         headers = {
             "Authorization": f"Bearer {self.access_token}",
@@ -180,14 +185,14 @@ class GoogleProvider(BaseProvider):
                 "pluginType": "GEMINI",
             }),
         }
-        
+
         max_retries = 3
         backoff_delays = [1, 2, 4, 8]
-        
+
         for attempt in range(max_retries + 1):
             try:
                 timeout = aiohttp.ClientTimeout(total=self.config.timeout_ms / 1000)
-                
+
                 async with session.post(
                     f"{self.API_BASE}/v1internal:generateContent",
                     headers=headers,
@@ -197,7 +202,12 @@ class GoogleProvider(BaseProvider):
                     # Handle 403 with retry
                     if resp.status == 403:
                         error_text = await resp.text()
-                        if "lack a Gemini Code Assist license" in error_text or "SECURITY_POLICY_VIOLATED" in error_text:
+                        if (
+                            "lack a Gemini Code Assist license"
+                            in error_text
+                            or "SECURITY_POLICY_VIOLATED"
+                            in error_text
+                        ):
                             if attempt < max_retries:
                                 delay = backoff_delays[attempt]
                                 logger.warning(
@@ -214,10 +224,10 @@ class GoogleProvider(BaseProvider):
                             status=resp.status,
                             message=error_text,
                         )
-                    
+
                     resp.raise_for_status()
                     data = await resp.json()
-                    
+
                     # Extract response text from nested structure
                     text = ""
                     response_data = data.get("response", {})
@@ -227,7 +237,7 @@ class GoogleProvider(BaseProvider):
                         parts = content.get("parts", [])
                         for part in parts:
                             text += part.get("text", "")
-                    
+
                     # Parse structured output if requested
                     structured = None
                     if response_format and text:
@@ -243,18 +253,18 @@ class GoogleProvider(BaseProvider):
                                 json_text = text[json_start:json_end].strip()
                             else:
                                 json_text = text.strip()
-                            
+
                             structured = json.loads(json_text)
                         except json.JSONDecodeError as e:
                             logger.warning("failed_to_parse_json", error=str(e), text=text[:200])
-                    
+
                     # Extract token usage (Gemini may not always provide this)
                     usage_metadata = response_data.get("usageMetadata", {})
                     input_tokens = usage_metadata.get("promptTokenCount", 0)
                     output_tokens = usage_metadata.get("candidatesTokenCount", 0)
-                    
+
                     latency_ms = (time.time() - start_time) * 1000
-                    
+
                     logger.info(
                         "google_complete",
                         model=self.config.model,
@@ -263,7 +273,7 @@ class GoogleProvider(BaseProvider):
                         latency_ms=latency_ms,
                         project_id=self.project_id,
                     )
-                    
+
                     return ProviderResponse(
                         text=text,
                         structured=structured,
@@ -273,7 +283,7 @@ class GoogleProvider(BaseProvider):
                         cache_hit=False,
                         model=self.config.model,
                     )
-                    
+
             except aiohttp.ClientResponseError as e:
                 if attempt == max_retries:
                     logger.error(
@@ -290,17 +300,17 @@ class GoogleProvider(BaseProvider):
                     model=self.config.model,
                 )
                 raise
-        
+
         raise RuntimeError("Max retries exceeded for Google API")
-    
+
     async def health_check(self) -> bool:
         """Check if Google Cloud Code Assist API is accessible"""
         try:
             # Refresh token if needed
             await self._refresh_token_if_needed()
-            
+
             session = await self._get_session()
-            
+
             # Simple test request using CCA format
             body = {
                 "project": self.project_id,
@@ -312,7 +322,7 @@ class GoogleProvider(BaseProvider):
                 "userAgent": "mistermoney-v3",
                 "requestId": f"mm-health-{int(time.time() * 1000)}",
             }
-            
+
             headers = {
                 "Authorization": f"Bearer {self.access_token}",
                 "Content-Type": "application/json",
@@ -322,7 +332,7 @@ class GoogleProvider(BaseProvider):
                     "pluginType": "GEMINI",
                 }),
             }
-            
+
             timeout = aiohttp.ClientTimeout(total=15)
             async with session.post(
                 f"{self.API_BASE}/v1internal:generateContent",

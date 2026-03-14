@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from decimal import Decimal
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from pydantic import BaseModel, Field
@@ -39,6 +40,10 @@ from pmm1.execution.tick_rounding import (
 )
 from pmm1.state.orders import OrderState, OrderTracker, TrackedOrder
 from pmm1.strategy.quote_engine import QuoteIntent
+
+if TYPE_CHECKING:
+    from pmm1.execution.mutation_guard import MutationGuardDecision
+    from pmm1.storage.spine import SpineEmitter
 
 logger = structlog.get_logger(__name__)
 
@@ -88,6 +93,7 @@ class OrderManager:
         post_only: bool = True,
         reprice_threshold_ticks: float = 1.0,
         reprice_threshold_size_pct: float = 0.20,
+        spine_emitter: SpineEmitter | None = None,
     ) -> None:
         self._client = client
         self._tracker = order_tracker
@@ -98,6 +104,18 @@ class OrderManager:
         self._reprice_threshold_ticks = reprice_threshold_ticks
         self._reprice_threshold_size_pct = reprice_threshold_size_pct
         self._server_time_offset: int = 0
+        self._spine = spine_emitter
+        self._mutation_guard: (
+            Callable[[CreateOrderRequest, str, str], MutationGuardDecision]
+            | None
+        ) = None
+
+    def set_mutation_guard(
+        self,
+        guard: Callable[[CreateOrderRequest, str, str], MutationGuardDecision],
+    ) -> None:
+        """Register the guard for direct submit paths that bypass quote-intent shaping."""
+        self._mutation_guard = guard
 
     def set_server_time_offset(self, server_time: int) -> None:
         """Set offset between local and server time."""
@@ -126,7 +144,11 @@ class OrderManager:
         order_type: OrderType | None = None,
     ) -> CreateOrderRequest:
         """Create a normalized order request for a desired quote."""
-        rounded_price = round_bid(price, tick_size) if side == OrderSide.BUY else round_ask(price, tick_size)
+        rounded_price = (
+            round_bid(price, tick_size)
+            if side == OrderSide.BUY
+            else round_ask(price, tick_size)
+        )
         rounded_size = round_size(size)
         expiration = 0
         normalized_order_type = order_type or OrderType.GTC
@@ -212,7 +234,9 @@ class OrderManager:
             reasons=normalized_reasons,
         ))
         for reason in normalized_reasons:
-            diff.replacement_reason_counts[reason] = diff.replacement_reason_counts.get(reason, 0) + 1
+            diff.replacement_reason_counts[reason] = (
+                diff.replacement_reason_counts.get(reason, 0) + 1
+            )
 
     def _plan_side(
         self,
@@ -404,6 +428,28 @@ class OrderManager:
             )
         return {"order_id": order_id, "success": True, "error": ""}
 
+    async def _emit_order_event(
+        self,
+        *,
+        event_type: str,
+        strategy: str,
+        condition_id: str = "",
+        token_id: str = "",
+        order_id: str = "",
+        payload_json: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit a canonical order event when the spine is enabled."""
+        if self._spine is None:
+            return
+        await self._spine.emit_event(
+            event_type=event_type,
+            strategy=strategy or "manual",
+            condition_id=condition_id or None,
+            token_id=token_id or None,
+            order_id=order_id or None,
+            payload_json=payload_json or {},
+        )
+
     async def _submit_orders(
         self,
         submissions: list[OrderSubmission],
@@ -414,6 +460,24 @@ class OrderManager:
 
         results: list[dict[str, Any]] = []
         for batch in self._batcher.batch(submissions):
+            for submission in batch:
+                req = submission.request
+                await self._emit_order_event(
+                    event_type="order_submit_requested",
+                    strategy=submission.strategy or "manual",
+                    condition_id=submission.condition_id,
+                    token_id=req.token_id,
+                    payload_json={
+                        "side": req.side.value,
+                        "price": req.price,
+                        "size": req.size,
+                        "post_only": req.post_only,
+                        "order_type": req.order_type.value,
+                        "expiration": req.expiration,
+                        "replacement_reasons": list(submission.replacement_reasons),
+                        "replaced_order_ids": list(submission.replaced_order_ids),
+                    },
+                )
             requests = [submission.request for submission in batch]
             responses = await self._client.create_orders_batch(requests)
             if len(responses) != len(batch):
@@ -424,7 +488,42 @@ class OrderManager:
                 )
 
             for submission, response in zip(batch, responses):
-                results.append(self._process_submission_response(submission, response))
+                result = self._process_submission_response(submission, response)
+                results.append(result)
+                req = submission.request
+                if result["success"]:
+                    await self._emit_order_event(
+                        event_type="order_submit_acknowledged",
+                        strategy=submission.strategy or "manual",
+                        condition_id=submission.condition_id,
+                        token_id=req.token_id,
+                        order_id=result["order_id"],
+                        payload_json={
+                            "side": req.side.value,
+                            "price": req.price,
+                            "size": req.size,
+                            "post_only": req.post_only,
+                            "order_type": req.order_type.value,
+                            "expiration": req.expiration,
+                            "replacement_reasons": list(submission.replacement_reasons),
+                            "replaced_order_ids": list(submission.replaced_order_ids),
+                        },
+                    )
+                else:
+                    await self._emit_order_event(
+                        event_type="order_rejected",
+                        strategy=submission.strategy or "manual",
+                        condition_id=submission.condition_id,
+                        token_id=req.token_id,
+                        payload_json={
+                            "side": req.side.value,
+                            "price": req.price,
+                            "size": req.size,
+                            "error": result["error"],
+                            "replacement_reasons": list(submission.replacement_reasons),
+                            "replaced_order_ids": list(submission.replaced_order_ids),
+                        },
+                    )
 
         return results
 
@@ -436,6 +535,35 @@ class OrderManager:
         strategy: str = "manual",
     ) -> dict[str, Any]:
         """Submit one order and track it if the exchange accepted it."""
+        if self._mutation_guard is not None:
+            decision = self._mutation_guard(request, condition_id, strategy)
+            if not decision.allowed:
+                logger.warning(
+                    "order_submission_blocked",
+                    condition_id=condition_id[:16] if condition_id else "?",
+                    token_id=request.token_id[:16],
+                    strategy=strategy or "manual",
+                    reason=decision.reason,
+                    details=decision.details,
+                )
+                await self._emit_order_event(
+                    event_type="order_rejected",
+                    strategy=strategy or "manual",
+                    condition_id=condition_id,
+                    token_id=request.token_id,
+                    payload_json={
+                        "side": request.side.value,
+                        "price": request.price,
+                        "size": request.size,
+                        "error": f"blocked_by_guard:{decision.reason}",
+                        "guard_details": decision.details,
+                    },
+                )
+                return {
+                    "order_id": "",
+                    "success": False,
+                    "error": f"blocked_by_guard:{decision.reason}",
+                }
         results = await self._submit_orders([
             OrderSubmission(
                 request=request,
@@ -478,10 +606,35 @@ class OrderManager:
                         continue
                     existing.reasons = self._dedupe_reasons(existing.reasons + cancel.reasons)
 
+                for cancel in cancel_map.values():
+                    tracked = self._tracker.get(cancel.order_id)
+                    await self._emit_order_event(
+                        event_type="order_cancel_requested",
+                        strategy=(tracked.strategy if tracked else intent.strategy) or "manual",
+                        condition_id=cancel.condition_id or (
+                            tracked.condition_id if tracked else ""
+                        ),
+                        token_id=cancel.token_id or (
+                            tracked.token_id if tracked else ""
+                        ),
+                        order_id=cancel.order_id,
+                        payload_json={
+                            "side": cancel.side or (
+                                tracked.side if tracked else ""
+                            ),
+                            "reasons": list(cancel.reasons),
+                            "source": "diff_cancel",
+                        },
+                    )
+
                 to_cancel = list(cancel_map)
                 await self._client.cancel_orders(to_cancel)
                 for cancel in cancel_map.values():
-                    self._tracker.update_state(cancel.order_id, OrderState.CANCELED, source="diff_cancel")
+                    self._tracker.update_state(
+                        cancel.order_id,
+                        OrderState.CANCELED,
+                        source="diff_cancel",
+                    )
                     logger.info(
                         "order_replacement_canceled",
                         token_id=cancel.token_id[:16] if cancel.token_id else "?",
@@ -539,6 +692,14 @@ class OrderManager:
             await self._client.cancel_all()
             # Mark all tracked active orders as canceled
             for order in self._tracker.get_active_orders():
+                await self._emit_order_event(
+                    event_type="order_cancel_requested",
+                    strategy=order.strategy or "manual",
+                    condition_id=order.condition_id,
+                    token_id=order.token_id,
+                    order_id=order.order_id,
+                    payload_json={"side": order.side, "source": "cancel_all"},
+                )
                 self._tracker.update_state(order.order_id, OrderState.CANCELED, source="cancel_all")
             logger.critical("emergency_cancel_all_executed")
             return True
@@ -555,6 +716,15 @@ class OrderManager:
 
             order_ids = [o.order_id for o in active if o.order_id]
             if order_ids:
+                for order in active:
+                    await self._emit_order_event(
+                        event_type="order_cancel_requested",
+                        strategy=order.strategy or "manual",
+                        condition_id=order.condition_id,
+                        token_id=order.token_id,
+                        order_id=order.order_id,
+                        payload_json={"side": order.side, "source": "cancel_market"},
+                    )
                 await self._client.cancel_orders(order_ids)
                 for oid in order_ids:
                     self._tracker.update_state(oid, OrderState.CANCELED, source="cancel_market")
@@ -659,10 +829,33 @@ class OrderManager:
                         continue
                     existing.reasons = self._dedupe_reasons(existing.reasons + cancel.reasons)
 
+                for cancel in cancel_map.values():
+                    tracked = self._tracker.get(cancel.order_id)
+                    await self._emit_order_event(
+                        event_type="order_cancel_requested",
+                        strategy=(tracked.strategy if tracked else "exit") or "exit",
+                        condition_id=cancel.condition_id or (
+                            tracked.condition_id if tracked else condition_id
+                        ),
+                        token_id=cancel.token_id or (
+                            tracked.token_id if tracked else token_id
+                        ),
+                        order_id=cancel.order_id,
+                        payload_json={
+                            "side": cancel.side or (tracked.side if tracked else "SELL"),
+                            "reasons": list(cancel.reasons),
+                            "source": "exit_cancel",
+                        },
+                    )
+
                 order_ids = list(cancel_map)
                 await self._client.cancel_orders(order_ids)
                 for cancel in cancel_map.values():
-                    self._tracker.update_state(cancel.order_id, OrderState.CANCELED, source="exit_cancel")
+                    self._tracker.update_state(
+                        cancel.order_id,
+                        OrderState.CANCELED,
+                        source="exit_cancel",
+                    )
                     logger.info(
                         "exit_order_canceled_for_replace",
                         token_id=cancel.token_id[:16] if cancel.token_id else "?",
@@ -691,7 +884,10 @@ class OrderManager:
                 submit_results = await self._submit_orders(diff.to_submit)
                 result["submitted"] = any(item["success"] for item in submit_results)
                 if not result["submitted"]:
-                    first_error = next((item["error"] for item in submit_results if item["error"]), "no_response")
+                    first_error = next(
+                        (item["error"] for item in submit_results if item["error"]),
+                        "no_response",
+                    )
                     result["error"] = first_error
             except (ClobRestartError, ClobPausedError) as e:
                 result["error"] = f"submit_error: {e}"

@@ -50,13 +50,13 @@ def build_rule_heavy_prompt(
 ) -> str:
     """
     Build the user prompt for Opus rule analysis
-    
+
     Args:
         question: Market question
         rules: Resolution rules text
         evidence: List of evidence dicts with evidence_id, claim, polarity, reliability
         clarifications: List of clarification texts
-        
+
     Returns:
         User prompt string
     """
@@ -67,7 +67,7 @@ def build_rule_heavy_prompt(
         "# Resolution Rules",
         rules,
     ]
-    
+
     if clarifications:
         prompt_parts.extend([
             "",
@@ -75,15 +75,20 @@ def build_rule_heavy_prompt(
         ])
         for i, clarification in enumerate(clarifications, 1):
             prompt_parts.append(f"{i}. {clarification}")
-    
+
     if evidence:
         prompt_parts.extend([
             "",
             "# Evidence",
         ])
         for item in evidence:
+            eid = item['evidence_id']
+            pol = item['polarity']
+            rel = item['reliability']
+            claim = item['claim']
             prompt_parts.append(
-                f"- **[{item['evidence_id']}]** ({item['polarity']}, reliability={item['reliability']:.2f}): {item['claim']}"
+                f"- **[{eid}]** ({pol},"
+                f" reliability={rel:.2f}): {claim}"
             )
     else:
         prompt_parts.extend([
@@ -91,7 +96,7 @@ def build_rule_heavy_prompt(
             "# Evidence",
             "No evidence available yet.",
         ])
-    
+
     prompt_parts.extend([
         "",
         "# Your Task",
@@ -103,5 +108,5 @@ def build_rule_heavy_prompt(
         "",
         "Output ONLY the JSON response, nothing else.",
     ])
-    
+
     return "\n".join(prompt_parts)

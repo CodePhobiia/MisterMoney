@@ -2,12 +2,12 @@
 
 import pytest
 
-from pmm1.risk.limits import RiskLimits, LimitCheckResult
 from pmm1.risk.correlation import ThematicCorrelation
+from pmm1.risk.limits import RiskLimits
 from pmm1.settings import RiskConfig
-from pmm1.state.positions import PositionTracker, MarketPosition
 from pmm1.state.inventory import InventoryManager
 from pmm1.state.orders import OrderTracker
+from pmm1.state.positions import PositionTracker
 from pmm1.strategy.quote_engine import QuoteIntent
 
 
@@ -59,6 +59,23 @@ class TestPerEventCluster:
         result = limits.check_per_event_cluster("event-1", proposed_additional=6.0)
         assert result.passed is False
 
+    def test_uses_mark_to_market_exposure_not_share_counts(self):
+        limits = _make_limits(nav=100.0, per_event_cluster_nav=0.02)
+        pos = limits.positions.register_market(
+            "cond-1",
+            "yes-1",
+            "no-1",
+            event_id="event-1",
+        )
+        pos.yes_size = 10.0
+        pos.yes_avg_price = 0.90
+        pos.yes_cost_basis = 9.0
+        limits.set_price_oracle_provider(lambda: {"yes-1": 0.10, "no-1": 0.90})
+
+        result = limits.check_per_event_cluster("event-1", proposed_additional=0.5)
+
+        assert result.passed is True
+
 
 class TestTotalDirectional:
     def test_within_limit(self):
@@ -70,6 +87,18 @@ class TestTotalDirectional:
         limits = _make_limits(nav=100.0, total_directional_nav=0.10)
         result = limits.check_total_directional(proposed_additional_net=15.0)
         assert result.passed is False
+
+    def test_uses_mark_to_market_directional_exposure(self):
+        limits = _make_limits(nav=100.0, total_directional_nav=0.02)
+        pos = limits.positions.register_market("cond-1", "yes-1", "no-1")
+        pos.yes_size = 10.0
+        pos.yes_avg_price = 0.90
+        pos.yes_cost_basis = 9.0
+        limits.set_price_oracle_provider(lambda: {"yes-1": 0.10, "no-1": 0.90})
+
+        result = limits.check_total_directional(proposed_additional_net=0.5)
+
+        assert result.passed is True
 
 
 class TestApplyToQuote:
@@ -145,3 +174,23 @@ class TestThematicCorrelation:
         pos_tracker = PositionTracker()
         passed, _ = tc.check_theme_limit("c1", 999.0, 100.0, pos_tracker)
         assert passed is True
+
+    def test_theme_limit_uses_mark_to_market_prices(self):
+        tc = ThematicCorrelation(per_theme_nav=0.02)
+        tc.classify("c1", "Will Trump win?")
+        pos_tracker = PositionTracker()
+        pos = pos_tracker.register_market("c1", "yes-1", "no-1", event_id="event-1")
+        pos.yes_size = 10.0
+        pos.yes_avg_price = 0.90
+        pos.yes_cost_basis = 9.0
+
+        passed, remaining = tc.check_theme_limit(
+            "c1",
+            0.5,
+            100.0,
+            pos_tracker,
+            price_oracle={"yes-1": 0.10, "no-1": 0.90},
+        )
+
+        assert passed is True
+        assert remaining == pytest.approx(1.0)

@@ -3,9 +3,9 @@ V3 Shadow Metrics
 Tracks prediction quality (Brier scores) and latency distributions
 """
 
-from datetime import datetime
-from typing import Dict, List
 import statistics
+from datetime import datetime
+
 import structlog
 
 from v3.evidence.db import Database
@@ -15,26 +15,26 @@ log = structlog.get_logger()
 
 class BrierScoreTracker:
     """Tracks prediction quality on resolved markets"""
-    
+
     def __init__(self, db: Database):
         """
         Initialize Brier score tracker
-        
+
         Args:
             db: Database instance
         """
         self.db = db
-    
+
     async def record_prediction(
-        self, 
-        condition_id: str, 
+        self,
+        condition_id: str,
         route: str,
-        p_predicted: float, 
+        p_predicted: float,
         timestamp: datetime
     ) -> None:
         """
         Store prediction for later scoring when market resolves
-        
+
         Args:
             condition_id: Market condition ID
             route: Route that generated prediction
@@ -44,48 +44,48 @@ class BrierScoreTracker:
         if self.db.pool is None:
             log.error("database_not_connected")
             return
-        
+
         try:
             await self.db.pool.execute(
                 """
-                INSERT INTO v3_predictions 
+                INSERT INTO v3_predictions
                     (condition_id, route, p_predicted, predicted_at)
                 VALUES ($1, $2, $3, $4)
                 """,
                 condition_id, route, p_predicted, timestamp
             )
-            
-            log.debug("prediction_recorded", 
+
+            log.debug("prediction_recorded",
                      condition_id=condition_id,
                      route=route,
                      p_predicted=p_predicted)
         except Exception as e:
-            log.error("failed_to_record_prediction", 
+            log.error("failed_to_record_prediction",
                      condition_id=condition_id,
                      error=str(e))
-    
+
     async def score_resolved(
-        self, 
-        condition_id: str, 
+        self,
+        condition_id: str,
         actual_outcome: float
     ) -> dict:
         """
         Score all predictions for a resolved market
-        
+
         Brier score = (p_predicted - actual_outcome)^2
         Lower is better (0 = perfect, 1 = worst)
-        
+
         Args:
             condition_id: Market condition ID
             actual_outcome: Actual outcome (0.0 or 1.0)
-            
+
         Returns:
             Dict with {brier_score, route, prediction_count, p_predicted, actual}
         """
         if self.db.pool is None:
             log.error("database_not_connected")
             return {}
-        
+
         try:
             # Get all predictions for this market
             rows = await self.db.pool.fetch(
@@ -97,22 +97,22 @@ class BrierScoreTracker:
                 """,
                 condition_id
             )
-            
+
             if not rows:
-                log.warning("no_predictions_to_score", 
+                log.warning("no_predictions_to_score",
                            condition_id=condition_id)
                 return {
                     "condition_id": condition_id,
                     "prediction_count": 0,
                 }
-            
+
             # Calculate Brier scores
             results = []
-            
+
             for row in rows:
                 p_predicted = row['p_predicted']
                 brier = (p_predicted - actual_outcome) ** 2
-                
+
                 # Update record with score
                 await self.db.pool.execute(
                     """
@@ -124,22 +124,22 @@ class BrierScoreTracker:
                     """,
                     actual_outcome, brier, datetime.utcnow(), row['id']
                 )
-                
+
                 results.append({
                     "route": row['route'],
                     "p_predicted": p_predicted,
                     "brier_score": brier,
                 })
-            
+
             # Calculate average Brier score
             avg_brier = statistics.mean([r['brier_score'] for r in results])
-            
-            log.info("market_scored", 
+
+            log.info("market_scored",
                     condition_id=condition_id,
                     prediction_count=len(results),
                     avg_brier_score=avg_brier,
                     actual_outcome=actual_outcome)
-            
+
             return {
                 "condition_id": condition_id,
                 "prediction_count": len(results),
@@ -147,17 +147,17 @@ class BrierScoreTracker:
                 "actual_outcome": actual_outcome,
                 "predictions": results,
             }
-        
+
         except Exception as e:
-            log.error("failed_to_score_market", 
+            log.error("failed_to_score_market",
                      condition_id=condition_id,
                      error=str(e))
             return {}
-    
+
     async def get_route_summary(self) -> dict:
         """
         Per-route Brier scores and prediction counts
-        
+
         Returns:
             Dict like:
             {
@@ -170,7 +170,7 @@ class BrierScoreTracker:
         if self.db.pool is None:
             log.error("database_not_connected")
             return {}
-        
+
         try:
             rows = await self.db.pool.fetch(
                 """
@@ -182,38 +182,38 @@ class BrierScoreTracker:
                 GROUP BY route
                 """
             )
-            
+
             summary = {}
-            
+
             for row in rows:
                 summary[row['route']] = {
                     "brier": round(row['avg_brier'], 4) if row['avg_brier'] else None,
                     "n": row['count'],
                 }
-            
-            log.info("route_summary_generated", 
+
+            log.info("route_summary_generated",
                     routes=list(summary.keys()))
-            
+
             return summary
-        
+
         except Exception as e:
             log.error("failed_to_get_route_summary", error=str(e))
             return {}
-    
-    async def get_recent_predictions(self, days: int = 7) -> List[dict]:
+
+    async def get_recent_predictions(self, days: int = 7) -> list[dict]:
         """
         Get recent predictions for analysis
-        
+
         Args:
             days: Number of days to look back
-            
+
         Returns:
             List of prediction dicts
         """
         if self.db.pool is None:
             log.error("database_not_connected")
             return []
-        
+
         try:
             rows = await self.db.pool.fetch(
                 """
@@ -225,9 +225,9 @@ class BrierScoreTracker:
                 """,
                 days
             )
-            
+
             return [dict(row) for row in rows]
-        
+
         except Exception as e:
             log.error("failed_to_get_recent_predictions", error=str(e))
             return []
@@ -235,16 +235,16 @@ class BrierScoreTracker:
 
 class LatencyTracker:
     """Tracks per-route, per-provider latency distributions"""
-    
+
     def __init__(self):
         """Initialize latency tracker with in-memory storage"""
         # Dict[route][provider] -> List[latency_ms]
-        self.latencies: Dict[str, Dict[str, List[float]]] = {}
-    
+        self.latencies: dict[str, dict[str, list[float]]] = {}
+
     def record(self, route: str, provider: str, latency_ms: float) -> None:
         """
         Record latency observation
-        
+
         Args:
             route: Route name (numeric/simple/rule/dossier)
             provider: Provider name (sonnet/opus/gpt5/gemini)
@@ -252,21 +252,21 @@ class LatencyTracker:
         """
         if route not in self.latencies:
             self.latencies[route] = {}
-        
+
         if provider not in self.latencies[route]:
             self.latencies[route][provider] = []
-        
+
         self.latencies[route][provider].append(latency_ms)
-        
-        log.debug("latency_recorded", 
-                 route=route, 
-                 provider=provider, 
+
+        log.debug("latency_recorded",
+                 route=route,
+                 provider=provider,
                  latency_ms=latency_ms)
-    
+
     def get_summary(self) -> dict:
         """
         Returns p50, p95, p99 per route and provider
-        
+
         Returns:
             Dict like:
             {
@@ -281,51 +281,51 @@ class LatencyTracker:
             }
         """
         summary = {}
-        
+
         for route, providers in self.latencies.items():
             summary[route] = {}
-            
+
             for provider, measurements in providers.items():
                 if not measurements:
                     continue
-                
+
                 sorted_measurements = sorted(measurements)
                 n = len(sorted_measurements)
-                
+
                 summary[route][provider] = {
                     "p50": self._percentile(sorted_measurements, 50),
                     "p95": self._percentile(sorted_measurements, 95),
                     "p99": self._percentile(sorted_measurements, 99),
                     "n": n,
                 }
-        
+
         return summary
-    
-    def _percentile(self, sorted_data: List[float], percentile: int) -> float:
+
+    def _percentile(self, sorted_data: list[float], percentile: int) -> float:
         """
         Calculate percentile from sorted data
-        
+
         Args:
             sorted_data: Sorted list of values
             percentile: Percentile to calculate (0-100)
-            
+
         Returns:
             Percentile value
         """
         if not sorted_data:
             return 0.0
-        
+
         n = len(sorted_data)
         k = (n - 1) * percentile / 100
         f = int(k)
         c = int(k) + 1
-        
+
         if c >= n:
             return sorted_data[-1]
-        
+
         # Linear interpolation
         return sorted_data[f] + (k - f) * (sorted_data[c] - sorted_data[f])
-    
+
     def reset(self) -> None:
         """Reset all latency data (e.g., daily rotation)"""
         self.latencies.clear()

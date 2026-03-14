@@ -69,6 +69,7 @@ def test_runtime_canary_filters_universe_and_reports_status(monkeypatch):
     runtime.last_canary_summary = summary
     selected = runtime._select_live_universe(markets)
     runtime.controlled_markets = {"eligible"}
+    runtime._refresh_control_lease()
 
     assert summary["eligible_markets"] == 1
     assert summary["selected_condition_ids"] == ["eligible"]
