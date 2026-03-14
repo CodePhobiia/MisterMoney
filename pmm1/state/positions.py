@@ -422,8 +422,10 @@ class PositionTracker:
                 # Auto-correct to exchange truth
                 if is_yes:
                     pos2.yes_size = exchange_size
+                    pos2.yes_cost_basis = exchange_size * pos2.yes_avg_price  # S-H3
                 else:
                     pos2.no_size = exchange_size
+                    pos2.no_cost_basis = exchange_size * pos2.no_avg_price  # S-H3
 
         if mismatches:
             logger.warning("position_reconciliation_mismatches", mismatches=mismatches)
@@ -431,6 +433,19 @@ class PositionTracker:
             logger.debug("position_reconciliation_clean")
 
         return {"mismatches": mismatches, "count": len(mismatches)}
+
+    def get_stale_mark_ratio(self, price_oracle: dict[str, float] | None = None) -> float:
+        """Fraction of positions without fresh oracle prices (using fallback avg_price)."""
+        if not self._positions:
+            return 0.0
+        oracle = price_oracle or {}
+        stale = 0
+        for pos in self._positions.values():
+            has_yes_mark = pos.token_id_yes in oracle
+            has_no_mark = pos.token_id_no in oracle if pos.token_id_no else True
+            if not has_yes_mark and not has_no_mark:
+                stale += 1
+        return stale / len(self._positions)
 
     @property
     def market_count(self) -> int:

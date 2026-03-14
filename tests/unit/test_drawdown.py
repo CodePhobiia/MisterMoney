@@ -1,5 +1,7 @@
 """Tests for drawdown governor — HWM, tier transitions, daily reset."""
 
+from unittest.mock import patch
+
 import pytest
 
 from pmm1.risk.drawdown import DrawdownGovernor, DrawdownTier
@@ -70,14 +72,22 @@ class TestDrawdownTiers:
         state = gov.update(96.0)
         assert state.tier == DrawdownTier.TIER3_FLATTEN_ONLY
 
-    def test_recovery_clears_tier(self):
+    def test_recovery_clears_tier_after_dwell(self):
         gov = _make_governor(pause=0.015)
-        gov.update(100.0)
-        gov.update(98.5)  # Tier 1
-        assert gov.state.tier == DrawdownTier.TIER1_PAUSE_TAKER
-        # Recovery back above threshold
-        gov.update(100.0)
-        assert gov.state.tier == DrawdownTier.NORMAL
+        t0 = 1000.0
+        with patch("pmm1.risk.drawdown.time") as mock_time:
+            mock_time.time.return_value = t0
+            gov.update(100.0)
+            gov.update(98.5)  # Tier 1
+            assert gov.state.tier == DrawdownTier.TIER1_PAUSE_TAKER
+            # Recovery before dwell: tier stays
+            mock_time.time.return_value = t0 + 60
+            gov.update(100.0)
+            assert gov.state.tier == DrawdownTier.TIER1_PAUSE_TAKER
+            # Recovery after 5-min dwell: tier clears
+            mock_time.time.return_value = t0 + 301
+            gov.update(100.0)
+            assert gov.state.tier == DrawdownTier.NORMAL
 
 
 class TestDrawdownStateProperties:
@@ -115,6 +125,34 @@ class TestDrawdownReset:
         gov.reset_daily(99.0)
         assert gov.state.tier == DrawdownTier.NORMAL
         assert gov.state.daily_high_watermark == 99.0
+
+
+class TestDrawdownDwellTime:
+    def test_tier_recovery_requires_dwell_time(self):
+        """R-M1: Tier should not recover before 5-minute dwell."""
+        gov = _make_governor(pause=0.015, wider=0.025, flatten=0.04)
+        t0 = 1000.0
+        with patch("pmm1.risk.drawdown.time") as mock_time:
+            mock_time.time.return_value = t0
+            gov.update(100.0)
+            # Escalate to TIER2
+            gov.update(97.5)
+            assert gov.state.tier == DrawdownTier.TIER2_WIDER_SMALLER
+
+            # Try to recover immediately — should stay at TIER2
+            mock_time.time.return_value = t0 + 10
+            gov.update(100.0)
+            assert gov.state.tier == DrawdownTier.TIER2_WIDER_SMALLER
+
+            # Still within 5 minutes — should stay at TIER2
+            mock_time.time.return_value = t0 + 299
+            gov.update(100.0)
+            assert gov.state.tier == DrawdownTier.TIER2_WIDER_SMALLER
+
+            # After 5 minutes — should recover
+            mock_time.time.return_value = t0 + 301
+            gov.update(100.0)
+            assert gov.state.tier == DrawdownTier.NORMAL
 
 
 class TestDrawdownCallbacks:

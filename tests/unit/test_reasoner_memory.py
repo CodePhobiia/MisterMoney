@@ -111,3 +111,19 @@ def test_get_summary_default_alpha():
     mem = ReasonerMemory(persist_path=path, min_for_calibration=50)
     summary = mem.get_summary()
     assert summary["optimal_alpha"] == 1.3
+
+
+def test_calibration_needs_200_samples():
+    """ML-M3: verify is_calibrated=False at 150 samples (default min=200)."""
+    path = os.path.join(tempfile.mkdtemp(), "mem_200.json")
+    mem = ReasonerMemory(persist_path=path)  # uses default min_for_calibration=200
+
+    for i in range(150):
+        mem.record_resolution(
+            f"m{i}", float(i % 2), 0.5, 0.5, 0.5, 0.2, "test",
+        )
+
+    assert not mem.is_calibrated, (
+        f"Expected is_calibrated=False at 150 samples, "
+        f"but got True (min_for_calibration={mem.min_for_calibration})"
+    )

@@ -165,3 +165,18 @@ def test_mwu_adaptive_eta():
     )
     assert updated[0] > updated[1]
     assert abs(sum(updated) - 1.0) < 1e-6
+
+
+def test_mwu_floor_invariant():
+    """Q-H3: weights [0.90, 0.05, 0.05] with min_weight=0.10 -> all >= 0.10."""
+    weights = [0.90, 0.05, 0.05]
+    # Use zero losses so MWU doesn't change weights, only floor enforcement matters
+    losses = [0.0, 0.0, 0.0]
+    updated = update_weights_mwu(
+        weights, losses, eta=0.1, min_weight=0.10,
+    )
+    for i, w in enumerate(updated):
+        assert w >= 0.10 - 1e-9, (
+            f"Weight {i} = {w} is below floor 0.10"
+        )
+    assert abs(sum(updated) - 1.0) < 1e-6

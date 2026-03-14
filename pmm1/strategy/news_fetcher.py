@@ -27,6 +27,11 @@ _PRICE_LEAK_PATTERNS = [
     r'(?:bookmakers?|oddsmakers?)\s+(?:favor|give|set|odds)[^.]{0,30}\d+',
     r'market\s+(?:is\s+)?(?:pricing|priced|trading)\s+(?:at\s+)?\$?0?\.\d+',
     r'currently\s+(?:at|trading)\s+\$?0\.\d+',
+    r'\d+\s*%\s*(?:chance|probability|likelihood)',
+    r'(?:forecaster|analyst|expert)s?\s+(?:predict|estimate|expect|give)',
+    r'(?:consensus|aggregate)\s+(?:forecast|estimate|probability)',
+    r'(?:prediction|forecast)\s+(?:market|platform)',
+    r'(?:trader|bettor|punter|investor)s?\s+(?:expect|believe|see)',
 ]
 
 

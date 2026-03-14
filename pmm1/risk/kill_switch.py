@@ -12,6 +12,7 @@ Kill switches trigger on:
 from __future__ import annotations
 
 import time
+from collections import deque
 from enum import StrEnum
 from typing import Any
 
@@ -62,7 +63,7 @@ class KillSwitch:
 
         self._is_triggered = False
         self._active_reasons: dict[KillSwitchReason, KillSwitchEvent] = {}
-        self._trigger_history: list[KillSwitchEvent] = []
+        self._trigger_history: deque[KillSwitchEvent] = deque(maxlen=1000)
         self._auth_failure_count = 0
         self._reconciliation_mismatch_count = 0
         self._on_trigger = None  # Optional async callback on trigger
@@ -115,8 +116,8 @@ class KillSwitch:
                 coro = self._on_trigger(reason.value, message)
                 if asyncio.iscoroutine(coro):
                     asyncio.ensure_future(coro)
-            except Exception:
-                pass  # Don't let notification failures affect kill switch
+            except Exception as e:
+                logger.error("kill_switch_callback_failed", error=str(e))
 
     def _check_auto_clear(self) -> None:
         """Clear expired auto-clear events."""

@@ -155,40 +155,57 @@ def sprt_update_glr(
     running_wins: int,
     running_total: int,
     p_null: float,
-    upper_bound: float = 2.77,
+    upper_bound: float = 3.84,
     lower_bound: float = -1.56,
 ) -> tuple[float, str]:
-    """SPRT with running MLE as adaptive alternative.
+    """GLR-based sequential test using batch likelihood ratio.
 
-    Solves the composite hypothesis problem: instead of testing
-    against a fixed p_true, uses the running MLE (empirical win
-    rate) as H1. This correctly detects edges of any size.
+    Instead of accumulating incremental log-ratios with a shifting MLE
+    (which inflates the statistic to ~80% false positive rate), we
+    recompute the full batch log-likelihood ratio at each step:
 
-    Args:
-        log_ratio: Current cumulative log-likelihood ratio.
-        outcome: Observed outcome (0 or 1).
-        running_wins: Total wins so far.
-        running_total: Total trades so far.
-        p_null: Probability under H0 (no edge = market price).
-        upper_bound: Accept H1 boundary.
-        lower_bound: Accept H0 boundary.
+        GLR = n * KL(p_mle || p_null)
 
-    Returns:
-        (updated_log_ratio, decision).
+    where p_mle is estimated from ALL observations in the current window.
+    The upper_bound default of 3.84 corresponds to the chi-squared(1)
+    critical value at alpha=0.05, which is the correct threshold for
+    a composite-alternative GLR test (unlike the Wald boundary of 2.77
+    which only applies to simple-vs-simple SPRT).
     """
     if running_total < 2:
-        return (log_ratio, "undecided")
+        return (0.0, "undecided")
 
-    p_mle = max(0.01, min(0.99, running_wins / running_total))
+    p_mle = running_wins / running_total
+    p0 = max(1e-10, min(1.0 - 1e-10, p_null))
 
-    # If MLE is very close to null, not enough evidence
-    if abs(p_mle - p_null) < 0.005:
-        return (log_ratio, "undecided")
+    # If MLE is very close to null, no evidence either way
+    if abs(p_mle - p0) < 0.005:
+        return (0.0, "undecided")
 
-    return sprt_update(
-        log_ratio, outcome, p_true=p_mle, p_null=p_null,
-        upper_bound=upper_bound, lower_bound=lower_bound,
+    # Clamp MLE away from boundaries
+    p_mle = max(1e-10, min(1.0 - 1e-10, p_mle))
+
+    # Batch GLR = n * KL(p_mle || p_null)
+    kl = p_mle * math.log(p_mle / p0) + (1.0 - p_mle) * math.log(
+        (1.0 - p_mle) / (1.0 - p0)
     )
+    glr = running_total * kl
+
+    # Apply chi-squared-calibrated boundary
+    if glr >= upper_bound:
+        # Check direction: is the edge in favor of the trader?
+        if p_mle > p0:
+            return (glr, "edge_confirmed")
+        else:
+            return (glr, "no_edge")
+
+    # For the no-edge direction, check if evidence strongly favors null
+    # With batch GLR, we need a different approach for H0 acceptance:
+    # If after sufficient samples, GLR is still very low, accept H0
+    if running_total >= 200 and glr < 0.5:
+        return (glr, "no_edge")
+
+    return (glr, "undecided")
 
 
 def brier_score(probs: list[float], outcomes: list[float]) -> float:

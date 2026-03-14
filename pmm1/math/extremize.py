@@ -181,9 +181,12 @@ def fit_gamma_tau(
                 total -= math.log(1.0 - p_cal)
         return total / len(probs)
 
+    # L2 regularization: penalize departure from identity (gamma=1, tau=0)
+    lambda_reg = 0.01
+
     best_gamma = 1.3
     best_tau = 0.0
-    best_loss = log_loss_at(1.3, 0.0)
+    best_loss = log_loss_at(1.3, 0.0) + lambda_reg * ((1.3 - 1.0) ** 2 + 0.0 ** 2)
 
     g_step = (gamma_bounds[1] - gamma_bounds[0]) / n_steps
     t_step = (tau_bounds[1] - tau_bounds[0]) / n_steps
@@ -194,8 +197,9 @@ def fit_gamma_tau(
         t = tau_bounds[0]
         while t <= tau_bounds[1]:
             loss = log_loss_at(g, t)
-            if loss < best_loss:
-                best_loss = loss
+            regularized_loss = loss + lambda_reg * ((g - 1.0) ** 2 + t ** 2)
+            if regularized_loss < best_loss:
+                best_loss = regularized_loss
                 best_gamma = g
                 best_tau = t
             t += t_step
@@ -214,8 +218,9 @@ def fit_gamma_tau(
         t = t_lo
         while t <= t_hi:
             loss = log_loss_at(g, t)
-            if loss < best_loss:
-                best_loss = loss
+            regularized_loss = loss + lambda_reg * ((g - 1.0) ** 2 + t ** 2)
+            if regularized_loss < best_loss:
+                best_loss = regularized_loss
                 best_gamma = g
                 best_tau = t
             t += fine_t

@@ -109,6 +109,7 @@ class OrderManager:
             Callable[[CreateOrderRequest, str, str], MutationGuardDecision]
             | None
         ) = None
+        self._inventory_manager: Any | None = None
 
     def set_mutation_guard(
         self,
@@ -116,6 +117,10 @@ class OrderManager:
     ) -> None:
         """Register the guard for direct submit paths that bypass quote-intent shaping."""
         self._mutation_guard = guard
+
+    def set_inventory_manager(self, inventory_manager: Any) -> None:
+        """Register inventory manager for exit size clamping."""
+        self._inventory_manager = inventory_manager
 
     def set_server_time_offset(self, server_time: int) -> None:
         """Set offset between local and server time."""
@@ -667,13 +672,37 @@ class OrderManager:
                 results["rejected"] = sum(1 for result in submit_results if not result["success"])
             except (ClobRestartError, ClobPausedError) as e:
                 results["errors"].append(f"submit_error: {e}")
+                if results["canceled"]:
+                    logger.critical(
+                        "cancel_succeeded_submit_failed",
+                        canceled=results["canceled"],
+                        submit_error=str(e),
+                    )
             except ClobRateLimitError:
                 results["errors"].append("submit_rate_limited")
+                if results["canceled"]:
+                    logger.critical(
+                        "cancel_succeeded_submit_failed",
+                        canceled=results["canceled"],
+                        submit_error="rate_limited",
+                    )
             except ClobAuthError as e:
                 results["errors"].append(f"submit_auth_error: {e}")
+                if results["canceled"]:
+                    logger.critical(
+                        "cancel_succeeded_submit_failed",
+                        canceled=results["canceled"],
+                        submit_error=str(e),
+                    )
             except Exception as e:
                 results["errors"].append(f"submit_unexpected: {e}")
                 logger.error("order_submit_error", error=str(e))
+                if results["canceled"]:
+                    logger.critical(
+                        "cancel_succeeded_submit_failed",
+                        canceled=results["canceled"],
+                        submit_error=str(e),
+                    )
 
         if results["errors"] or results["rejected"]:
             logger.warning("order_cycle_errors", **results)
@@ -773,6 +802,17 @@ class OrderManager:
             sell_price = price
 
         sell_price = max(tick_float, sell_price)  # Don't go below min tick
+
+        # R-C3: Clamp exit size to actual position
+        if self._inventory_manager is not None:
+            actual_position_size = self._inventory_manager.get_max_sell_size(token_id)
+            if size > actual_position_size:
+                logger.warning(
+                    "exit_size_clamped",
+                    requested=size,
+                    actual=actual_position_size,
+                )
+                size = actual_position_size
 
         if urgency in ("critical", "high"):
             sell_price_d = round_bid(sell_price, tick_size)
@@ -919,6 +959,18 @@ class OrderManager:
 
         Arb orders should be all-or-nothing.
         """
+        # R-C2: Check safety gates before arb execution
+        if self._mutation_guard is not None:
+            for req in orders:
+                decision = self._mutation_guard(req, "", "arb")
+                if not decision.allowed:
+                    logger.warning(
+                        "arb_blocked_by_guard",
+                        reason=decision.reason,
+                        details=decision.details,
+                    )
+                    return [{"error": f"{decision.reason}_active"}]
+
         results = []
         try:
             results = await self._submit_orders([

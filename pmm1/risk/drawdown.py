@@ -150,6 +150,8 @@ class DrawdownGovernor:
 
         Should be called frequently (every quote cycle).
 
+        Note: drawdown is measured from intraday high-water mark, not day-start NAV.
+
         Args:
             current_nav: Current total NAV.
 
@@ -211,6 +213,20 @@ class DrawdownGovernor:
         else:
             self._state.tier = DrawdownTier.NORMAL
 
+        # R-M1: Minimum 5-minute dwell before tier recovery
+        _tier_severity = {
+            DrawdownTier.NORMAL: 0,
+            DrawdownTier.TIER1_PAUSE_TAKER: 1,
+            DrawdownTier.TIER2_WIDER_SMALLER: 2,
+            DrawdownTier.TIER3_FLATTEN_ONLY: 3,
+        }
+        if (
+            _tier_severity[self._state.tier] < _tier_severity[old_tier]  # recovering to less severe
+            and self._state.tier_changed_at > 0
+            and time.time() - self._state.tier_changed_at < 300  # 5 minutes
+        ):
+            self._state.tier = old_tier  # keep the more severe tier
+
         # Log tier transitions
         if self._state.tier != old_tier:
             self._state.tier_changed_at = time.time()
@@ -232,8 +248,8 @@ class DrawdownGovernor:
                     coro = self._on_tier_change(old_tier.value, self._state.tier.value, dd * 100)
                     if asyncio.iscoroutine(coro):
                         asyncio.ensure_future(coro)
-                except Exception:
-                    pass  # Don't let notification failures affect drawdown governor
+                except Exception as e:
+                    logger.error("drawdown_callback_failed", error=str(e))
 
         return self._state
 

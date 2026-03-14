@@ -2781,6 +2781,11 @@ async def run(settings: Settings | None = None) -> None:
                 if not book_usable:
                     rest_cache_key = f"rest_book_{token_id}"
                     rest_cache_ts = state.rest_book_cache_ts.get(rest_cache_key, 0)
+                    # S-H4: Reject REST book cache entries older than 60 seconds
+                    if time.time() - rest_cache_ts > 60.0:
+                        book = None  # Force fresh fetch
+                    else:
+                        book = state.rest_book_cache.get(rest_cache_key)
                     if time.time() - rest_cache_ts > 10.0:  # Refresh every 10s
                         try:
                             rest_book = await clob_public.get_order_book(token_id)
@@ -2788,13 +2793,13 @@ async def run(settings: Settings | None = None) -> None:
                                 cached_book = _build_cached_rest_book(token_id, rest_book)
                                 state.rest_book_cache[rest_cache_key] = cached_book
                                 state.rest_book_cache_ts[rest_cache_key] = time.time()
+                                book = cached_book
                         except Exception as e:
                             logger.warning(
                                 "rest_book_refresh_failed",
                                 token_id=token_id[:16],
                                 error=str(e),
                             )
-                    book = state.rest_book_cache.get(rest_cache_key)
 
                 if book is None or (not book._bids and not book._asks):
                     suppress_result = await _clear_token_quotes(
@@ -3917,6 +3922,19 @@ async def run(settings: Settings | None = None) -> None:
             )
 
             if cycle_count % 100 == 0:
+                # S-C2: Periodic cleanup of terminal orders to prevent memory leak
+                if hasattr(state, 'order_tracker'):
+                    state.order_tracker.cleanup_terminal()
+
+                # S-H4: Evict stale REST book cache entries
+                stale_keys = [
+                    k for k, ts in state.rest_book_cache_ts.items()
+                    if time.time() - ts > 120.0
+                ]
+                for k in stale_keys:
+                    state.rest_book_cache.pop(k, None)
+                    state.rest_book_cache_ts.pop(k, None)
+
                 if paper_mode and paper_engine and paper_logger:
                     # Paper mode summary with PnL snapshot
                     snap = paper_engine.snapshot(state.book_manager)

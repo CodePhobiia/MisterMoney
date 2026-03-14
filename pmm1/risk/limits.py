@@ -100,7 +100,10 @@ class RiskLimits:
         Both current_gross and proposed_additional should be in dollar terms.
         """
         if self._nav <= 0:
-            return LimitCheckResult(passed=True)
+            return LimitCheckResult(
+                passed=False,
+                breaches=["nav_unavailable: NAV is zero or negative"],
+            )
 
         pos = self.positions.get(condition_id)
         current_gross = pos.gross_exposure_usdc(self._current_price_oracle()) if pos else 0.0
@@ -125,7 +128,10 @@ class RiskLimits:
     ) -> LimitCheckResult:
         """Check per-event cluster exposure limit (default: 5% NAV)."""
         if self._nav <= 0:
-            return LimitCheckResult(passed=True)
+            return LimitCheckResult(
+                passed=False,
+                breaches=["nav_unavailable: NAV is zero or negative"],
+            )
 
         current_gross = self.positions.get_event_gross_exposure_mark_to_market(
             event_id,
@@ -151,11 +157,16 @@ class RiskLimits:
     ) -> LimitCheckResult:
         """Check total directional net exposure limit (default: 10% NAV)."""
         if self._nav <= 0:
-            return LimitCheckResult(passed=True)
+            return LimitCheckResult(
+                passed=False,
+                breaches=["nav_unavailable: NAV is zero or negative"],
+            )
 
         current_net = self.positions.get_total_directional_exposure_mark_to_market(
             price_oracle=self._current_price_oracle()
         )
+        # NET directional check: opposing positions cancel out.
+        # For gross, use check_total_arb_gross.
         new_net = abs(current_net + proposed_additional_net)
         limit = self._effective_limit(self.config.total_directional_nav) * self._nav
 
@@ -169,13 +180,17 @@ class RiskLimits:
             )
         return LimitCheckResult(passed=True)
 
+    # NOTE: Currently counts ALL positions, not just arb. Functions as a total gross limit.
     def check_total_arb_gross(
         self,
         proposed_additional: float = 0.0,
     ) -> LimitCheckResult:
         """Check total arb gross exposure limit (default: 25% NAV)."""
         if self._nav <= 0:
-            return LimitCheckResult(passed=True)
+            return LimitCheckResult(
+                passed=False,
+                breaches=["nav_unavailable: NAV is zero or negative"],
+            )
 
         # Count arb positions (simplified: all positions for now)
         current_arb = self.positions.get_total_gross_exposure_mark_to_market(

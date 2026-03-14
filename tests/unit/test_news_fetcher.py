@@ -91,3 +91,39 @@ def test_sanitize_truncates_to_500_chars():
     long_q = "A" * 600
     result = fetcher._sanitize_question(long_q)
     assert len(result) == 500
+
+
+# --- ML-M1: Price leak pattern tests ---
+
+
+def test_filter_catches_probability_statements():
+    """Probability statements like 'analysts give a 70% chance' are filtered."""
+    fetcher = NewsFetcher()
+    text = "Several analysts give a 70% chance of rate cuts this quarter."
+    filtered = fetcher._filter_price_leaks(text)
+    assert "70%" not in filtered
+    assert "[market reference removed]" in filtered
+
+
+def test_filter_catches_consensus_forecast():
+    """Consensus forecast references are filtered."""
+    fetcher = NewsFetcher()
+    text = "The consensus forecast puts the probability at 0.65."
+    filtered = fetcher._filter_price_leaks(text)
+    assert "[market reference removed]" in filtered
+
+
+def test_filter_catches_prediction_market():
+    """Prediction market references are filtered."""
+    fetcher = NewsFetcher()
+    text = "The prediction market shows strong support for the candidate."
+    filtered = fetcher._filter_price_leaks(text)
+    assert "[market reference removed]" in filtered
+
+
+def test_filter_catches_trader_expectations():
+    """Trader expectation references are filtered."""
+    fetcher = NewsFetcher()
+    text = "Traders expect a breakout by end of month."
+    filtered = fetcher._filter_price_leaks(text)
+    assert "[market reference removed]" in filtered

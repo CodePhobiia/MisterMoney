@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import structlog
@@ -51,11 +52,13 @@ class InventoryManager:
         self.orders = order_tracker
         self._usdc_balance: float = 0.0
         self._usdc_allowance: float = 0.0
+        self._usdc_balance_ts: float = 0.0
 
     def update_balances(self, balance: float, allowance: float) -> None:
         """Update USDC balance from exchange."""
         self._usdc_balance = balance
         self._usdc_allowance = allowance
+        self._usdc_balance_ts = time.time()
 
     @property
     def usdc_balance(self) -> float:
@@ -227,6 +230,10 @@ class InventoryManager:
 
         NAV = USDC balance + Σ(position_values at current prices)
         """
+        # S-M3: Warn if USDC balance is stale
+        if self._usdc_balance_ts > 0 and time.time() - self._usdc_balance_ts > 120.0:
+            logger.warning("stale_usdc_balance_in_nav", age_s=time.time() - self._usdc_balance_ts)
+
         nav = self._usdc_balance
 
         for pos in self.positions._positions.values():

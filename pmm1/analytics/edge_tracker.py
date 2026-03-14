@@ -61,6 +61,7 @@ class EdgeTracker:
         self.sprt_decision: str = "undecided"
         self._running_wins = 0
         self._running_total = 0
+        self._running_market_p_sum: float = 0.0
         self._decision_trade_index = 0
         self._decision_history: list[tuple[str, int]] = []
         self.window_size = 200
@@ -90,7 +91,8 @@ class EdgeTracker:
 
         # Track running stats for GLR
         self._running_total += 1
-        if pnl > 0:
+        self._running_market_p_sum += market_p
+        if outcome > 0.5:
             self._running_wins += 1
 
         # Sliding window: reset SPRT after window_size trades past last decision
@@ -103,16 +105,24 @@ class EdgeTracker:
             )
             self.sprt_log_ratio = 0.0
             self.sprt_decision = "undecided"
+            self._running_wins = 0
+            self._running_total = 0
+            self._running_market_p_sum = 0.0
             self._decision_trade_index = len(self.trades)
 
         # Use GLR instead of fixed-alternative SPRT
         if self.sprt_decision == "undecided":
+            p_null_avg = (
+                self._running_market_p_sum / self._running_total
+                if self._running_total > 0
+                else 0.5
+            )
             self.sprt_log_ratio, self.sprt_decision = sprt_update_glr(
                 self.sprt_log_ratio,
                 outcome,
                 self._running_wins,
                 self._running_total,
-                p_null=market_p,
+                p_null=p_null_avg,
             )
             if self.sprt_decision != "undecided":
                 self._decision_trade_index = len(self.trades)

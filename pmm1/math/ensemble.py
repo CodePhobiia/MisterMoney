@@ -169,25 +169,25 @@ def update_weights_mwu(
     normalized = [w / total for w in updated]
 
     # Enforce minimum weight floor
+    # Q-H3: Iterative projection to ensure floor invariant
     if min_weight > 0:
-        deficit = 0.0
-        for i, w in enumerate(normalized):
-            if w < min_weight:
-                deficit += min_weight - w
+        for _iter in range(10):  # max iterations to prevent infinite loop
+            below_floor = [i for i, w in enumerate(normalized) if w < min_weight]
+            if not below_floor:
+                break
+            deficit = sum(min_weight - normalized[i] for i in below_floor)
+            above_floor = [i for i, w in enumerate(normalized) if w > min_weight]
+            if not above_floor:
+                break
+            per_model_deduct = deficit / len(above_floor)
+            for i in below_floor:
                 normalized[i] = min_weight
-        # Redistribute deficit from models above floor
-        above_floor = [
-            i for i, w in enumerate(normalized)
-            if w > min_weight
-        ]
-        if above_floor and deficit > 0:
-            per_model = deficit / len(above_floor)
             for i in above_floor:
-                normalized[i] -= per_model
-
-        # Re-normalize
+                normalized[i] -= per_model_deduct
+        # Final normalization
         total = sum(normalized)
-        normalized = [w / total for w in normalized]
+        if total > 0:
+            normalized = [w / total for w in normalized]
 
     return normalized
 

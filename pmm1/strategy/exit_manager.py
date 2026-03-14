@@ -104,6 +104,32 @@ class ExitManager:
                 md = active_markets.get(pos.condition_id)
                 is_orphan = pos.condition_id not in active_markets
 
+                # R-H2: Escalate when book is empty for aged positions
+                if current_price is None and not is_orphan:
+                    hold_hours = (now - pos.last_update) / 3600.0
+                    if hold_hours > 8.0 and avg_price > 0:
+                        # Emergency exit at 10% haircut after 8 hours with no book
+                        logger.warning(
+                            "empty_book_emergency_exit",
+                            condition_id=pos.condition_id[:16],
+                            hold_hours=f"{hold_hours:.1f}",
+                        )
+                        signals.append(SellSignal(
+                            token_id=token_id,
+                            condition_id=pos.condition_id,
+                            size=inv_size,
+                            price=round(avg_price * 0.90, 4),
+                            urgency="high",
+                            reason="empty_book_aged",
+                        ))
+                        continue
+                    elif hold_hours > 4.0:
+                        logger.warning(
+                            "empty_book_aged_position",
+                            condition_id=pos.condition_id[:16],
+                            hold_hours=f"{hold_hours:.1f}",
+                        )
+
                 # 1. FLATTEN (highest priority)
                 if flatten_active:
                     sig = self._build_flatten_signal(pos, token_id, inv_size, current_price)

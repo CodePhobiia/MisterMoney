@@ -122,3 +122,30 @@ def test_sliding_window_resets_sprt():
     first_decision = tracker.sprt_decision
     # Should have confirmed and then possibly reset
     assert len(tracker._decision_history) >= 1 or first_decision != "undecided"
+
+
+def test_running_wins_counts_outcomes_not_pnl():
+    """Q-C2: _running_wins should count outcome>0.5, not pnl>0."""
+    tracker = EdgeTracker()
+    # Trade where outcome=1.0 (YES resolved) but pnl is negative
+    tracker.record_trade(predicted_p=0.7, market_p=0.6, outcome=1.0, pnl=-0.05)
+    assert tracker._running_wins == 1  # counted as win (outcome=1.0)
+    # Trade where outcome=0.0 (NO resolved) but pnl is positive
+    tracker.record_trade(predicted_p=0.3, market_p=0.4, outcome=0.0, pnl=0.10)
+    assert tracker._running_wins == 1  # NOT counted (outcome=0.0)
+
+
+def test_counters_reset_on_window_slide():
+    """Q-M3: Running counters should reset when SPRT window slides."""
+    tracker = EdgeTracker(min_trades=5)
+    # Force a decision
+    for _ in range(100):
+        tracker.record_trade(predicted_p=0.8, market_p=0.5, outcome=1.0, pnl=0.1)
+    # Should have decided by now
+    assert tracker.sprt_decision != "undecided"
+    old_decision_idx = tracker._decision_trade_index  # noqa: F841
+    # Add window_size more trades to trigger window slide
+    for _ in range(tracker.window_size):
+        tracker.record_trade(predicted_p=0.5, market_p=0.5, outcome=1.0, pnl=0.01)
+    # Counters should have reset
+    assert tracker._running_total < tracker.window_size + 50  # not accumulating from start

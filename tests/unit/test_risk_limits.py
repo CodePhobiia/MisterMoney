@@ -42,10 +42,11 @@ class TestPerMarketGross:
         result = limits.check_per_market_gross("cond-1", proposed_additional_dollars=3.0)
         assert result.passed is False
 
-    def test_zero_nav_passes(self):
+    def test_zero_nav_blocks(self):
         limits = _make_limits(nav=0.0)
         result = limits.check_per_market_gross("cond-1", proposed_additional_dollars=999.0)
-        assert result.passed is True
+        assert result.passed is False
+        assert any("nav_unavailable" in b for b in result.breaches)
 
 
 class TestPerEventCluster:
@@ -232,3 +233,25 @@ class TestThematicCorrelation:
 
         assert passed is True
         assert remaining == pytest.approx(1.0)
+
+
+class TestNavZeroBlocks:
+    def test_nav_zero_blocks_all_checks(self):
+        """R-C1: All 4 risk checks must fail when NAV is zero."""
+        limits = _make_limits(nav=0.0)
+
+        r1 = limits.check_per_market_gross("cond-1", proposed_additional_dollars=1.0)
+        assert r1.passed is False
+        assert any("nav_unavailable" in b for b in r1.breaches)
+
+        r2 = limits.check_per_event_cluster("event-1", proposed_additional=1.0)
+        assert r2.passed is False
+        assert any("nav_unavailable" in b for b in r2.breaches)
+
+        r3 = limits.check_total_directional(proposed_additional_net=1.0)
+        assert r3.passed is False
+        assert any("nav_unavailable" in b for b in r3.breaches)
+
+        r4 = limits.check_total_arb_gross(proposed_additional=1.0)
+        assert r4.passed is False
+        assert any("nav_unavailable" in b for b in r4.breaches)

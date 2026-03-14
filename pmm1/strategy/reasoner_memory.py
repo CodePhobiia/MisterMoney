@@ -33,6 +33,7 @@ class ResolvedEstimate:
     actual_outcome: float  # 1.0 = YES, 0.0 = NO
     category: str = ""
     resolved_at: float = field(default_factory=time.time)
+    p_ensemble: float = 0.0
 
     @property
     def brier(self) -> float:
@@ -57,7 +58,7 @@ class ReasonerMemory:
     def __init__(
         self,
         persist_path: str = "data/reasoner_memory.json",
-        min_for_calibration: int = 50,
+        min_for_calibration: int = 200,
     ) -> None:
         self.persist_path = persist_path
         self.min_for_calibration = min_for_calibration
@@ -73,6 +74,7 @@ class ReasonerMemory:
         p_calibrated: float,
         uncertainty: float,
         category: str = "",
+        p_ensemble: float = 0.0,
     ) -> None:
         """Record a resolved market for calibration tracking."""
         est = ResolvedEstimate(
@@ -83,6 +85,7 @@ class ReasonerMemory:
             uncertainty=uncertainty,
             actual_outcome=actual_outcome,
             category=category,
+            p_ensemble=p_ensemble,
         )
         self._resolved.append(est)
 
@@ -181,7 +184,7 @@ class ReasonerMemory:
         if len(self._resolved) < self.min_for_calibration:
             return (1.3, 0.0)
 
-        probs = [e.p_challenged for e in self._resolved]
+        probs = [e.p_ensemble if e.p_ensemble > 0 else e.p_challenged for e in self._resolved]
         outcomes = [e.actual_outcome for e in self._resolved]
 
         gamma, tau = fit_gamma_tau(probs, outcomes)
@@ -302,6 +305,7 @@ class ReasonerMemory:
                     "actual_outcome": e.actual_outcome,
                     "category": e.category,
                     "resolved_at": e.resolved_at,
+                    "p_ensemble": e.p_ensemble,
                 }
                 for e in self._resolved[-5000:]  # Keep recent
             ]

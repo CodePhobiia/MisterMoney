@@ -133,6 +133,18 @@ class TestKillSwitchCallbacks:
         assert ks._on_trigger is cb
 
 
+class TestKillSwitchHistoryBounded:
+    def test_trigger_history_bounded(self):
+        """S-H1: trigger history should be bounded to 1000 entries."""
+        ks = KillSwitch()
+        for i in range(1500):
+            ks._trigger(
+                KillSwitchReason.MANUAL,
+                f"trigger {i}",
+            )
+        assert len(ks._trigger_history) <= 1000
+
+
 class TestKillSwitchStatus:
     def test_get_status(self):
         ks = KillSwitch()

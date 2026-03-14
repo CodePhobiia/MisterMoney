@@ -119,6 +119,27 @@ class RiskConfig(BaseModel):
     # Absolute drawdown from session peak (Paper 1: 15%)
     absolute_max_drawdown_nav: float = 0.15
 
+    @field_validator("per_market_gross_nav")
+    @classmethod
+    def _validate_per_market(cls, v: float) -> float:
+        if not 0.001 <= v <= 0.10:
+            raise ValueError(f"per_market_gross_nav must be in [0.001, 0.10], got {v}")
+        return v
+
+    @field_validator("per_event_cluster_nav")
+    @classmethod
+    def _validate_per_event(cls, v: float) -> float:
+        if not 0.001 <= v <= 0.20:
+            raise ValueError(f"per_event_cluster_nav must be in [0.001, 0.20], got {v}")
+        return v
+
+    @field_validator("absolute_max_drawdown_nav")
+    @classmethod
+    def _validate_abs_dd(cls, v: float) -> float:
+        if not 0.05 <= v <= 0.50:
+            raise ValueError(f"absolute_max_drawdown_nav must be in [0.05, 0.50], got {v}")
+        return v
+
 
 class ExecutionConfig(BaseModel):
     """Execution parameters from §12."""

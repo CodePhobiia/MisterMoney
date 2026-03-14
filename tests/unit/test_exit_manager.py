@@ -1001,3 +1001,65 @@ class TestSellSignalModel:
         )
         assert sig.price == 0.45
         assert sig.urgency == "critical"
+
+
+# ── R-H2: Empty book emergency exit tests ────────────────────────────────────
+
+
+class TestEmptyBookEmergencyExit:
+    """Tests for R-H2: stop-loss fails on empty book — emergency exit for aged positions."""
+
+    @pytest.mark.asyncio
+    async def test_empty_book_emergency_exit_after_8_hours(self):
+        """Position held >8h with no book -> exit signal reason='empty_book_aged'."""
+        # Position held for 9 hours (32400 seconds) with no book data
+        pos = _make_position(
+            yes_avg_price=0.50,
+            yes_size=100.0,
+            last_update=time.time() - 32400,  # 9 hours ago
+        )
+        em = _build_exit_manager(
+            config=_make_exit_config(
+                stop_loss={"enabled": True, "threshold_pct": 0.20},
+            ),
+            positions=[pos],
+            prices={},  # No book data at all — empty book
+        )
+        # Market IS in active_markets (not orphan)
+        active_markets = {"cond-1": _make_market_metadata()}
+        signals = await em.evaluate_all(active_markets)
+
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.reason == "empty_book_aged"
+        assert sig.urgency == "high"
+        assert sig.size == 100.0
+        # Price should be avg_price * 0.90 = 0.50 * 0.90 = 0.45
+        assert sig.price == pytest.approx(0.45, abs=0.001)
+        assert sig.token_id == "tok-yes-1"
+        assert sig.condition_id == "cond-1"
+
+    @pytest.mark.asyncio
+    async def test_empty_book_under_8_hours_no_emergency_exit(self):
+        """Position with no book data held < 8 hours does NOT generate emergency exit."""
+        # Position held for 5 hours — should warn but not generate signal
+        pos = _make_position(
+            yes_avg_price=0.50,
+            yes_size=100.0,
+            last_update=time.time() - 18000,  # 5 hours ago
+        )
+        em = _build_exit_manager(
+            config=_make_exit_config(
+                stop_loss={"enabled": True, "threshold_pct": 0.20},
+                take_profit={"enabled": False},
+                resolution={"enabled": False},
+            ),
+            positions=[pos],
+            prices={},  # No book data
+        )
+        active_markets = {"cond-1": _make_market_metadata()}
+        signals = await em.evaluate_all(active_markets)
+
+        # No emergency exit signal (position is not old enough)
+        emergency_signals = [s for s in signals if s.reason == "empty_book_aged"]
+        assert len(emergency_signals) == 0

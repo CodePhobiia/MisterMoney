@@ -252,7 +252,12 @@ def test_rolling_sharpe_json_serializable():
 
 
 def test_sprt_glr_detects_small_edge():
-    """GLR test detects edges smaller than hypothesized."""
+    """GLR test detects a 5% edge given enough observations.
+
+    A 5% edge at even odds needs ~620 trades for fixed-sample significance
+    (Paper 2 table). The batch GLR with chi-squared boundary needs a similar
+    number. We allow up to 800 trades for the sequential test.
+    """
     import random
 
     random.seed(42)
@@ -260,7 +265,7 @@ def test_sprt_glr_detects_small_edge():
     wins = 0
     total = 0
     decision = "undecided"
-    for _ in range(500):
+    for _ in range(800):
         outcome = 1.0 if random.random() < 0.55 else 0.0
         total += 1
         if outcome > 0.5:
@@ -271,3 +276,32 @@ def test_sprt_glr_detects_small_edge():
         if decision != "undecided":
             break
     assert decision == "edge_confirmed"
+
+
+def test_sprt_glr_false_positive_rate():
+    """Monte Carlo: GLR should have <10% FPR under H0."""
+    import random
+
+    random.seed(42)
+    false_positives = 0
+    trials = 2000
+    for _ in range(trials):
+        p_null = 0.50
+        wins = 0
+        total = 0
+        log_ratio = 0.0
+        decision = "undecided"
+        for _ in range(300):
+            outcome = 1.0 if random.random() < p_null else 0.0
+            total += 1
+            if outcome > 0.5:
+                wins += 1
+            log_ratio, decision = sprt_update_glr(
+                log_ratio, outcome, wins, total, p_null=p_null,
+            )
+            if decision != "undecided":
+                break
+        if decision == "edge_confirmed":
+            false_positives += 1
+    fpr = false_positives / trials
+    assert fpr < 0.10, f"False positive rate {fpr:.3f} exceeds 10%"

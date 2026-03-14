@@ -65,6 +65,7 @@ class LLMEstimate:
     reasoning: str
     contra_points: str  # Arguments against own estimate
     model: str
+    mid_at_signal_time: float = 0.0
     generated_at: float = field(default_factory=time.time)
     latency_ms: float = 0.0
     input_tokens: int = 0
@@ -111,7 +112,7 @@ class ReasonerConfig:
     max_markets_per_cycle: int = 10
     min_confidence: float = 0.70
     extremization_alpha: float = 1.3  # Single-model optimal (Halawi et al.)
-    signal_max_age_s: float = 600.0
+    signal_max_age_s: float = 1800.0
     decay_half_life_s: float = 900.0
     daily_cost_cap_usd: float = 50.0
 
@@ -215,7 +216,7 @@ NOW: The market price is {market_price:.3f}.
 
 {book_block}
 
-The market disagrees with you by {disagreement:.1f} percentage points.
+The market price differs from your estimate.
 
 TASK: Reconcile your estimate with the market price.
 - If the market knows something you don't, adjust toward it.
@@ -285,8 +286,14 @@ class LLMReasoner:
         """Inject bot state after construction."""
         self.bot_state = state
 
+    _MODEL_PRICING: dict[str, tuple[float, float]] = {
+        "opus": (15.0, 75.0),
+        "sonnet": (3.0, 15.0),
+    }
+
     def _track_cost(
         self, input_tokens: int, output_tokens: int,
+        model: str = "",
     ) -> None:
         """Track daily token spend and cost estimate."""
         import time as _time
@@ -298,11 +305,20 @@ class LLMReasoner:
             self._cost_day_start = now
 
         self._daily_token_spend += input_tokens + output_tokens
-        # Rough cost: $15/M input + $75/M output for Opus
-        # $3/M input + $15/M output for Sonnet
+
+        # Look up model-specific pricing
+        model_lower = model.lower()
+        if "sonnet" in model_lower:
+            input_price, output_price = self._MODEL_PRICING["sonnet"]
+        elif "opus" in model_lower:
+            input_price, output_price = self._MODEL_PRICING["opus"]
+        else:
+            # Default to Opus pricing if unknown
+            input_price, output_price = self._MODEL_PRICING["opus"]
+
         self._daily_cost_usd += (
-            input_tokens * 15.0 / 1_000_000
-            + output_tokens * 75.0 / 1_000_000
+            input_tokens * input_price / 1_000_000
+            + output_tokens * output_price / 1_000_000
         )
 
     @property
@@ -377,13 +393,14 @@ class LLMReasoner:
             return book_midpoint, meta
 
         # Event-aware decay (M1)
-        price_change = abs(
-            book_midpoint - est.p_calibrated,
-        )
+        # Actual market movement since signal generation (Q-H2+ML-H3)
+        actual_market_move = abs(
+            book_midpoint - est.mid_at_signal_time,
+        ) if est.mid_at_signal_time > 0 else 0.0
         p_decayed = est.decay_toward_market(
             book_midpoint,
             self.config.decay_half_life_s,
-            price_change_since_signal=price_change,
+            price_change_since_signal=actual_market_move,
         )
 
         # Inventory-aware blend (H8)
@@ -401,7 +418,7 @@ class LLMReasoner:
         # When calibrated: use signal/market variance ratio
         if self.memory and self.memory.is_calibrated:
             llm_var = max(0.001, est.uncertainty ** 2)
-            market_var = max(0.001, price_change ** 2 + 0.005)
+            market_var = max(0.001, actual_market_move ** 2 + 0.005)
             # Kalman gain: high LLM variance -> trust market more
             kalman_gain = llm_var / (llm_var + market_var)
             # Invert: low LLM uncertainty -> higher blend weight
@@ -436,6 +453,7 @@ class LLMReasoner:
         book_summary: str = "",
         resolution_criteria: str = "",
         extra_context: str = "",
+        challenge_context: str = "",
     ) -> LLMEstimate | None:
         """Full two-pass analysis of a single market.
 
@@ -469,7 +487,7 @@ class LLMReasoner:
             blind_out = blind_resp.get("output_tokens", 0)
             total_input += blind_in
             total_output += blind_out
-            self._track_cost(blind_in, blind_out)
+            self._track_cost(blind_in, blind_out, model=self.config.blind_model)
             any_cache_hit = any_cache_hit or blind_resp.get(
                 "cache_hit", False,
             )
@@ -507,11 +525,15 @@ class LLMReasoner:
             return None
 
         # ── PASS 2: Market-aware challenge ──
-        disagreement = abs(p_blind - midpoint) * 100
-
         book_block = ""
         if book_summary:
             book_block = f"ORDER BOOK STATE:\n{book_summary}"
+
+        challenge_context_block = ""
+        if challenge_context:
+            challenge_context_block = (
+                f"\nADDITIONAL CONTEXT:\n{challenge_context}"
+            )
 
         challenge_prompt = _CHALLENGE_PROMPT_TEMPLATE.format(
             blind_p=p_blind,
@@ -519,9 +541,8 @@ class LLMReasoner:
             blind_reasoning=blind_reasoning,
             contra_argument=contra_argument,
             market_price=midpoint,
-            disagreement=disagreement,
             book_block=book_block,
-        )
+        ) + challenge_context_block
 
         try:
             challenge_resp = await self._call_opus(
@@ -531,7 +552,7 @@ class LLMReasoner:
             chal_out = challenge_resp.get("output_tokens", 0)
             total_input += chal_in
             total_output += chal_out
-            self._track_cost(chal_in, chal_out)
+            self._track_cost(chal_in, chal_out, model=self.config.challenge_model)
             any_cache_hit = (
                 any_cache_hit
                 or challenge_resp.get("cache_hit", False)
@@ -560,7 +581,6 @@ class LLMReasoner:
                 p_blind=round(p_blind, 3),
                 p_challenged=round(p_challenged, 3),
                 market=round(midpoint, 3),
-                disagreement=round(disagreement, 1),
             )
 
         except Exception as e:
@@ -603,6 +623,7 @@ class LLMReasoner:
             reasoning=blind_reasoning,
             contra_points=contra_argument,
             model=self.config.model,
+            mid_at_signal_time=midpoint,
             latency_ms=latency,
             input_tokens=total_input,
             output_tokens=total_output,
@@ -741,7 +762,8 @@ class LLMReasoner:
 
                     # ── Build rich context ──
                     book_summary = ""
-                    extra_parts: list[str] = []
+                    blind_extra_parts: list[str] = []
+                    challenge_extra_parts: list[str] = []
 
                     if self.bot_state:
                         book = self.bot_state.book_manager.get(tid)
@@ -756,18 +778,18 @@ class LLMReasoner:
                             )
                         )
 
-                    # 2. Market metadata
+                    # 2. Market metadata (blind-safe: no prices)
                     if self.context_builder and md:
                         meta_str = (
                             self.context_builder
                             .build_market_metadata(md)
                         )
                         if meta_str:
-                            extra_parts.append(
+                            blind_extra_parts.append(
                                 f"MARKET METADATA:\n{meta_str}"
                             )
 
-                    # 3. Price history
+                    # 3. Price history (challenge only — contains prices)
                     if self.context_builder and tid:
                         try:
                             price_ctx = await (
@@ -775,14 +797,14 @@ class LLMReasoner:
                                 .build_price_context(tid)
                             )
                             if price_ctx:
-                                extra_parts.append(
+                                challenge_extra_parts.append(
                                     f"PRICE HISTORY (24h):\n"
                                     f"{price_ctx}"
                                 )
                         except Exception:
                             pass  # Non-critical
 
-                    # 4. Cross-market signals
+                    # 4. Cross-market signals (challenge only — contains prices)
                     if (
                         self.context_builder
                         and self.bot_state
@@ -799,9 +821,9 @@ class LLMReasoner:
                             )
                         )
                         if cross_ctx:
-                            extra_parts.append(cross_ctx)
+                            challenge_extra_parts.append(cross_ctx)
 
-                    # 5. News context
+                    # 5. News context (blind-safe: filtered for price leaks)
                     if self.news_fetcher:
                         question = market.get("question", "")
                         try:
@@ -811,7 +833,7 @@ class LLMReasoner:
                                 )
                             )
                             if news:
-                                extra_parts.append(
+                                blind_extra_parts.append(
                                     "RECENT NEWS (use for facts, "
                                     "NOT as sole basis — base "
                                     "rates are more predictive):"
@@ -820,13 +842,11 @@ class LLMReasoner:
                         except Exception:
                             pass  # Non-critical
 
-                    # 6. Calibration history
+                    # 6. Calibration history (blind-safe: no prices)
                     if self.memory and self.memory.is_calibrated:
                         cal_ctx = self.memory.format_for_prompt()
                         if cal_ctx:
-                            extra_parts.append(cal_ctx)
-
-                    extra_context = "\n\n".join(extra_parts)
+                            blind_extra_parts.append(cal_ctx)
 
                     await self.analyze_market(
                         condition_id=cid,
@@ -836,7 +856,10 @@ class LLMReasoner:
                         resolution_criteria=market.get(
                             "resolution_criteria", "",
                         ),
-                        extra_context=extra_context,
+                        extra_context="\n\n".join(blind_extra_parts),
+                        challenge_context="\n\n".join(
+                            challenge_extra_parts,
+                        ),
                     )
                     analyzed += 1
                     await asyncio.sleep(2)
@@ -996,7 +1019,35 @@ class LLMReasoner:
             # On success: reset failure counter
             self._consecutive_failures = 0
             return result
+        except aiohttp.ClientResponseError as e:
+            if e.status in (400, 401, 403):
+                logger.error(
+                    "llm_permanent_error",
+                    status=e.status,
+                    error=str(e),
+                )
+                # Don't count toward circuit breaker
+                return None
+            # Retryable errors count toward circuit breaker
+            self._consecutive_failures += 1
+            if (
+                self._consecutive_failures
+                >= self._MAX_CONSECUTIVE_FAILURES
+            ):
+                self._circuit_open = True
+                self._circuit_open_until = (
+                    time.time() + self._CIRCUIT_COOLDOWN_S
+                )
+                logger.critical(
+                    "llm_circuit_breaker_opened",
+                    consecutive_failures=(
+                        self._consecutive_failures
+                    ),
+                    cooldown_s=self._CIRCUIT_COOLDOWN_S,
+                )
+            raise
         except Exception:
+            # Network errors, timeouts count toward circuit breaker
             self._consecutive_failures += 1
             if (
                 self._consecutive_failures
@@ -1031,10 +1082,27 @@ class LLMReasoner:
 
             result: dict[str, Any] = json.loads(text)
             return result
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning(
-                "llm_parse_failed",
-                error=str(e),
-                text=text[:200],
-            )
-            return None
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Fallback: find first { to last } using brace matching
+        start = text.find('{')
+        if start >= 0:
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:i + 1])
+                        except json.JSONDecodeError:
+                            break
+
+        logger.warning(
+            "llm_parse_failed",
+            error="no valid JSON found",
+            text=text[:200],
+        )
+        return None

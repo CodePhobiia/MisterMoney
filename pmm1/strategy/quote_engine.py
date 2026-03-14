@@ -192,6 +192,7 @@ class QuoteEngine:
         k = self.size_decay_k
 
         cfg = self.config
+        _kelly_active = False
         if (
             cfg.kelly_enabled
             and nav > 0
@@ -225,6 +226,10 @@ class QuoteEngine:
                     1.0, n_active_positions, rho=0.05,
                 )
                 dollar_size *= corr_factor
+            # Q-H1: When Kelly-sizing, don't override with 5-share floor.
+            # If Kelly says the position is too small for Polymarket minimum ($1.50),
+            # return 0 (don't trade) rather than inflating to 5 shares.
+            _kelly_active = True
             if dollar_size <= 0:
                 return 0.0
             target_shares = dollar_size / price
@@ -257,7 +262,9 @@ class QuoteEngine:
         elif time_to_catalyst_hours < 24:
             size *= 0.8
 
-        return max(5.0, min(max_shares, size))
+        if _kelly_active:
+            return max(0.0, min(max_shares, size))  # Kelly: no artificial floor
+        return max(5.0, min(max_shares, size))  # Dollar-flat: keep minimum
 
     def compute_quote(
         self,

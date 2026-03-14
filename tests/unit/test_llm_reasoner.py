@@ -403,15 +403,30 @@ async def test_call_opus_resets_circuit_after_cooldown():
     # Set cooldown to already expired
     reasoner._circuit_open_until = time.time() - 1
 
-    # The circuit should close, but the actual API call will fail
-    # (no real API). The important thing is it doesn't raise
+    # Mock a network error (not a permanent HTTP error)
+    mock_resp = AsyncMock()
+
+    def raise_network_error():
+        raise ConnectionError("network failure")
+
+    mock_resp.raise_for_status = raise_network_error
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = AsyncMock()
+    mock_session.post = lambda *a, **kw: mock_resp
+    mock_session.closed = False
+    reasoner._session = mock_session
+
+    # The circuit should close, but the API call will fail
+    # with a network error. The important thing is it doesn't raise
     # RuntimeError("Circuit breaker open").
     with pytest.raises(Exception) as exc_info:
         await reasoner._call_opus("test prompt")
     # Should NOT be the circuit breaker error
     assert "Circuit breaker open" not in str(exc_info.value)
     # Circuit should now be closed (reset happened before API call)
-    # But consecutive_failures increments due to API error
+    # But consecutive_failures increments due to network error
     assert not reasoner._circuit_open or (
         reasoner._consecutive_failures
         >= LLMReasoner._MAX_CONSECUTIVE_FAILURES
@@ -426,6 +441,21 @@ async def test_call_opus_increments_failures():
         per_market_timeout_s=1.0,
     )
     reasoner = LLMReasoner(config)
+
+    # Mock a network error (retryable, not permanent)
+    mock_resp = AsyncMock()
+
+    def raise_network_error():
+        raise ConnectionError("network failure")
+
+    mock_resp.raise_for_status = raise_network_error
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = AsyncMock()
+    mock_session.post = lambda *a, **kw: mock_resp
+    mock_session.closed = False
+    reasoner._session = mock_session
 
     assert reasoner._consecutive_failures == 0
 
@@ -444,6 +474,21 @@ async def test_call_opus_opens_circuit_at_threshold():
         per_market_timeout_s=1.0,
     )
     reasoner = LLMReasoner(config)
+
+    # Mock a network error (retryable, not permanent)
+    mock_resp = AsyncMock()
+
+    def raise_network_error():
+        raise ConnectionError("network failure")
+
+    mock_resp.raise_for_status = raise_network_error
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = AsyncMock()
+    mock_session.post = lambda *a, **kw: mock_resp
+    mock_session.closed = False
+    reasoner._session = mock_session
 
     for i in range(5):
         with pytest.raises(Exception):
@@ -551,3 +596,146 @@ def test_class_level_circuit_constants():
     """Circuit breaker constants are class-level."""
     assert LLMReasoner._MAX_CONSECUTIVE_FAILURES == 5
     assert LLMReasoner._CIRCUIT_COOLDOWN_S == 900.0
+
+
+# ── ML-C1+C2: Blind pass excludes price context ──
+
+
+@pytest.mark.asyncio
+async def test_blind_pass_excludes_price_context():
+    """Blind pass must NOT contain PRICE HISTORY or CROSS-MARKET."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        per_market_timeout_s=5.0,
+    )
+    reasoner = LLMReasoner(config)
+
+    captured_prompts: list[str] = []
+
+    async def mock_call_opus(prompt, model=None):
+        captured_prompts.append(prompt)
+        if len(captured_prompts) == 1:
+            # Blind pass response
+            return {
+                "text": '{"p_hat": 0.55, "uncertainty": 0.15, '
+                        '"reasoning_summary": "test", '
+                        '"contra_argument": "test contra"}',
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_hit": False,
+            }
+        else:
+            # Challenge pass response
+            return {
+                "text": '{"p_hat_final": 0.60, "uncertainty": 0.12}',
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_hit": False,
+            }
+
+    reasoner._call_opus = mock_call_opus
+
+    await reasoner.analyze_market(
+        condition_id="test_cid",
+        question="Will X happen?",
+        midpoint=0.50,
+        extra_context="MARKET METADATA:\ncategory=politics",
+        challenge_context="PRICE HISTORY (24h):\n0.45->0.50\n\n"
+                          "CROSS-MARKET CONTEXT:\nrelated=0.60",
+    )
+
+    assert len(captured_prompts) >= 2
+    blind_prompt = captured_prompts[0]
+    challenge_prompt = captured_prompts[1]
+
+    # Blind prompt should NOT contain price data
+    assert "PRICE HISTORY" not in blind_prompt
+    assert "CROSS-MARKET" not in blind_prompt
+    # Blind prompt should contain metadata
+    assert "MARKET METADATA" in blind_prompt
+
+    # Challenge prompt SHOULD contain price context
+    assert "PRICE HISTORY" in challenge_prompt
+    assert "CROSS-MARKET" in challenge_prompt
+
+
+# ── ML-C3: Cost tracking uses model pricing ──
+
+
+def test_cost_tracking_uses_model_pricing():
+    """Sonnet uses $3/$15, Opus uses $15/$75."""
+    config = ReasonerConfig(enabled=True, auth_token="test")
+    reasoner = LLMReasoner(config)
+
+    # Sonnet pricing: $3/M input, $15/M output
+    reasoner._track_cost(1_000_000, 1_000_000, model="claude-sonnet-4-6")
+    sonnet_cost = reasoner._daily_cost_usd
+    expected_sonnet = 3.0 + 15.0  # $3 input + $15 output
+    assert abs(sonnet_cost - expected_sonnet) < 1e-6, (
+        f"Sonnet cost {sonnet_cost} != expected {expected_sonnet}"
+    )
+
+    # Reset
+    reasoner._daily_cost_usd = 0.0
+    reasoner._daily_token_spend = 0
+
+    # Opus pricing: $15/M input, $75/M output
+    reasoner._track_cost(1_000_000, 1_000_000, model="claude-opus-4-6")
+    opus_cost = reasoner._daily_cost_usd
+    expected_opus = 15.0 + 75.0  # $15 input + $75 output
+    assert abs(opus_cost - expected_opus) < 1e-6, (
+        f"Opus cost {opus_cost} != expected {expected_opus}"
+    )
+
+    # Reset
+    reasoner._daily_cost_usd = 0.0
+    reasoner._daily_token_spend = 0
+
+    # Unknown model defaults to Opus pricing
+    reasoner._track_cost(1_000_000, 1_000_000, model="unknown-model")
+    unknown_cost = reasoner._daily_cost_usd
+    assert abs(unknown_cost - expected_opus) < 1e-6
+
+
+# ── ML-M4: Circuit breaker ignores permanent errors ──
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_ignores_permanent_errors():
+    """400/401/403 errors don't increment failure count."""
+    import aiohttp
+
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        per_market_timeout_s=5.0,
+    )
+    reasoner = LLMReasoner(config)
+
+    assert reasoner._consecutive_failures == 0
+
+    # Mock a 400 response using aiohttp.ClientResponseError
+    mock_resp = AsyncMock()
+
+    def raise_400():
+        raise aiohttp.ClientResponseError(
+            request_info=AsyncMock(),
+            history=(),
+            status=400,
+            message="Bad Request",
+        )
+
+    mock_resp.raise_for_status = raise_400
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = AsyncMock()
+    mock_session.post = lambda *a, **kw: mock_resp
+    mock_session.closed = False
+    reasoner._session = mock_session
+
+    # Permanent error should return None, not raise
+    result = await reasoner._call_opus("test")
+    assert result is None
+    # Failure count should NOT have incremented
+    assert reasoner._consecutive_failures == 0
+    assert not reasoner._circuit_open

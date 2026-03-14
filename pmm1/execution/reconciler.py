@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import random
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -430,8 +431,10 @@ class Reconciler:
             if now - self._last_position_reconcile >= self._reconcile_positions_s:
                 await self.reconcile_positions()
 
-            # Sleep for the shorter interval
-            await asyncio.sleep(min(self._reconcile_orders_s, self._reconcile_positions_s) / 2)
+            # S-H5: Add jitter to prevent thundering herd with multiple instances
+            base_sleep = min(self._reconcile_orders_s, self._reconcile_positions_s) / 2
+            jitter = random.uniform(0, base_sleep * 0.3)
+            await asyncio.sleep(base_sleep + jitter)
 
     def start(self) -> asyncio.Task[None]:
         """Start the reconciliation loop."""

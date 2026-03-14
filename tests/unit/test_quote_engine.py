@@ -404,3 +404,28 @@ class TestCheckCrossingRule:
             haircut=0.005,
         )
         assert should_cross is False
+
+
+# ===================================================================
+# Q-H1: Kelly no share floor
+# ===================================================================
+
+
+class TestKellyNoShareFloor:
+    """Q-H1: Kelly sizing should not inflate to 5-share minimum."""
+
+    def test_kelly_no_share_floor(self):
+        """Kelly with tiny edge returns 0, not 5 shares."""
+        cfg = _default_config(kelly_enabled=True, kelly_min_edge=0.03)
+        eng = _engine(config=cfg)
+        # Edge = |0.51 - 0.50| = 0.01 < 0.03 min_edge → kelly returns 0
+        size = eng.compute_size(
+            confidence=1.0,
+            market_inventory=0.0,
+            fair_value=0.51,
+            market_price=0.50,
+            nav=100.0,
+        )
+        assert size == 0.0, (
+            f"Kelly with sub-threshold edge should return 0.0, got {size}"
+        )
