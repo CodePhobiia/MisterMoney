@@ -249,6 +249,11 @@ class FairValueModel:
         predicted fair value at fill time to the actual midpoint
         5 minutes later.
 
+        NOTE: Not currently wired in main.py. Requires a data pipeline
+        that accumulates fills with ``mid_5min_later`` field (the market
+        midpoint 5 minutes after fill). Resolution-based calibration via
+        ``FairValueCalibrator.record_sample()`` is the active path.
+
         Args:
             fills: List of {features: FeatureVector, fill_price, mid_5min_later}
 
