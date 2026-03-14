@@ -993,9 +993,24 @@ async def run(settings: Settings | None = None) -> None:
     fv_calibrator = FairValueCalibrator(min_samples=100)
 
     # ── Embedded Opus reasoner (OAuth, background loop) ──
+    from pmm1.strategy.market_context import MarketContextBuilder
+    from pmm1.strategy.news_fetcher import NewsFetcher
+    from pmm1.strategy.reasoner_memory import ReasonerMemory
+
     llm_reasoner_config = ReasonerConfig.from_env()
+    llm_context_builder = MarketContextBuilder(
+        data_api=data_api,
+    )
+    llm_news_fetcher = NewsFetcher.from_env()
+    llm_memory = ReasonerMemory(
+        persist_path="data/reasoner_memory.json",
+    )
     llm_reasoner = LLMReasoner(
-        llm_reasoner_config, bot_state=state,
+        llm_reasoner_config,
+        bot_state=state,
+        context_builder=llm_context_builder,
+        memory=llm_memory,
+        news_fetcher=llm_news_fetcher,
     )
     if llm_reasoner_config.enabled:
         await llm_reasoner.start()

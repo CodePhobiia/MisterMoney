@@ -231,9 +231,15 @@ class LLMReasoner:
         self,
         config: ReasonerConfig,
         bot_state: Any = None,
+        context_builder: Any = None,
+        memory: Any = None,
+        news_fetcher: Any = None,
     ) -> None:
         self.config = config
         self.bot_state = bot_state
+        self.context_builder = context_builder
+        self.memory = memory
+        self.news_fetcher = news_fetcher
         self._cache: dict[str, LLMEstimate] = {}
         self._session: aiohttp.ClientSession | None = None
         self._task: asyncio.Task[None] | None = None
@@ -241,7 +247,6 @@ class LLMReasoner:
         self._cycle_count = 0
         self._total_calls = 0
         self._total_errors = 0
-        self._calibration_history: list[dict[str, float]] = []
 
     def set_bot_state(self, state: Any) -> None:
         """Inject bot state after construction."""
@@ -467,10 +472,13 @@ class LLMReasoner:
             p_challenged = p_blind
             uncertainty = blind_uncertainty
 
-        # ── POST: Extremize ──
-        p_calibrated = extremize(
-            p_challenged, self.config.extremization_alpha,
+        # ── POST: Extremize (dynamic α from memory) ──
+        alpha = (
+            self.memory.get_optimal_alpha()
+            if self.memory and self.memory.is_calibrated
+            else self.config.extremization_alpha
         )
+        p_calibrated = extremize(p_challenged, alpha)
 
         latency = (time.time() - start) * 1000
 
@@ -508,7 +516,7 @@ class LLMReasoner:
 
     def get_status(self) -> dict[str, Any]:
         """Reasoner status for ops/healthcheck."""
-        return {
+        status: dict[str, Any] = {
             "enabled": self.config.enabled,
             "running": self._running,
             "model": self.config.model,
@@ -520,16 +528,26 @@ class LLMReasoner:
             "total_calls": self._total_calls,
             "total_errors": self._total_errors,
         }
+        if self.memory:
+            status["memory"] = self.memory.get_summary()
+        if self.news_fetcher:
+            status["news"] = self.news_fetcher.get_status()
+        return status
 
     # ── Internal methods ──
 
     async def _loop(self) -> None:
-        """Background reasoning loop.
+        """Background reasoning loop with full context pipeline.
 
-        Cycles through active markets, prioritizing those with
-        stale or missing estimates.
+        For each market:
+        1. Build rich book summary (imbalance, depth, microprice)
+        2. Build market metadata (category, end date, volume)
+        3. Fetch price history (trend, volatility)
+        4. Find cross-market signals (parity, related markets)
+        5. Fetch news context (if enabled)
+        6. Inject calibration history (if available)
+        7. Run blind + challenge two-pass analysis
         """
-        # Wait for bot state to be available
         await asyncio.sleep(30)
 
         while self._running:
@@ -546,32 +564,104 @@ class LLMReasoner:
                     cid = market.get("condition_id", "")
                     existing = self._cache.get(cid)
 
-                    # Skip if estimate is still fresh
                     if existing and existing.age_seconds < (
                         self.config.cycle_interval_s * 0.8
                     ):
                         continue
 
+                    tid = market.get("token_id", "")
+                    md = market.get("_metadata")
                     book = None
+                    mid = market.get("midpoint", 0.5)
+
+                    # ── Build rich context ──
                     book_summary = ""
+                    extra_parts: list[str] = []
+
                     if self.bot_state:
-                        tid = market.get("token_id", "")
                         book = self.bot_state.book_manager.get(tid)
                         if book:
                             mid = book.get_midpoint()
-                            best_bid = book.best_bid
-                            best_ask = book.best_ask
-                            book_summary = (
-                                f"Best bid: {best_bid:.3f}, "
-                                f"Best ask: {best_ask:.3f}, "
-                                f"Midpoint: {mid:.3f}, "
-                                f"Spread: "
-                                f"{(best_ask - best_bid):.3f}"
+
+                    # 1. Rich book summary
+                    if self.context_builder and book:
+                        book_summary = (
+                            self.context_builder.build_book_summary(
+                                book,
                             )
-                        else:
-                            mid = 0.5
-                    else:
-                        mid = market.get("midpoint", 0.5)
+                        )
+
+                    # 2. Market metadata
+                    if self.context_builder and md:
+                        meta_str = (
+                            self.context_builder
+                            .build_market_metadata(md)
+                        )
+                        if meta_str:
+                            extra_parts.append(
+                                f"MARKET METADATA:\n{meta_str}"
+                            )
+
+                    # 3. Price history
+                    if self.context_builder and tid:
+                        try:
+                            price_ctx = await (
+                                self.context_builder
+                                .build_price_context(tid)
+                            )
+                            if price_ctx:
+                                extra_parts.append(
+                                    f"PRICE HISTORY (24h):\n"
+                                    f"{price_ctx}"
+                                )
+                        except Exception:
+                            pass  # Non-critical
+
+                    # 4. Cross-market signals
+                    if (
+                        self.context_builder
+                        and self.bot_state
+                        and md
+                    ):
+                        event_id = getattr(md, "event_id", "")
+                        cross_ctx = (
+                            self.context_builder
+                            .build_cross_market_context(
+                                cid,
+                                event_id,
+                                self.bot_state.active_markets,
+                                self.bot_state.book_manager,
+                            )
+                        )
+                        if cross_ctx:
+                            extra_parts.append(cross_ctx)
+
+                    # 5. News context
+                    if self.news_fetcher:
+                        question = market.get("question", "")
+                        try:
+                            news = await (
+                                self.news_fetcher.fetch_context(
+                                    question,
+                                )
+                            )
+                            if news:
+                                extra_parts.append(
+                                    "RECENT NEWS (use for facts, "
+                                    "NOT as sole basis — base "
+                                    "rates are more predictive):"
+                                    f"\n{news}"
+                                )
+                        except Exception:
+                            pass  # Non-critical
+
+                    # 6. Calibration history
+                    if self.memory and self.memory.is_calibrated:
+                        cal_ctx = self.memory.format_for_prompt()
+                        if cal_ctx:
+                            extra_parts.append(cal_ctx)
+
+                    extra_context = "\n\n".join(extra_parts)
 
                     await self.analyze_market(
                         condition_id=cid,
@@ -581,10 +671,9 @@ class LLMReasoner:
                         resolution_criteria=market.get(
                             "resolution_criteria", "",
                         ),
+                        extra_context=extra_context,
                     )
                     analyzed += 1
-
-                    # Brief pause between markets
                     await asyncio.sleep(2)
 
                 self._cycle_count += 1
@@ -604,13 +693,16 @@ class LLMReasoner:
                 await asyncio.sleep(30)
 
     def _get_priority_markets(self) -> list[dict[str, Any]]:
-        """Get markets to analyze, prioritized by staleness."""
+        """Get markets to analyze, scored by expected value.
+
+        Priority = staleness + volume + spread - toxicity.
+        High-value markets get analyzed first.
+        """
         if not self.bot_state:
             return []
 
         markets: list[dict[str, Any]] = []
         for cid, md in self.bot_state.active_markets.items():
-            # Skip extreme-priced markets (no edge)
             tid = getattr(md, "token_id_yes", "")
             book = self.bot_state.book_manager.get(tid)
             mid = book.get_midpoint() if book else 0.5
@@ -622,6 +714,26 @@ class LLMReasoner:
                 existing.age_seconds if existing else 99999.0
             )
 
+            # Smart priority scoring (Phase 6)
+            vol = getattr(md, "volume_24h", 0)
+            spread = getattr(md, "spread", 0)
+            tox = getattr(md, "toxicity_estimate", 0)
+            liq = getattr(md, "liquidity", 0)
+
+            stale_score = min(staleness / 300.0, 5.0)
+            vol_score = math.log1p(vol) / 5.0
+            spread_score = min(spread * 50, 2.0)
+            tox_penalty = tox * 100
+            liq_score = math.log1p(liq) / 5.0
+
+            priority = (
+                stale_score
+                + vol_score
+                + spread_score
+                + liq_score
+                - tox_penalty
+            )
+
             markets.append({
                 "condition_id": cid,
                 "question": getattr(md, "question", ""),
@@ -631,10 +743,11 @@ class LLMReasoner:
                     md, "resolution_source", "",
                 ),
                 "staleness": staleness,
+                "priority": priority,
+                "_metadata": md,
             })
 
-        # Most stale first
-        markets.sort(key=lambda m: -m["staleness"])
+        markets.sort(key=lambda m: -m["priority"])
         return markets
 
     async def _get_session(self) -> aiohttp.ClientSession:
