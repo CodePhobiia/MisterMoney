@@ -82,10 +82,16 @@ class LLMEstimate:
 
     def decay_toward_market(
         self, market_mid: float, half_life_s: float = 900.0,
+        price_change_since_signal: float = 0.0,
     ) -> float:
-        """Exponential decay toward market midpoint."""
+        """Event-aware decay toward market midpoint.
+
+        Decays faster when market moved (new info arrives),
+        slower when stable (signal still relevant).
+        """
         age = self.age_seconds
-        lam = math.exp(-age / half_life_s)
+        move_factor = 1.0 + abs(price_change_since_signal) * 20
+        lam = math.exp(-age * move_factor / half_life_s)
         return lam * self.p_calibrated + (1.0 - lam) * market_mid
 
 
@@ -96,15 +102,18 @@ class ReasonerConfig:
     enabled: bool = False
     auth_token: str = ""  # sk-ant-oat01-... OAuth token
     model: str = "claude-opus-4-6-20250610"
+    blind_model: str = "claude-sonnet-4-6-20250514"
+    challenge_model: str = "claude-opus-4-6-20250610"
     thinking_budget: int = 10000  # Extended thinking tokens
     max_tokens: int = 12000
     cycle_interval_s: float = 120.0
     per_market_timeout_s: float = 90.0
     max_markets_per_cycle: int = 10
     min_confidence: float = 0.70
-    extremization_alpha: float = 1.73  # Paper 2 §3: √3
+    extremization_alpha: float = 1.3  # Single-model optimal (Halawi et al.)
     signal_max_age_s: float = 600.0
     decay_half_life_s: float = 900.0
+    daily_cost_cap_usd: float = 50.0
 
     @classmethod
     def from_env(cls) -> ReasonerConfig:
@@ -118,11 +127,22 @@ class ReasonerConfig:
                 "PMM1_LLM_MODEL",
                 "claude-opus-4-6-20250610",
             ),
+            blind_model=os.getenv(
+                "PMM1_LLM_BLIND_MODEL",
+                "claude-sonnet-4-6-20250514",
+            ),
+            challenge_model=os.getenv(
+                "PMM1_LLM_CHALLENGE_MODEL",
+                "claude-opus-4-6-20250610",
+            ),
             thinking_budget=int(
                 os.getenv("PMM1_LLM_THINKING_BUDGET", "10000"),
             ),
             cycle_interval_s=float(
                 os.getenv("PMM1_LLM_CYCLE_INTERVAL", "120"),
+            ),
+            daily_cost_cap_usd=float(
+                os.getenv("PMM1_LLM_DAILY_COST_CAP", "50.0"),
             ),
         )
 
@@ -142,8 +162,9 @@ credible interval [low, high] for the true probability.
 event before incorporating specific evidence. Recency bias \
 is your biggest enemy — recent headlines feel important but \
 base rates are more predictive.
-3. EXTREMIZE: RLHF training makes you hedge toward 50%. Fight \
-this. If your analysis says 75%, say 75%, not 65%.
+3. HONEST ESTIMATE: Give your genuine probability estimate. \
+Do not artificially adjust it in any direction. Post-processing \
+will handle calibration corrections.
 4. CONTRA-REASONING: After forming your estimate, generate the \
 strongest argument AGAINST your own position. If the contra \
 argument is compelling, adjust.
@@ -200,9 +221,8 @@ TASK: Reconcile your estimate with the market price.
 - If the market knows something you don't, adjust toward it.
 - If your analysis is stronger, hold your ground.
 - Markets are efficient on average but can be wrong on specifics.
-- Paper 1 research: optimal blend is ~67% market / ~33% your \
-estimate. But if you have specific information the market lacks, \
-deviate more.
+- Consider: does the market know something you don't, or do \
+you have specific information the market hasn't priced in yet?
 
 Output JSON:
 {{
@@ -227,6 +247,9 @@ class LLMReasoner:
     The quote loop reads from cache, never blocks.
     """
 
+    _MAX_CONSECUTIVE_FAILURES = 5
+    _CIRCUIT_COOLDOWN_S = 900.0  # 15 min
+
     def __init__(
         self,
         config: ReasonerConfig,
@@ -248,9 +271,43 @@ class LLMReasoner:
         self._total_calls = 0
         self._total_errors = 0
 
+        # Phase 2: Cost controls
+        self._daily_token_spend: int = 0
+        self._daily_cost_usd: float = 0.0
+        self._cost_day_start: float = time.time()
+
+        # Phase 3: Circuit breaker
+        self._consecutive_failures = 0
+        self._circuit_open = False
+        self._circuit_open_until = 0.0
+
     def set_bot_state(self, state: Any) -> None:
         """Inject bot state after construction."""
         self.bot_state = state
+
+    def _track_cost(
+        self, input_tokens: int, output_tokens: int,
+    ) -> None:
+        """Track daily token spend and cost estimate."""
+        import time as _time
+
+        now = _time.time()
+        if now - self._cost_day_start > 86400:
+            self._daily_token_spend = 0
+            self._daily_cost_usd = 0.0
+            self._cost_day_start = now
+
+        self._daily_token_spend += input_tokens + output_tokens
+        # Rough cost: $15/M input + $75/M output for Opus
+        # $3/M input + $15/M output for Sonnet
+        self._daily_cost_usd += (
+            input_tokens * 15.0 / 1_000_000
+            + output_tokens * 75.0 / 1_000_000
+        )
+
+    @property
+    def _cost_cap_hit(self) -> bool:
+        return self._daily_cost_usd >= self.config.daily_cost_cap_usd
 
     async def start(self) -> None:
         """Start the background reasoning loop."""
@@ -299,10 +356,14 @@ class LLMReasoner:
         condition_id: str,
         book_midpoint: float,
         blend_weight: float = 0.33,
+        position_utilization: float = 0.0,
+        vol_regime: str = "normal",
     ) -> tuple[float, dict[str, Any]]:
         """Get LLM-blended fair value.
 
-        Paper 1: optimal ~67% market / ~33% AI.
+        Uses log-odds pooling (H2) instead of linear blend.
+        Scales blend weight by position utilization (H8)
+        and volatility regime (M2).
         """
         est = self.get_estimate(condition_id)
         meta: dict[str, Any] = {"llm_used": False}
@@ -315,13 +376,32 @@ class LLMReasoner:
             meta["miss_reason"] = "low_confidence"
             return book_midpoint, meta
 
+        # Event-aware decay (M1)
+        price_change = abs(
+            book_midpoint - est.p_calibrated,
+        )
         p_decayed = est.decay_toward_market(
-            book_midpoint, self.config.decay_half_life_s,
+            book_midpoint,
+            self.config.decay_half_life_s,
+            price_change_since_signal=price_change,
         )
 
-        blended = (
-            (1.0 - blend_weight) * book_midpoint
-            + blend_weight * p_decayed
+        # Inventory-aware blend (H8)
+        eff_blend = blend_weight * max(
+            0.1, 1.0 - position_utilization ** 2,
+        )
+
+        # Regime-conditional blend (M2)
+        if vol_regime == "extreme":
+            eff_blend *= 0.1
+        elif vol_regime == "high":
+            eff_blend *= 0.5
+
+        # Log-odds blend (H2) — respects external Bayesianity
+        from pmm1.math.ensemble import log_pool
+        blended = log_pool(
+            [book_midpoint, p_decayed],
+            weights=[1.0 - eff_blend, eff_blend],
         )
 
         meta.update({
@@ -371,9 +451,14 @@ class LLMReasoner:
         )
 
         try:
-            blind_resp = await self._call_opus(blind_prompt)
-            total_input += blind_resp.get("input_tokens", 0)
-            total_output += blind_resp.get("output_tokens", 0)
+            blind_resp = await self._call_opus(
+                blind_prompt, model=self.config.blind_model,
+            )
+            blind_in = blind_resp.get("input_tokens", 0)
+            blind_out = blind_resp.get("output_tokens", 0)
+            total_input += blind_in
+            total_output += blind_out
+            self._track_cost(blind_in, blind_out)
             any_cache_hit = any_cache_hit or blind_resp.get(
                 "cache_hit", False,
             )
@@ -428,9 +513,14 @@ class LLMReasoner:
         )
 
         try:
-            challenge_resp = await self._call_opus(challenge_prompt)
-            total_input += challenge_resp.get("input_tokens", 0)
-            total_output += challenge_resp.get("output_tokens", 0)
+            challenge_resp = await self._call_opus(
+                challenge_prompt, model=self.config.challenge_model,
+            )
+            chal_in = challenge_resp.get("input_tokens", 0)
+            chal_out = challenge_resp.get("output_tokens", 0)
+            total_input += chal_in
+            total_output += chal_out
+            self._track_cost(chal_in, chal_out)
             any_cache_hit = (
                 any_cache_hit
                 or challenge_resp.get("cache_hit", False)
@@ -472,13 +562,17 @@ class LLMReasoner:
             p_challenged = p_blind
             uncertainty = blind_uncertainty
 
-        # ── POST: Extremize (dynamic α from memory) ──
-        alpha = (
-            self.memory.get_optimal_alpha()
-            if self.memory and self.memory.is_calibrated
-            else self.config.extremization_alpha
-        )
-        p_calibrated = extremize(p_challenged, alpha)
+        # ── POST: Platt scaling (γ, τ) from memory, or α fallback ──
+        from pmm1.math.extremize import generalized_calibration
+        if self.memory and self.memory.is_calibrated:
+            gamma, tau = self.memory.get_optimal_gamma_tau()
+            p_calibrated = generalized_calibration(
+                p_challenged, gamma, tau,
+            )
+        else:
+            p_calibrated = extremize(
+                p_challenged, self.config.extremization_alpha,
+            )
 
         latency = (time.time() - start) * 1000
 
@@ -527,6 +621,11 @@ class LLMReasoner:
             "cycle_count": self._cycle_count,
             "total_calls": self._total_calls,
             "total_errors": self._total_errors,
+            "daily_cost_usd": round(self._daily_cost_usd, 2),
+            "daily_cost_cap_usd": self.config.daily_cost_cap_usd,
+            "cost_cap_hit": self._cost_cap_hit,
+            "circuit_open": self._circuit_open,
+            "consecutive_failures": self._consecutive_failures,
         }
         if self.memory:
             status["memory"] = self.memory.get_summary()
@@ -554,6 +653,29 @@ class LLMReasoner:
             try:
                 markets = self._get_priority_markets()
                 analyzed = 0
+
+                # Phase 2: cost cap — restrict to top-3 if hit
+                if self._cost_cap_hit:
+                    markets = markets[:3]
+                    logger.warning(
+                        "llm_cost_cap_hit",
+                        daily_cost_usd=round(
+                            self._daily_cost_usd, 2,
+                        ),
+                        cap=self.config.daily_cost_cap_usd,
+                        restricting_to=3,
+                    )
+                elif (
+                    self._daily_cost_usd
+                    >= self.config.daily_cost_cap_usd * 0.8
+                ):
+                    logger.warning(
+                        "llm_cost_cap_warning_80pct",
+                        daily_cost_usd=round(
+                            self._daily_cost_usd, 2,
+                        ),
+                        cap=self.config.daily_cost_cap_usd,
+                    )
 
                 for market in markets:
                     if not self._running:
@@ -756,13 +878,24 @@ class LLMReasoner:
         return self._session
 
     async def _call_opus(
-        self, user_prompt: str,
+        self,
+        user_prompt: str,
+        model: str | None = None,
     ) -> dict[str, Any]:
         """Call Anthropic Messages API with OAuth token."""
+        # Phase 3: Circuit breaker check
+        if self._circuit_open:
+            if time.time() < self._circuit_open_until:
+                raise RuntimeError("Circuit breaker open")
+            else:
+                self._circuit_open = False
+                self._consecutive_failures = 0
+                logger.info("llm_circuit_breaker_closed")
+
         session = await self._get_session()
 
         body: dict[str, Any] = {
-            "model": self.config.model,
+            "model": model or self.config.model,
             "max_tokens": self.config.max_tokens,
             "system": [
                 {
@@ -791,29 +924,53 @@ class LLMReasoner:
         timeout = aiohttp.ClientTimeout(
             total=self.config.per_market_timeout_s,
         )
-        async with session.post(
-            f"{_API_BASE}/messages",
-            headers=headers,
-            json=body,
-            timeout=timeout,
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
 
-        text = ""
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                text += block.get("text", "")
+        try:
+            async with session.post(
+                f"{_API_BASE}/messages",
+                headers=headers,
+                json=body,
+                timeout=timeout,
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
 
-        usage = data.get("usage", {})
-        return {
-            "text": text,
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-            "cache_hit": (
-                usage.get("cache_read_input_tokens", 0) > 0
-            ),
-        }
+            text = ""
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    text += block.get("text", "")
+
+            usage = data.get("usage", {})
+            result = {
+                "text": text,
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "cache_hit": (
+                    usage.get("cache_read_input_tokens", 0) > 0
+                ),
+            }
+
+            # On success: reset failure counter
+            self._consecutive_failures = 0
+            return result
+        except Exception:
+            self._consecutive_failures += 1
+            if (
+                self._consecutive_failures
+                >= self._MAX_CONSECUTIVE_FAILURES
+            ):
+                self._circuit_open = True
+                self._circuit_open_until = (
+                    time.time() + self._CIRCUIT_COOLDOWN_S
+                )
+                logger.critical(
+                    "llm_circuit_breaker_opened",
+                    consecutive_failures=(
+                        self._consecutive_failures
+                    ),
+                    cooldown_s=self._CIRCUIT_COOLDOWN_S,
+                )
+            raise
 
     def _parse_response(
         self, text: str,

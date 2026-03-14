@@ -1,6 +1,9 @@
 """Tests for embedded LLM reasoner with Paper 1+2 pipeline."""
 
 import time
+from unittest.mock import AsyncMock
+
+import pytest
 
 from pmm1.strategy.llm_reasoner import (
     LLMEstimate,
@@ -236,3 +239,291 @@ def test_set_bot_state():
     assert reasoner.bot_state is None
     reasoner.set_bot_state({"test": True})
     assert reasoner.bot_state is not None
+
+
+# ── Phase 2: Cost Controls ──
+
+
+def test_config_tiered_models_defaults():
+    """Config has tiered model defaults."""
+    config = ReasonerConfig()
+    assert config.blind_model == "claude-sonnet-4-6-20250514"
+    assert config.challenge_model == "claude-opus-4-6-20250610"
+    assert config.daily_cost_cap_usd == 50.0
+
+
+def test_config_tiered_models_from_env():
+    """Tiered models load from environment variables."""
+    import os
+
+    os.environ["PMM1_LLM_ENABLED"] = "true"
+    os.environ["ANTHROPIC_OAUTH_TOKEN"] = "sk-ant-oat01-test"
+    os.environ["PMM1_LLM_BLIND_MODEL"] = "claude-haiku-custom"
+    os.environ["PMM1_LLM_CHALLENGE_MODEL"] = "claude-opus-custom"
+    os.environ["PMM1_LLM_DAILY_COST_CAP"] = "25.0"
+
+    try:
+        config = ReasonerConfig.from_env()
+        assert config.blind_model == "claude-haiku-custom"
+        assert config.challenge_model == "claude-opus-custom"
+        assert config.daily_cost_cap_usd == 25.0
+    finally:
+        for key in [
+            "PMM1_LLM_ENABLED", "ANTHROPIC_OAUTH_TOKEN",
+            "PMM1_LLM_BLIND_MODEL", "PMM1_LLM_CHALLENGE_MODEL",
+            "PMM1_LLM_DAILY_COST_CAP",
+        ]:
+            os.environ.pop(key, None)
+
+
+def test_track_cost_accumulates():
+    """_track_cost accumulates daily spend."""
+    config = ReasonerConfig(enabled=True, auth_token="test")
+    reasoner = LLMReasoner(config)
+
+    assert reasoner._daily_cost_usd == 0.0
+    assert reasoner._daily_token_spend == 0
+
+    reasoner._track_cost(1000, 500)
+    assert reasoner._daily_token_spend == 1500
+    # 1000 * 15/1M + 500 * 75/1M = 0.015 + 0.0375 = 0.0525
+    assert abs(reasoner._daily_cost_usd - 0.0525) < 1e-6
+
+    reasoner._track_cost(2000, 1000)
+    assert reasoner._daily_token_spend == 4500
+    expected = 0.0525 + (2000 * 15 / 1e6 + 1000 * 75 / 1e6)
+    assert abs(reasoner._daily_cost_usd - expected) < 1e-6
+
+
+def test_track_cost_resets_after_24h():
+    """_track_cost resets counters after 24 hours."""
+    config = ReasonerConfig(enabled=True, auth_token="test")
+    reasoner = LLMReasoner(config)
+
+    reasoner._track_cost(10000, 5000)
+    assert reasoner._daily_token_spend == 15000
+    assert reasoner._daily_cost_usd > 0
+
+    # Simulate 25 hours passing
+    reasoner._cost_day_start = time.time() - 90000
+    reasoner._track_cost(100, 50)
+    # Should have reset and only counted new tokens
+    assert reasoner._daily_token_spend == 150
+
+
+def test_cost_cap_hit_property():
+    """_cost_cap_hit returns True when over cap."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        daily_cost_cap_usd=1.0,
+    )
+    reasoner = LLMReasoner(config)
+
+    assert not reasoner._cost_cap_hit
+    reasoner._daily_cost_usd = 0.99
+    assert not reasoner._cost_cap_hit
+    reasoner._daily_cost_usd = 1.0
+    assert reasoner._cost_cap_hit
+    reasoner._daily_cost_usd = 1.5
+    assert reasoner._cost_cap_hit
+
+
+def test_status_includes_cost_fields():
+    """get_status() includes cost and circuit breaker fields."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        daily_cost_cap_usd=50.0,
+    )
+    reasoner = LLMReasoner(config)
+    reasoner._daily_cost_usd = 12.345
+
+    status = reasoner.get_status()
+    assert status["daily_cost_usd"] == 12.35  # rounded
+    assert status["daily_cost_cap_usd"] == 50.0
+    assert status["cost_cap_hit"] is False
+    assert status["circuit_open"] is False
+    assert status["consecutive_failures"] == 0
+
+
+# ── Phase 3: Circuit Breaker ──
+
+
+def test_circuit_breaker_initial_state():
+    """Circuit breaker starts closed."""
+    config = ReasonerConfig(enabled=True, auth_token="test")
+    reasoner = LLMReasoner(config)
+
+    assert not reasoner._circuit_open
+    assert reasoner._consecutive_failures == 0
+    assert reasoner._circuit_open_until == 0.0
+
+
+def test_circuit_breaker_opens_after_max_failures():
+    """Circuit opens after _MAX_CONSECUTIVE_FAILURES."""
+    config = ReasonerConfig(enabled=True, auth_token="test")
+    reasoner = LLMReasoner(config)
+
+    # Simulate failures below threshold
+    reasoner._consecutive_failures = 4
+    assert not reasoner._circuit_open
+
+    # Trip it at threshold
+    reasoner._consecutive_failures = 5
+    reasoner._circuit_open = True
+    reasoner._circuit_open_until = time.time() + 900
+
+    assert reasoner._circuit_open
+
+    status = reasoner.get_status()
+    assert status["circuit_open"] is True
+    assert status["consecutive_failures"] == 5
+
+
+@pytest.mark.asyncio
+async def test_call_opus_rejects_when_circuit_open():
+    """_call_opus raises when circuit is open."""
+    config = ReasonerConfig(enabled=True, auth_token="test")
+    reasoner = LLMReasoner(config)
+
+    reasoner._circuit_open = True
+    reasoner._circuit_open_until = time.time() + 900
+
+    with pytest.raises(RuntimeError, match="Circuit breaker open"):
+        await reasoner._call_opus("test prompt")
+
+
+@pytest.mark.asyncio
+async def test_call_opus_resets_circuit_after_cooldown():
+    """Circuit closes after cooldown expires."""
+    config = ReasonerConfig(enabled=True, auth_token="test")
+    reasoner = LLMReasoner(config)
+
+    reasoner._circuit_open = True
+    reasoner._consecutive_failures = 5
+    # Set cooldown to already expired
+    reasoner._circuit_open_until = time.time() - 1
+
+    # The circuit should close, but the actual API call will fail
+    # (no real API). The important thing is it doesn't raise
+    # RuntimeError("Circuit breaker open").
+    with pytest.raises(Exception) as exc_info:
+        await reasoner._call_opus("test prompt")
+    # Should NOT be the circuit breaker error
+    assert "Circuit breaker open" not in str(exc_info.value)
+    # Circuit should now be closed (reset happened before API call)
+    # But consecutive_failures increments due to API error
+    assert not reasoner._circuit_open or (
+        reasoner._consecutive_failures
+        >= LLMReasoner._MAX_CONSECUTIVE_FAILURES
+    )
+
+
+@pytest.mark.asyncio
+async def test_call_opus_increments_failures():
+    """Each failed _call_opus increments consecutive_failures."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        per_market_timeout_s=1.0,
+    )
+    reasoner = LLMReasoner(config)
+
+    assert reasoner._consecutive_failures == 0
+
+    for i in range(1, 4):
+        with pytest.raises(Exception):
+            await reasoner._call_opus("test")
+        assert reasoner._consecutive_failures == i
+        assert not reasoner._circuit_open  # under threshold
+
+
+@pytest.mark.asyncio
+async def test_call_opus_opens_circuit_at_threshold():
+    """Circuit opens on the 5th consecutive failure."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        per_market_timeout_s=1.0,
+    )
+    reasoner = LLMReasoner(config)
+
+    for i in range(5):
+        with pytest.raises(Exception):
+            await reasoner._call_opus("test")
+
+    assert reasoner._circuit_open
+    assert reasoner._consecutive_failures == 5
+    assert reasoner._circuit_open_until > time.time()
+
+
+@pytest.mark.asyncio
+async def test_call_opus_resets_failures_on_success():
+    """Successful call resets consecutive_failures to 0."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        per_market_timeout_s=5.0,
+    )
+    reasoner = LLMReasoner(config)
+    reasoner._consecutive_failures = 3
+
+    # Mock a successful API response
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = lambda: None
+    mock_resp.json = AsyncMock(return_value={
+        "content": [{"type": "text", "text": "{}"}],
+        "usage": {"input_tokens": 100, "output_tokens": 50},
+    })
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = AsyncMock()
+    mock_session.post = lambda *a, **kw: mock_resp
+    mock_session.closed = False
+    reasoner._session = mock_session
+
+    result = await reasoner._call_opus("test")
+    assert reasoner._consecutive_failures == 0
+    assert result["text"] == "{}"
+
+
+@pytest.mark.asyncio
+async def test_call_opus_uses_model_parameter():
+    """_call_opus uses the model parameter when provided."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        model="default-model",
+    )
+    reasoner = LLMReasoner(config)
+
+    captured_body = {}
+
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = lambda: None
+    mock_resp.json = AsyncMock(return_value={
+        "content": [{"type": "text", "text": "{}"}],
+        "usage": {"input_tokens": 100, "output_tokens": 50},
+    })
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    def capture_post(*args, **kwargs):
+        captured_body.update(kwargs.get("json", {}))
+        return mock_resp
+
+    mock_session = AsyncMock()
+    mock_session.post = capture_post
+    mock_session.closed = False
+    reasoner._session = mock_session
+
+    # With explicit model
+    await reasoner._call_opus("test", model="custom-model")
+    assert captured_body["model"] == "custom-model"
+
+    # Without model (should use default)
+    captured_body.clear()
+    await reasoner._call_opus("test")
+    assert captured_body["model"] == "default-model"
+
+
+def test_class_level_circuit_constants():
+    """Circuit breaker constants are class-level."""
+    assert LLMReasoner._MAX_CONSECUTIVE_FAILURES == 5
+    assert LLMReasoner._CIRCUIT_COOLDOWN_S == 900.0

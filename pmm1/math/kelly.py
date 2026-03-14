@@ -124,6 +124,7 @@ def kelly_bet_dollars(
     nav: float,
     lambda_frac: float = 0.25,
     adverse_selection_lambda: float = 1.0,
+    adverse_selection_cost: float = 0.0,
     min_edge: float = 0.03,
     max_position_nav: float = 0.05,
 ) -> tuple[str, float]:
@@ -132,13 +133,24 @@ def kelly_bet_dollars(
     Applies adverse selection discount, minimum edge filter,
     fractional Kelly, and position cap.
 
+    Adverse selection can be applied two ways:
+    - adverse_selection_cost: absolute cost in probability units
+      (subtracted from edge — preferred, per quant audit)
+    - adverse_selection_lambda: multiplicative discount
+      (multiplied with edge — legacy, default 1.0 = no effect)
+
+    When using the LLM blend (67/33 market/AI), the blend itself
+    is the adverse selection discount. Set lambda=1.0 and cost=0.0.
+
     Args:
         p_true: Believed true probability.
         p_market: Market price.
         nav: Current net asset value (bankroll).
         lambda_frac: Kelly fraction (default 0.25 = quarter-Kelly).
-        adverse_selection_lambda: Edge discount for adverse selection
-            (0.4 = keep 40% of raw edge, per Paper 2 §2).
+        adverse_selection_lambda: Multiplicative edge discount
+            (1.0 = no discount, since blend handles it).
+        adverse_selection_cost: Absolute AS cost to subtract from
+            edge (e.g., trailing 5s markout in probability units).
         min_edge: Minimum adjusted edge to trade (default 3%).
         max_position_nav: Maximum position as fraction of NAV.
 
@@ -146,7 +158,8 @@ def kelly_bet_dollars(
         (side, dollar_amount) — dollar_amount is 0 if below min_edge.
     """
     raw_edge = abs(p_true - p_market)
-    adj_edge = raw_edge * adverse_selection_lambda
+    adj_edge = raw_edge * adverse_selection_lambda - adverse_selection_cost
+    adj_edge = max(0.0, adj_edge)
 
     if adj_edge < min_edge:
         return ("NO_TRADE", 0.0)

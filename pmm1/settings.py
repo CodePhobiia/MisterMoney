@@ -96,7 +96,7 @@ class PricingConfig(BaseModel):
     kelly_fraction: float = 0.25  # quarter-Kelly default
     kelly_min_edge: float = 0.03  # 3% minimum edge to size
     kelly_max_position_nav: float = 0.05  # 5% max per position
-    kelly_adverse_selection_lambda: float = 0.4  # edge discount
+    kelly_adverse_selection_lambda: float = 1.0  # 1.0 = blend handles AS
     # Fill model coefficients
     theta_0: float = -1.0
     theta_1: float = 5.0

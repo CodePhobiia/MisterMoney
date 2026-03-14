@@ -16,7 +16,7 @@ from typing import Any
 
 import structlog
 
-from pmm1.math.extremize import fit_alpha
+from pmm1.math.extremize import fit_alpha, fit_gamma_tau
 from pmm1.math.validation import brier_score
 
 logger = structlog.get_logger(__name__)
@@ -149,13 +149,11 @@ class ReasonerMemory:
     def get_optimal_alpha(self) -> float:
         """Fit extremization alpha from resolved data.
 
-        Returns 1.73 (Paper 2 default) if insufficient data.
+        Returns 1.3 (single-model default) if insufficient data.
         """
         if len(self._resolved) < self.min_for_calibration:
-            return 1.73
+            return 1.3
 
-        # Use the challenged (pre-extremization) probabilities
-        # to find what alpha would have minimized Brier
         probs = [e.p_challenged for e in self._resolved]
         outcomes = [e.actual_outcome for e in self._resolved]
 
@@ -168,6 +166,34 @@ class ReasonerMemory:
             brier_current=round(self.get_brier(), 4),
         )
         return alpha
+
+    def get_optimal_gamma_tau(self) -> tuple[float, float]:
+        """Fit two-parameter Platt scaling from resolved data.
+
+        Returns (γ, τ) where:
+        - γ corrects spread (like extremization α)
+        - τ corrects directional bias
+
+        This is strictly more expressive than scalar alpha.
+        Uses log-loss (not Brier) because log-loss directly
+        predicts Kelly growth rate.
+        """
+        if len(self._resolved) < self.min_for_calibration:
+            return (1.3, 0.0)
+
+        probs = [e.p_challenged for e in self._resolved]
+        outcomes = [e.actual_outcome for e in self._resolved]
+
+        gamma, tau = fit_gamma_tau(probs, outcomes)
+
+        logger.info(
+            "reasoner_gamma_tau_fitted",
+            gamma=round(gamma, 3),
+            tau=round(tau, 3),
+            n_resolved=len(self._resolved),
+            brier_current=round(self.get_brier(), 4),
+        )
+        return (gamma, tau)
 
     def format_for_prompt(self) -> str:
         """Format calibration history as prompt context.
