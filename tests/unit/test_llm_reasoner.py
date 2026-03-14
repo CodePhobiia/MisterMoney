@@ -611,11 +611,14 @@ async def test_blind_pass_excludes_price_context():
     reasoner = LLMReasoner(config)
 
     captured_prompts: list[str] = []
+    call_count = 0
 
     async def mock_call_opus(prompt, model=None):
+        nonlocal call_count
+        call_count += 1
         captured_prompts.append(prompt)
-        if len(captured_prompts) == 1:
-            # Blind pass response
+        if call_count <= 3:
+            # Blind pass responses (3 samples)
             return {
                 "text": '{"p_hat": 0.55, "uncertainty": 0.15, '
                         '"reasoning_summary": "test", '
@@ -644,9 +647,10 @@ async def test_blind_pass_excludes_price_context():
                           "CROSS-MARKET CONTEXT:\nrelated=0.60",
     )
 
-    assert len(captured_prompts) >= 2
+    # 3 blind samples + 1 challenge = 4 calls
+    assert len(captured_prompts) >= 4
     blind_prompt = captured_prompts[0]
-    challenge_prompt = captured_prompts[1]
+    challenge_prompt = captured_prompts[3]
 
     # Blind prompt should NOT contain price data
     assert "PRICE HISTORY" not in blind_prompt
@@ -739,3 +743,295 @@ async def test_circuit_breaker_ignores_permanent_errors():
     # Failure count should NOT have incremented
     assert reasoner._consecutive_failures == 0
     assert not reasoner._circuit_open
+
+
+# ── Phase 4A: Multi-Sample Blind Pass + Evidence Extraction ──
+
+
+def _make_blind_response(
+    p_hat: float,
+    uncertainty: float = 0.15,
+    reasoning: str = "reasoning",
+    contra: str = "contra",
+    key_evidence: list[str] | None = None,
+    risk_flags: list[str] | None = None,
+) -> dict:
+    """Helper to build a mock blind pass API response."""
+    import json
+
+    payload = {
+        "p_hat": p_hat,
+        "uncertainty": uncertainty,
+        "reasoning_summary": reasoning,
+        "contra_argument": contra,
+        "key_evidence": key_evidence or [],
+        "risk_flags": risk_flags or [],
+    }
+    return {
+        "text": json.dumps(payload),
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cache_hit": False,
+    }
+
+
+def _make_challenge_response(
+    p_hat_final: float = 0.60,
+    uncertainty: float = 0.12,
+) -> dict:
+    """Helper to build a mock challenge pass API response."""
+    import json
+
+    payload = {
+        "p_hat_final": p_hat_final,
+        "uncertainty": uncertainty,
+    }
+    return {
+        "text": json.dumps(payload),
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cache_hit": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_multi_sample_aggregation():
+    """LLM-01: 3 blind samples are aggregated via trimmed mean."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        per_market_timeout_s=5.0,
+    )
+    reasoner = LLMReasoner(config)
+
+    call_count = 0
+    # Three different blind p_hat values
+    blind_responses = [
+        _make_blind_response(p_hat=0.40),
+        _make_blind_response(p_hat=0.50),
+        _make_blind_response(p_hat=0.60),
+    ]
+
+    async def mock_call_opus(prompt, model=None):
+        nonlocal call_count
+        idx = call_count
+        call_count += 1
+        if idx < 3:
+            return blind_responses[idx]
+        return _make_challenge_response()
+
+    reasoner._call_opus = mock_call_opus
+
+    est = await reasoner.analyze_market(
+        condition_id="agg_test",
+        question="Will X happen?",
+        midpoint=0.50,
+    )
+    assert est is not None
+    # Trimmed mean of [0.40, 0.50, 0.60]: drop min/max → [0.50]
+    # log_pool([0.50]) = 0.50
+    assert abs(est.p_blind - 0.50) < 0.01
+    assert est.n_blind_samples == 3
+    assert abs(est.blind_sample_spread - 0.20) < 0.01
+
+
+@pytest.mark.asyncio
+async def test_empirical_uncertainty():
+    """LLM-03: High sample spread → high empirical uncertainty."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        per_market_timeout_s=5.0,
+    )
+    reasoner = LLMReasoner(config)
+
+    call_count = 0
+    # Wide-spread blind samples → high empirical uncertainty
+    blind_responses = [
+        _make_blind_response(p_hat=0.20),
+        _make_blind_response(p_hat=0.50),
+        _make_blind_response(p_hat=0.80),
+    ]
+
+    async def mock_call_opus(prompt, model=None):
+        nonlocal call_count
+        idx = call_count
+        call_count += 1
+        if idx < 3:
+            return blind_responses[idx]
+        return _make_challenge_response()
+
+    reasoner._call_opus = mock_call_opus
+
+    est = await reasoner.analyze_market(
+        condition_id="unc_test",
+        question="Will Y happen?",
+        midpoint=0.50,
+    )
+    assert est is not None
+    # With samples [0.20, 0.50, 0.80], spread is huge
+    # Empirical uncertainty should be meaningfully > 0
+    assert est.blind_sample_spread == pytest.approx(0.60, abs=0.01)
+
+    # Now test with tight spread (low uncertainty)
+    call_count2 = 0
+    tight_responses = [
+        _make_blind_response(p_hat=0.49),
+        _make_blind_response(p_hat=0.50),
+        _make_blind_response(p_hat=0.51),
+    ]
+
+    async def mock_call_tight(prompt, model=None):
+        nonlocal call_count2
+        idx = call_count2
+        call_count2 += 1
+        if idx < 3:
+            return tight_responses[idx]
+        return _make_challenge_response()
+
+    reasoner2 = LLMReasoner(config)
+    reasoner2._call_opus = mock_call_tight
+
+    est2 = await reasoner2.analyze_market(
+        condition_id="unc_test2",
+        question="Will Z happen?",
+        midpoint=0.50,
+    )
+    assert est2 is not None
+    # Tight spread should have lower uncertainty than wide spread
+    assert est2.blind_sample_spread < est.blind_sample_spread
+
+
+@pytest.mark.asyncio
+async def test_evidence_extraction():
+    """LLM-06: key_evidence and risk_flags stored on estimate."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        per_market_timeout_s=5.0,
+    )
+    reasoner = LLMReasoner(config)
+
+    call_count = 0
+    blind_responses = [
+        _make_blind_response(
+            p_hat=0.55,
+            key_evidence=["polls show 55%", "historical trend"],
+            risk_flags=["low sample size"],
+        ),
+        _make_blind_response(
+            p_hat=0.57,
+            key_evidence=["polls show 55%", "expert consensus"],
+            risk_flags=["low sample size", "recency bias"],
+        ),
+        _make_blind_response(
+            p_hat=0.56,
+            key_evidence=["economic indicators"],
+            risk_flags=[],
+        ),
+    ]
+
+    async def mock_call_opus(prompt, model=None):
+        nonlocal call_count
+        idx = call_count
+        call_count += 1
+        if idx < 3:
+            return blind_responses[idx]
+        return _make_challenge_response()
+
+    reasoner._call_opus = mock_call_opus
+
+    est = await reasoner.analyze_market(
+        condition_id="ev_test",
+        question="Will A happen?",
+        midpoint=0.50,
+    )
+    assert est is not None
+    # Evidence should be deduplicated and aggregated
+    assert "polls show 55%" in est.key_evidence
+    assert "historical trend" in est.key_evidence
+    assert "expert consensus" in est.key_evidence
+    assert "economic indicators" in est.key_evidence
+    assert len(est.key_evidence) == 4
+
+    # Risk flags should be deduplicated
+    assert "low sample size" in est.risk_flags
+    assert "recency bias" in est.risk_flags
+    assert len(est.risk_flags) == 2
+
+
+@pytest.mark.asyncio
+async def test_single_sample_fallback():
+    """When only 1 blind sample succeeds, should still work."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        per_market_timeout_s=5.0,
+    )
+    reasoner = LLMReasoner(config)
+
+    call_count = 0
+
+    async def mock_call_opus(prompt, model=None):
+        nonlocal call_count
+        idx = call_count
+        call_count += 1
+        if idx == 0:
+            # First sample succeeds
+            return _make_blind_response(
+                p_hat=0.65, uncertainty=0.20,
+            )
+        elif idx < 3:
+            # Samples 2 and 3 fail (return None = permanent error)
+            return None
+        else:
+            return _make_challenge_response()
+
+    reasoner._call_opus = mock_call_opus
+
+    est = await reasoner.analyze_market(
+        condition_id="single_test",
+        question="Will B happen?",
+        midpoint=0.50,
+    )
+    assert est is not None
+    assert est.n_blind_samples == 1
+    assert est.blind_sample_spread == 0.0
+    # Single sample: use self-reported uncertainty, not empirical
+    assert abs(est.p_blind - 0.65) < 0.02
+
+
+@pytest.mark.asyncio
+async def test_blind_sample_failure_resilience():
+    """One sample fails out of 3 → still produces estimate from 2."""
+    config = ReasonerConfig(
+        enabled=True, auth_token="test",
+        per_market_timeout_s=5.0,
+    )
+    reasoner = LLMReasoner(config)
+
+    call_count = 0
+
+    async def mock_call_opus(prompt, model=None):
+        nonlocal call_count
+        idx = call_count
+        call_count += 1
+        if idx == 0:
+            return _make_blind_response(p_hat=0.55)
+        elif idx == 1:
+            # Second sample fails with exception
+            raise ConnectionError("network failure")
+        elif idx == 2:
+            return _make_blind_response(p_hat=0.65)
+        else:
+            return _make_challenge_response()
+
+    reasoner._call_opus = mock_call_opus
+
+    est = await reasoner.analyze_market(
+        condition_id="resilient_test",
+        question="Will C happen?",
+        midpoint=0.50,
+    )
+    assert est is not None
+    assert est.n_blind_samples == 2
+    # With 2 samples, no trimming — log_pool([0.55, 0.65])
+    assert 0.55 <= est.p_blind <= 0.65
+    # Spread = 0.65 - 0.55 = 0.10
+    assert abs(est.blind_sample_spread - 0.10) < 0.01

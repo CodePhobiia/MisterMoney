@@ -1,5 +1,7 @@
 """Tests for NewsFetcher."""
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 from pmm1.strategy.news_fetcher import NewsFetcher
@@ -127,3 +129,125 @@ def test_filter_catches_trader_expectations():
     text = "Traders expect a breakout by end of month."
     filtered = fetcher._filter_price_leaks(text)
     assert "[market reference removed]" in filtered
+
+
+# --- LLM-05: Enhanced price-leak pattern tests ---
+
+
+def test_poll_numbers_filtered():
+    """Poll numbers with vs/to format are filtered."""
+    fetcher = NewsFetcher()
+    text = "Trump leads Biden 52% to 48% in latest poll"
+    filtered = fetcher._filter_price_leaks(text)
+    assert "52%" not in filtered
+    assert "[market reference removed]" in filtered
+
+
+def test_odds_terminology_filtered():
+    """Sports odds terminology is filtered."""
+    fetcher = NewsFetcher()
+    text = "Biden is the odds-on favorite"
+    filtered = fetcher._filter_price_leaks(text)
+    assert "odds-on" not in filtered
+    assert "[market reference removed]" in filtered
+
+
+def test_expected_to_win_filtered():
+    """'Expected to win' framing is filtered."""
+    fetcher = NewsFetcher()
+    text = "Democrats are expected to win the Senate"
+    filtered = fetcher._filter_price_leaks(text)
+    assert "expected to win" not in filtered
+    assert "[market reference removed]" in filtered
+
+
+def test_projected_at_filtered():
+    """'Projected at X%' statements are filtered."""
+    fetcher = NewsFetcher()
+    text = "GDP growth projected at 3.2%"
+    filtered = fetcher._filter_price_leaks(text)
+    assert "projected at" not in filtered
+    assert "[market reference removed]" in filtered
+
+
+def test_consensus_filtered():
+    """Implicit consensus/aggregate poll references are filtered."""
+    fetcher = NewsFetcher()
+    text = "Most polls show a tight race"
+    filtered = fetcher._filter_price_leaks(text)
+    assert "Most polls show" not in filtered
+    assert "[market reference removed]" in filtered
+
+
+def test_paranoid_mode_strips_all_pct():
+    """Paranoid mode strips ALL numeric percentages."""
+    fetcher = NewsFetcher()
+    text = "Inflation at 3.5% is concerning for investors."
+    filtered = fetcher._filter_price_leaks(text, paranoid=True)
+    assert "3.5%" not in filtered
+    assert "[number removed]" in filtered
+
+
+def test_paranoid_mode_off_keeps_pct():
+    """Without paranoid mode, plain percentages are preserved."""
+    fetcher = NewsFetcher()
+    text = "Inflation at 3.5% is concerning for investors."
+    filtered = fetcher._filter_price_leaks(text, paranoid=False)
+    assert "3.5%" in filtered
+
+
+# --- LLM-12: Category-aware news tests ---
+
+
+@pytest.mark.asyncio
+async def test_category_finance_max_words():
+    """Category 'finance' increases max_words to 400."""
+    fetcher = NewsFetcher(backend="perplexity", api_key="test-key")
+    with patch.object(
+        fetcher, "_fetch_perplexity", new_callable=AsyncMock,
+        return_value="some news",
+    ) as mock_fetch:
+        await fetcher.fetch_context(
+            "Will the Fed raise rates?",
+            max_words=200,
+            category="finance",
+        )
+        mock_fetch.assert_called_once()
+        # max_words should have been boosted to 400
+        assert mock_fetch.call_args[0][1] == 400
+
+
+@pytest.mark.asyncio
+async def test_category_entertainment_reduced():
+    """Category 'entertainment' reduces max_words to 100."""
+    fetcher = NewsFetcher(backend="perplexity", api_key="test-key")
+    with patch.object(
+        fetcher, "_fetch_perplexity", new_callable=AsyncMock,
+        return_value="some news",
+    ) as mock_fetch:
+        await fetcher.fetch_context(
+            "Will Taylor Swift win a Grammy?",
+            max_words=200,
+            category="entertainment",
+        )
+        mock_fetch.assert_called_once()
+        # max_words should have been reduced to 100
+        assert mock_fetch.call_args[0][1] == 100
+
+
+@pytest.mark.asyncio
+async def test_category_empty_default():
+    """No category leaves max_words unchanged at default."""
+    fetcher = NewsFetcher(backend="perplexity", api_key="test-key")
+    with patch.object(
+        fetcher, "_fetch_perplexity", new_callable=AsyncMock,
+        return_value="some news",
+    ) as mock_fetch:
+        await fetcher.fetch_context(
+            "Will it rain tomorrow?",
+            max_words=200,
+            category="",
+        )
+        mock_fetch.assert_called_once()
+        # max_words should remain 200
+        assert mock_fetch.call_args[0][1] == 200

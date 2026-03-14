@@ -9,6 +9,7 @@ the extremization parameter.
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +17,12 @@ from typing import Any
 
 import structlog
 
-from pmm1.math.extremize import fit_alpha, fit_gamma_tau
+from pmm1.math.extremize import (
+    apply_isotonic,
+    fit_alpha,
+    fit_gamma_tau,
+    fit_isotonic,
+)
 from pmm1.math.validation import brier_score
 
 logger = structlog.get_logger(__name__)
@@ -34,6 +40,7 @@ class ResolvedEstimate:
     category: str = ""
     resolved_at: float = field(default_factory=time.time)
     p_ensemble: float = 0.0
+    forecast_to_resolution_hours: float = 0.0
 
     @property
     def brier(self) -> float:
@@ -75,6 +82,7 @@ class ReasonerMemory:
         uncertainty: float,
         category: str = "",
         p_ensemble: float = 0.0,
+        forecast_to_resolution_hours: float = 0.0,
     ) -> None:
         """Record a resolved market for calibration tracking."""
         est = ResolvedEstimate(
@@ -86,6 +94,7 @@ class ReasonerMemory:
             actual_outcome=actual_outcome,
             category=category,
             p_ensemble=p_ensemble,
+            forecast_to_resolution_hours=forecast_to_resolution_hours,
         )
         self._resolved.append(est)
 
@@ -170,8 +179,10 @@ class ReasonerMemory:
         )
         return alpha
 
-    def get_optimal_gamma_tau(self) -> tuple[float, float]:
-        """Fit two-parameter Platt scaling from resolved data.
+    def get_optimal_gamma_tau(
+        self, category: str = "",
+    ) -> tuple[float, float]:
+        """Fit two-parameter Platt scaling from resolved data (LLM-02).
 
         Returns (γ, τ) where:
         - γ corrects spread (like extremization α)
@@ -180,14 +191,50 @@ class ReasonerMemory:
         This is strictly more expressive than scalar alpha.
         Uses log-loss (not Brier) because log-loss directly
         predicts Kelly growth rate.
+
+        When *category* is provided, tries a per-category fit first
+        (threshold: 50 samples).  Falls back to global fit otherwise.
+
+        Time-decay weighting (LLM-10): recent resolutions matter more
+        (half-life ~70 days).  Resolution-time weighting (LLM-07):
+        predictions closer to resolution matter more.
         """
+        # --- LLM-02: Try category-specific fit first ----------------------
+        if category:
+            cat_resolved = [
+                e for e in self._resolved if e.category == category
+            ]
+            if len(cat_resolved) >= 50:
+                probs = [
+                    e.p_ensemble if e.p_ensemble > 0 else e.p_challenged
+                    for e in cat_resolved
+                ]
+                outcomes = [e.actual_outcome for e in cat_resolved]
+                weights = self._compute_weights(cat_resolved)
+                gamma, tau = fit_gamma_tau(
+                    probs, outcomes, weights=weights,
+                )
+                logger.info(
+                    "category_gamma_tau_fitted",
+                    category=category,
+                    gamma=round(gamma, 3),
+                    tau=round(tau, 3),
+                    n=len(cat_resolved),
+                )
+                return (gamma, tau)
+
+        # --- Fall back to global fit (existing behaviour) ------------------
         if len(self._resolved) < self.min_for_calibration:
             return (1.3, 0.0)
 
-        probs = [e.p_ensemble if e.p_ensemble > 0 else e.p_challenged for e in self._resolved]
+        probs = [
+            e.p_ensemble if e.p_ensemble > 0 else e.p_challenged
+            for e in self._resolved
+        ]
         outcomes = [e.actual_outcome for e in self._resolved]
+        weights = self._compute_weights(self._resolved)
 
-        gamma, tau = fit_gamma_tau(probs, outcomes)
+        gamma, tau = fit_gamma_tau(probs, outcomes, weights=weights)
 
         logger.info(
             "reasoner_gamma_tau_fitted",
@@ -197,6 +244,131 @@ class ReasonerMemory:
             brier_current=round(self.get_brier(), 4),
         )
         return (gamma, tau)
+
+    # ------------------------------------------------------------------
+    # LLM-02: Category-aware blend weight
+    # ------------------------------------------------------------------
+
+    def get_category_blend_weight(self, category: str) -> float:
+        """Suggested LLM blend weight per category (LLM-02).
+
+        Based on per-category Brier skill score:
+        - High skill (politics): higher blend weight
+        - Low skill (economics): lower blend weight
+        """
+        cat_brier = self.get_brier_by_category()
+        if category not in cat_brier:
+            return 0.33  # Default blend weight
+
+        # Compare to overall Brier
+        overall = self.get_brier()
+        cat_b = cat_brier[category]
+
+        # Better than average -> higher weight, worse -> lower weight
+        if overall > 0:
+            skill_ratio = 1.0 - cat_b / overall  # Positive = better
+            return max(0.10, min(0.50, 0.33 + skill_ratio * 0.17))
+        return 0.33
+
+    # ------------------------------------------------------------------
+    # LLM-04: Adaptive extremization by diversity
+    # ------------------------------------------------------------------
+
+    def get_diversity_adjusted_alpha(
+        self,
+        base_alpha: float = 1.3,
+        diversity: float = 0.0,
+    ) -> float:
+        """Adjust extremization based on ensemble diversity (LLM-04).
+
+        Higher diversity (models disagree) -> higher alpha (extremize more).
+        alpha_eff = 1.0 + diversity_ratio * (base_alpha - 1.0)
+        """
+        max_diversity = 0.15  # Normalize diversity to [0, 1]
+        diversity_ratio = min(1.0, diversity / max_diversity)
+        return 1.0 + diversity_ratio * (base_alpha - 1.0)
+
+    # ------------------------------------------------------------------
+    # LLM-09: Isotonic vs Platt calibrator selection
+    # ------------------------------------------------------------------
+
+    def _best_calibrator(self) -> str:
+        """Choose between Platt and isotonic based on held-out Brier.
+
+        When > 1000 resolved samples are available, compare Platt vs
+        isotonic on the last 200 held-out samples.  Otherwise default
+        to Platt which is more stable at smaller sample sizes.
+        """
+        if len(self._resolved) < 1000:
+            return "platt"
+
+        # Train on all but last 200, evaluate on last 200
+        train = self._resolved[:-200]
+        holdout = self._resolved[-200:]
+
+        train_probs = [
+            e.p_ensemble if e.p_ensemble > 0 else e.p_challenged
+            for e in train
+        ]
+        train_outcomes = [e.actual_outcome for e in train]
+
+        ho_probs = [
+            e.p_ensemble if e.p_ensemble > 0 else e.p_challenged
+            for e in holdout
+        ]
+        ho_outcomes = [e.actual_outcome for e in holdout]
+
+        # Platt on holdout
+        gamma, tau = fit_gamma_tau(train_probs, train_outcomes)
+        from pmm1.math.extremize import generalized_calibration
+        platt_preds = [
+            generalized_calibration(p, gamma, tau) for p in ho_probs
+        ]
+        platt_brier = brier_score(platt_preds, ho_outcomes)
+
+        # Isotonic on holdout
+        lookup = fit_isotonic(train_probs, train_outcomes)
+        iso_preds = [apply_isotonic(p, lookup) for p in ho_probs]
+        iso_brier = brier_score(iso_preds, ho_outcomes)
+
+        logger.info(
+            "calibrator_comparison",
+            platt_brier=round(platt_brier, 4),
+            isotonic_brier=round(iso_brier, 4),
+            n_train=len(train),
+            n_holdout=len(holdout),
+        )
+
+        return "isotonic" if iso_brier < platt_brier else "platt"
+
+    # ------------------------------------------------------------------
+    # LLM-07 / LLM-10: Time-decay and resolution-time weights
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_weights(
+        resolved: list[ResolvedEstimate],
+    ) -> list[float]:
+        """Compute per-sample weights combining time-decay (LLM-10)
+        and resolution-time proximity (LLM-07).
+
+        Time-decay: exp(-0.01 * age_days)  (half-life ~70 days)
+        Resolution proximity: 1 / (1 + hours/168)  (weekly decay)
+        """
+        now = time.time()
+        weights: list[float] = []
+        for e in resolved:
+            # LLM-10: time-decay — recent resolutions matter more
+            age_days = (now - e.resolved_at) / 86400.0
+            w_time = math.exp(-0.01 * age_days)
+
+            # LLM-07: closer forecasts (small forecast_to_resolution_hours)
+            # matter more
+            hrs = max(0.0, e.forecast_to_resolution_hours)
+            w_resolution = 1.0 / (1.0 + hrs / 168.0)
+
+            weights.append(w_time * w_resolution)
+        return weights
 
     def format_for_prompt(self) -> str:
         """Format calibration history as prompt context.
@@ -306,6 +478,7 @@ class ReasonerMemory:
                     "category": e.category,
                     "resolved_at": e.resolved_at,
                     "p_ensemble": e.p_ensemble,
+                    "forecast_to_resolution_hours": e.forecast_to_resolution_hours,
                 }
                 for e in self._resolved[-5000:]  # Keep recent
             ]

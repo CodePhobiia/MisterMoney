@@ -149,6 +149,7 @@ def fit_gamma_tau(
     gamma_bounds: tuple[float, float] = (0.5, 3.0),
     tau_bounds: tuple[float, float] = (-1.0, 1.0),
     n_steps: int = 50,
+    weights: list[float] | None = None,
 ) -> tuple[float, float]:
     """Fit two-parameter Platt scaling (γ, τ) by minimizing log-loss.
 
@@ -157,12 +158,16 @@ def fit_gamma_tau(
     Uses log-loss (not Brier) because log-loss directly predicts
     Kelly growth rate (mathematician audit finding M7).
 
+    When *weights* are provided (LLM-10), each sample's loss is
+    multiplied by its weight in the grid search.
+
     Args:
         probs: Raw predicted probabilities.
         outcomes: Actual outcomes (0 or 1).
         gamma_bounds: Search range for γ.
         tau_bounds: Search range for τ.
         n_steps: Grid resolution per dimension.
+        weights: Optional per-sample weights (e.g. time-decay).
 
     Returns:
         (gamma, tau) tuple.
@@ -170,16 +175,22 @@ def fit_gamma_tau(
     if not probs or not outcomes or len(probs) != len(outcomes):
         return (1.3, 0.0)
 
+    w = weights if weights is not None else [1.0] * len(probs)
+    w_sum = sum(w)
+    if w_sum <= 0:
+        w = [1.0] * len(probs)
+        w_sum = float(len(probs))
+
     def log_loss_at(g: float, t: float) -> float:
         total = 0.0
-        for p, o in zip(probs, outcomes):
+        for p, o, wi in zip(probs, outcomes, w):
             p_cal = generalized_calibration(p, g, t)
             p_cal = max(1e-10, min(1.0 - 1e-10, p_cal))
             if o > 0.5:
-                total -= math.log(p_cal)
+                total -= wi * math.log(p_cal)
             else:
-                total -= math.log(1.0 - p_cal)
-        return total / len(probs)
+                total -= wi * math.log(1.0 - p_cal)
+        return total / w_sum
 
     # L2 regularization: penalize departure from identity (gamma=1, tau=0)
     lambda_reg = 0.01
@@ -227,3 +238,82 @@ def fit_gamma_tau(
         g += fine_g
 
     return (round(best_gamma, 4), round(best_tau, 4))
+
+
+# ---------------------------------------------------------------------------
+# LLM-09: Isotonic regression calibration (Pool Adjacent Violators)
+# ---------------------------------------------------------------------------
+
+
+def fit_isotonic(
+    probs: list[float],
+    outcomes: list[float],
+) -> list[tuple[float, float]]:
+    """Pool Adjacent Violators (PAV) isotonic regression.
+
+    Returns sorted list of (threshold, calibrated_value) pairs.
+    When n > 1000, this may outperform Platt scaling at extremes.
+    """
+    n = len(probs)
+    if n == 0:
+        return [(0.0, 0.0), (1.0, 1.0)]
+
+    # Sort by predicted probability
+    pairs = sorted(zip(probs, outcomes))
+    result = [o for _, o in pairs]
+    weights_pav = [1.0] * n
+
+    # PAV algorithm
+    i = 0
+    while i < n - 1:
+        if result[i] > result[i + 1]:
+            # Pool: merge i and i+1
+            w = weights_pav[i] + weights_pav[i + 1]
+            val = (
+                weights_pav[i] * result[i]
+                + weights_pav[i + 1] * result[i + 1]
+            ) / w
+            result[i] = val
+            result[i + 1] = val
+            weights_pav[i] = w
+            weights_pav[i + 1] = w
+            # Check backward
+            while i > 0 and result[i - 1] > result[i]:
+                w = weights_pav[i - 1] + weights_pav[i]
+                val = (
+                    weights_pav[i - 1] * result[i - 1]
+                    + weights_pav[i] * result[i]
+                ) / w
+                result[i - 1] = val
+                result[i] = val
+                weights_pav[i - 1] = w
+                weights_pav[i] = w
+                i -= 1
+        i += 1
+
+    # Build lookup table
+    lookup: list[tuple[float, float]] = []
+    for idx, (p, _) in enumerate(pairs):
+        lookup.append((p, result[idx]))
+
+    return lookup
+
+
+def apply_isotonic(
+    p: float,
+    lookup: list[tuple[float, float]],
+) -> float:
+    """Apply isotonic calibration to a single probability."""
+    if not lookup:
+        return p
+    if p <= lookup[0][0]:
+        return lookup[0][1]
+    if p >= lookup[-1][0]:
+        return lookup[-1][1]
+    # Linear interpolation
+    for i in range(len(lookup) - 1):
+        if lookup[i][0] <= p <= lookup[i + 1][0]:
+            span = lookup[i + 1][0] - lookup[i][0]
+            t = (p - lookup[i][0]) / max(1e-10, span)
+            return lookup[i][1] + t * (lookup[i + 1][1] - lookup[i][1])
+    return p

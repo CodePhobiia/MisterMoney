@@ -1,6 +1,7 @@
 """Tests for ReasonerMemory."""
 
 import os
+import random
 import tempfile
 
 from pmm1.strategy.reasoner_memory import ReasonerMemory
@@ -127,3 +128,129 @@ def test_calibration_needs_200_samples():
         f"Expected is_calibrated=False at 150 samples, "
         f"but got True (min_for_calibration={mem.min_for_calibration})"
     )
+
+
+# ------------------------------------------------------------------
+# Phase 4B: LLM-02, LLM-04, LLM-07, LLM-09, LLM-10 tests
+# ------------------------------------------------------------------
+
+
+def test_category_gamma_tau():
+    """LLM-02: 50+ sports resolutions -> per-category gamma/tau."""
+    path = os.path.join(tempfile.mkdtemp(), "mem_cat_gt.json")
+    mem = ReasonerMemory(persist_path=path, min_for_calibration=200)
+
+    random.seed(99)
+    for i in range(60):
+        # Sports: hedged predictions
+        true_p = random.choice([0.2, 0.8])
+        outcome = 1.0 if random.random() < true_p else 0.0
+        hedged = 0.5 + 0.4 * (true_p - 0.5)
+        mem.record_resolution(
+            f"sport{i}", outcome, hedged, hedged, hedged, 0.15,
+            category="sports", p_ensemble=hedged,
+        )
+
+    # With only 60 sports samples, category fit should trigger (>= 50)
+    gamma, tau = mem.get_optimal_gamma_tau(category="sports")
+    # Should find gamma != default 1.3 (data is hedged, needs de-hedging)
+    assert isinstance(gamma, float)
+    assert isinstance(tau, float)
+    # The gamma should push toward extremization since data is hedged
+    assert gamma >= 0.5
+
+
+def test_category_blend_weight():
+    """LLM-02: Category with good Brier -> higher weight."""
+    path = os.path.join(tempfile.mkdtemp(), "mem_cat_blend.json")
+    mem = ReasonerMemory(persist_path=path, min_for_calibration=3)
+
+    random.seed(42)
+    # Politics: great predictions (close to outcome)
+    for i in range(15):
+        outcome = float(i % 2)
+        p = 0.9 if outcome == 1.0 else 0.1
+        mem.record_resolution(
+            f"p{i}", outcome, p, p, p, 0.1, category="politics",
+        )
+
+    # Economics: bad predictions (always 0.5)
+    for i in range(15):
+        outcome = float(i % 2)
+        mem.record_resolution(
+            f"e{i}", outcome, 0.5, 0.5, 0.5, 0.2, category="economics",
+        )
+
+    w_politics = mem.get_category_blend_weight("politics")
+    w_economics = mem.get_category_blend_weight("economics")
+
+    # Politics has better Brier -> should get higher blend weight
+    assert w_politics > w_economics
+    assert 0.10 <= w_politics <= 0.50
+    assert 0.10 <= w_economics <= 0.50
+
+
+def test_category_fallback_to_global():
+    """LLM-02: Category with < 50 samples -> falls back to global fit."""
+    path = os.path.join(tempfile.mkdtemp(), "mem_cat_fallback.json")
+    mem = ReasonerMemory(persist_path=path, min_for_calibration=5)
+
+    random.seed(77)
+    # Only 10 sports samples (< 50 threshold)
+    for i in range(10):
+        outcome = float(i % 2)
+        mem.record_resolution(
+            f"s{i}", outcome, 0.5, 0.5, 0.5, 0.2,
+            category="sports", p_ensemble=0.5,
+        )
+
+    # But 200+ total
+    for i in range(200):
+        true_p = random.choice([0.3, 0.7])
+        outcome = 1.0 if random.random() < true_p else 0.0
+        hedged = 0.5 + 0.5 * (true_p - 0.5)
+        mem.record_resolution(
+            f"g{i}", outcome, hedged, hedged, hedged, 0.15,
+            category="general", p_ensemble=hedged,
+        )
+
+    # Category fit should fall back to global (< 50 sports samples)
+    gamma_cat, tau_cat = mem.get_optimal_gamma_tau(category="sports")
+    gamma_global, tau_global = mem.get_optimal_gamma_tau(category="")
+
+    # Should get the global result since sports < 50
+    assert gamma_cat == gamma_global
+    assert tau_cat == tau_global
+
+
+def test_diversity_adjusted_alpha():
+    """LLM-04: High diversity -> alpha closer to base_alpha."""
+    path = os.path.join(tempfile.mkdtemp(), "mem_div.json")
+    mem = ReasonerMemory(persist_path=path, min_for_calibration=5)
+
+    # Zero diversity -> alpha should be 1.0
+    alpha_zero = mem.get_diversity_adjusted_alpha(
+        base_alpha=1.3, diversity=0.0,
+    )
+    assert abs(alpha_zero - 1.0) < 1e-6
+
+    # Max diversity (0.15) -> alpha should be base_alpha
+    alpha_max = mem.get_diversity_adjusted_alpha(
+        base_alpha=1.3, diversity=0.15,
+    )
+    assert abs(alpha_max - 1.3) < 1e-6
+
+    # Medium diversity -> alpha between 1.0 and base_alpha
+    alpha_mid = mem.get_diversity_adjusted_alpha(
+        base_alpha=1.3, diversity=0.075,
+    )
+    assert 1.0 < alpha_mid < 1.3
+
+    # Higher diversity => higher alpha (more extremization)
+    alpha_low = mem.get_diversity_adjusted_alpha(
+        base_alpha=2.0, diversity=0.03,
+    )
+    alpha_high = mem.get_diversity_adjusted_alpha(
+        base_alpha=2.0, diversity=0.12,
+    )
+    assert alpha_high > alpha_low

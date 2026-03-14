@@ -71,6 +71,12 @@ class LLMEstimate:
     input_tokens: int = 0
     output_tokens: int = 0
     cache_hit: bool = False
+    # LLM-06: Structured evidence extraction
+    key_evidence: list[str] = field(default_factory=list)
+    risk_flags: list[str] = field(default_factory=list)
+    # LLM-01: Multi-sample blind pass metadata
+    n_blind_samples: int = 1
+    blind_sample_spread: float = 0.0  # max - min of blind samples
 
     @property
     def age_seconds(self) -> float:
@@ -208,7 +214,7 @@ _CHALLENGE_PROMPT_TEMPLATE = """\
 You previously estimated this market BLIND (without seeing \
 the market price):
 
-YOUR BLIND ESTIMATE: {blind_p:.3f} ± {blind_uncertainty:.3f}
+{blind_summary}
 YOUR REASONING: {blind_reasoning}
 YOUR CONTRA: {contra_argument}
 
@@ -466,7 +472,7 @@ class LLMReasoner:
         total_output = 0
         any_cache_hit = False
 
-        # ── PASS 1: Blind estimate ──
+        # ── PASS 1: Blind estimate (multi-sample for variance reduction) ──
         context_block = ""
         if extra_context:
             context_block = f"AVAILABLE CONTEXT:\n{extra_context}"
@@ -479,50 +485,143 @@ class LLMReasoner:
             context_block=context_block,
         )
 
-        try:
-            blind_resp = await self._call_opus(
-                blind_prompt, model=self.config.blind_model,
-            )
-            blind_in = blind_resp.get("input_tokens", 0)
-            blind_out = blind_resp.get("output_tokens", 0)
-            total_input += blind_in
-            total_output += blind_out
-            self._track_cost(blind_in, blind_out, model=self.config.blind_model)
-            any_cache_hit = any_cache_hit or blind_resp.get(
-                "cache_hit", False,
-            )
+        # LLM-01: Multi-sample blind pass
+        blind_samples: list[float] = []
+        blind_uncertainties: list[float] = []
+        blind_reasonings: list[str] = []
+        blind_contras: list[str] = []
+        blind_evidence_lists: list[list[str]] = []  # LLM-06
+        blind_risk_flags_lists: list[list[str]] = []  # LLM-06
+        n_samples = 3  # LLM-01: configurable via config
 
-            blind_parsed = self._parse_response(blind_resp["text"])
-            if blind_parsed is None:
-                self._total_errors += 1
-                return None
+        for sample_idx in range(n_samples):
+            try:
+                blind_resp = await self._call_opus(
+                    blind_prompt, model=self.config.blind_model,
+                )
+                # _call_opus returns None on 400/401/403
+                if blind_resp is None:
+                    continue
 
-            p_blind = float(blind_parsed.get("p_hat", 0.5))
-            blind_uncertainty = float(
-                blind_parsed.get("uncertainty", 0.25),
-            )
-            blind_reasoning = blind_parsed.get(
-                "reasoning_summary", "",
-            )
-            contra_argument = blind_parsed.get(
-                "contra_argument", "",
-            )
+                blind_in = blind_resp.get("input_tokens", 0)
+                blind_out = blind_resp.get("output_tokens", 0)
+                total_input += blind_in
+                total_output += blind_out
+                self._track_cost(
+                    blind_in, blind_out,
+                    model=self.config.blind_model,
+                )
+                any_cache_hit = any_cache_hit or blind_resp.get(
+                    "cache_hit", False,
+                )
 
-            logger.info(
-                "llm_blind_pass",
-                condition_id=condition_id[:16],
-                p_blind=round(p_blind, 3),
-                question=question[:50],
-            )
+                blind_parsed = self._parse_response(
+                    blind_resp["text"],
+                )
+                if blind_parsed is None:
+                    continue
 
-        except Exception as e:
+                blind_samples.append(
+                    float(blind_parsed.get("p_hat", 0.5)),
+                )
+                blind_uncertainties.append(
+                    float(blind_parsed.get("uncertainty", 0.25)),
+                )
+                blind_reasonings.append(
+                    blind_parsed.get("reasoning_summary", ""),
+                )
+                blind_contras.append(
+                    blind_parsed.get("contra_argument", ""),
+                )
+                # LLM-06: Extract structured evidence
+                blind_evidence_lists.append(
+                    blind_parsed.get("key_evidence", []),
+                )
+                blind_risk_flags_lists.append(
+                    blind_parsed.get("risk_flags", []),
+                )
+            except Exception as e:
+                logger.warning(
+                    "llm_blind_sample_failed",
+                    sample=sample_idx,
+                    error=str(e),
+                )
+                continue
+
+        if not blind_samples:
             self._total_errors += 1
             logger.error(
                 "llm_blind_pass_failed",
                 condition_id=condition_id[:16],
-                error=str(e),
+                error="all blind samples failed",
             )
             return None
+
+        # Aggregate: trimmed mean in log-odds space (drop min/max if 3+ samples)
+        from pmm1.math.ensemble import log_pool
+        if len(blind_samples) >= 3:
+            # Drop min and max, average the rest
+            sorted_samples = sorted(blind_samples)
+            trimmed = sorted_samples[1:-1]  # Remove extremes
+            p_blind = log_pool(trimmed)  # Equal weights
+        else:
+            p_blind = log_pool(blind_samples)
+
+        # LLM-03: Empirical uncertainty from sample spread
+        if len(blind_samples) >= 2:
+            logit_samples = [
+                math.log(max(0.01, p) / max(0.01, 1 - p))
+                for p in blind_samples
+            ]
+            mean_logit = sum(logit_samples) / len(logit_samples)
+            empirical_var = sum(
+                (lg - mean_logit) ** 2 for lg in logit_samples
+            ) / len(logit_samples)
+            empirical_uncertainty = min(
+                0.5, empirical_var ** 0.5 * 0.2,
+            )  # Scale to [0, 0.5]
+            blind_uncertainty = empirical_uncertainty
+        else:
+            blind_uncertainty = (
+                blind_uncertainties[0]
+                if blind_uncertainties
+                else 0.25
+            )
+
+        # Use best reasoning (from median sample)
+        median_idx = len(blind_samples) // 2
+        blind_reasoning = (
+            blind_reasonings[median_idx]
+            if blind_reasonings
+            else ""
+        )
+        contra_argument = (
+            blind_contras[median_idx]
+            if blind_contras
+            else ""
+        )
+
+        # LLM-06: Aggregate evidence and risk flags
+        all_evidence: list[str] = []
+        all_risk_flags: list[str] = []
+        for ev_list in blind_evidence_lists:
+            all_evidence.extend(ev_list)
+        for rf_list in blind_risk_flags_lists:
+            all_risk_flags.extend(rf_list)
+        # Deduplicate preserving order
+        key_evidence = list(dict.fromkeys(all_evidence))[:10]
+        risk_flags = list(dict.fromkeys(all_risk_flags))[:5]
+
+        logger.info(
+            "llm_blind_pass",
+            condition_id=condition_id[:16],
+            p_blind=round(p_blind, 3),
+            n_samples=len(blind_samples),
+            sample_spread=round(
+                max(blind_samples) - min(blind_samples), 3,
+            ) if len(blind_samples) > 1 else 0.0,
+            question=question[:50],
+        )
 
         # ── PASS 2: Market-aware challenge ──
         book_block = ""
@@ -535,9 +634,26 @@ class LLMReasoner:
                 f"\nADDITIONAL CONTEXT:\n{challenge_context}"
             )
 
+        # LLM-11: Richer challenge prompt with multi-sample info
+        if len(blind_samples) >= 2:
+            blind_range_str = (
+                f"[{min(blind_samples):.3f}, "
+                f"{max(blind_samples):.3f}]"
+            )
+            blind_summary = (
+                f"YOUR BLIND ESTIMATES ({len(blind_samples)} "
+                f"samples): mean={p_blind:.3f}, "
+                f"range={blind_range_str}, "
+                f"uncertainty={blind_uncertainty:.3f}"
+            )
+        else:
+            blind_summary = (
+                f"YOUR BLIND ESTIMATE: {p_blind:.3f} "
+                f"\u00b1 {blind_uncertainty:.3f}"
+            )
+
         challenge_prompt = _CHALLENGE_PROMPT_TEMPLATE.format(
-            blind_p=p_blind,
-            blind_uncertainty=blind_uncertainty,
+            blind_summary=blind_summary,
             blind_reasoning=blind_reasoning,
             contra_argument=contra_argument,
             market_price=midpoint,
@@ -628,6 +744,14 @@ class LLMReasoner:
             input_tokens=total_input,
             output_tokens=total_output,
             cache_hit=any_cache_hit,
+            key_evidence=key_evidence,
+            risk_flags=risk_flags,
+            n_blind_samples=len(blind_samples),
+            blind_sample_spread=(
+                max(blind_samples) - min(blind_samples)
+                if len(blind_samples) > 1
+                else 0.0
+            ),
         )
 
         self._cache[condition_id] = estimate
