@@ -44,7 +44,8 @@ class MarkoutTracker:
     """
 
     def __init__(self, ewma_halflife: int = 20) -> None:
-        self._pending: list[PendingMarkout] = []
+        self._pending_by_id: dict[int, PendingMarkout] = {}
+        self._next_fill_id: int = 0
         self._ewma_decay = 0.5 ** (1.0 / max(1, ewma_halflife))
         self._market_as: dict[str, float] = {}  # condition_id -> EWMA AS cost
         self._market_count: dict[str, int] = {}
@@ -65,20 +66,23 @@ class MarkoutTracker:
             fill_side=fill_side,
             fv_at_fill=fv_at_fill,
         )
-        self._pending.append(pm)
+        fill_id = self._next_fill_id
+        self._next_fill_id += 1
+        self._pending_by_id[fill_id] = pm
 
-        # Cap pending list
-        if len(self._pending) > 5000:
-            self._pending = self._pending[-5000:]
+        # Cap pending dict
+        if len(self._pending_by_id) > 5000:
+            oldest = sorted(self._pending_by_id)[:len(self._pending_by_id) - 5000]
+            for k in oldest:
+                del self._pending_by_id[k]
 
-        return len(self._pending) - 1
+        return fill_id
 
-    def update_markout(self, index: int, current_mid: float, horizon: str) -> None:
+    def update_markout(self, fill_id: int, current_mid: float, horizon: str) -> None:
         """Update a pending fill with markout at a specific horizon."""
-        if index < 0 or index >= len(self._pending):
+        pm = self._pending_by_id.get(fill_id)
+        if pm is None:
             return
-
-        pm = self._pending[index]
 
         # Markout = how much mid moved in our direction
         # Positive = good (market confirmed our trade), Negative = bad (adverse selection)
@@ -113,18 +117,18 @@ class MarkoutTracker:
             return 0.0
         return self._market_as.get(condition_id, 0.0)
 
-    def get_spread_capture(self, index: int) -> float:
+    def get_spread_capture(self, fill_id: int) -> float:
         """Get spread capture for a fill (mid_at_fill - fill_price for BUY)."""
-        if index < 0 or index >= len(self._pending):
+        pm = self._pending_by_id.get(fill_id)
+        if pm is None:
             return 0.0
-        pm = self._pending[index]
         if pm.fill_side == "BUY":
             return pm.fv_at_fill - pm.fill_price
         return pm.fill_price - pm.fv_at_fill
 
     def get_status(self) -> dict[str, Any]:
         return {
-            "pending_fills": len(self._pending),
+            "pending_fills": len(self._pending_by_id),
             "tracked_markets": len(self._market_as),
             "markets_with_data": len(
                 [c for c, n in self._market_count.items() if n >= 5]

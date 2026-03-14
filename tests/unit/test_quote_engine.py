@@ -169,8 +169,8 @@ class TestComputeHalfSpread:
     def test_as_spread_widens_with_vol(self):
         """#8 — Higher sigma_eff produces wider spread (A-S vol sensitivity)."""
         eng = _engine()
-        feat_low = _default_features(sigma_eff=0.10, kappa_estimate=0.1)
-        feat_high = _default_features(sigma_eff=0.45, kappa_estimate=0.1)
+        feat_low = _default_features(sigma_eff=0.10, kappa_estimate=5.0)
+        feat_high = _default_features(sigma_eff=0.45, kappa_estimate=5.0)
         delta_low = eng.compute_half_spread(feat_low)
         delta_high = eng.compute_half_spread(feat_high)
         assert delta_high > delta_low, (
@@ -560,21 +560,23 @@ class TestAvellanedaStoikovSpread:
         )
         delta = eng.compute_half_spread(feat, reward_ev=0.0)
 
-        # Expected A-S half-spread
+        # Expected A-S half-spread (clamped to 0.49 for binary)
         t_eff = time_to_res / 24.0  # 0.5
         expected_as = (
             (gamma * sigma_eff ** 2 * t_eff) / 2
             + (1 / gamma) * math.log(1 + gamma / kappa)
         )
-        assert delta == pytest.approx(expected_as, rel=1e-6)
+        # Raw A-S exceeds binary range; verify clamp applies
+        assert expected_as > 0.49
+        assert delta == pytest.approx(0.49, rel=1e-6)
 
     def test_as_spread_widens_with_vol(self):
         """Higher sigma_eff → wider spread (sigma^2 term dominates)."""
         cfg = _default_config(inventory_skew_gamma=0.015)
         eng = _engine(config=cfg)
 
-        feat_low_vol = _default_features(sigma_eff=0.10, kappa_estimate=0.1)
-        feat_high_vol = _default_features(sigma_eff=0.45, kappa_estimate=0.1)
+        feat_low_vol = _default_features(sigma_eff=0.10, kappa_estimate=5.0)
+        feat_high_vol = _default_features(sigma_eff=0.45, kappa_estimate=5.0)
 
         delta_low = eng.compute_half_spread(feat_low_vol)
         delta_high = eng.compute_half_spread(feat_high_vol)
@@ -928,20 +930,22 @@ class TestLayeredQuotes:
         )
 
     def test_layered_quotes_3_layers(self):
-        """3 layers with correct size fractions (60/30/10)."""
+        """3 layers with correct ordering and minimum sizes."""
         layers = self._make_layers(n_layers=3)
         assert len(layers) == 3
 
-        # Check size fractions relative to each other
-        # Layer 0 should have ~60%, layer 1 ~30%, layer 2 ~10%
-        total_bid = sum(layer.bid_size for layer in layers if layer.bid_size)
-        for i, (layer, expected_frac) in enumerate(
-            zip(layers, [0.60, 0.30, 0.10])
-        ):
-            actual_frac = layer.bid_size / total_bid if total_bid > 0 else 0
-            assert actual_frac == pytest.approx(expected_frac, abs=0.02), (
-                f"Layer {i} bid fraction: {actual_frac:.3f} vs expected {expected_frac:.2f}"
-            )
+        # All layers must meet Polymarket minimum
+        for layer in layers:
+            if layer.bid_size is not None:
+                assert layer.bid_size >= 5.0
+            if layer.ask_size is not None:
+                assert layer.ask_size >= 5.0
+
+        # Layer 0 (closest) should have largest size
+        bid_sizes = [
+            ly.bid_size for ly in layers if ly.bid_size
+        ]
+        assert bid_sizes[0] >= bid_sizes[1] >= bid_sizes[2]
 
         # Verify strategy names
         assert layers[0].strategy == "mm_layer0"

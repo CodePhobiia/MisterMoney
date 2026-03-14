@@ -90,7 +90,7 @@ TERMINAL_STATES = {
 ACTIVE_STATES = {
     OrderState.SUBMITTED, OrderState.LIVE,
     OrderState.PARTIAL, OrderState.MATCHED,
-    OrderState.DELAYED,
+    OrderState.DELAYED, OrderState.RETRYING,
 }
 
 LIFECYCLE_COUNTER_NAMES = (

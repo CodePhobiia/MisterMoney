@@ -142,7 +142,7 @@ class TestMultiModuleFillDistribution:
         # Verify ALL modules received data
         assert len(mkt_prof._markets) > 0
         assert len(sig_val._observations) == 1
-        assert len(markout._pending) > 0
+        assert len(markout._pending_by_id) > 0
         assert cid in spread_opt._market_buckets
         assert post_mortem._total_classified == 1
         assert changepoint._n_obs == 1

@@ -10,6 +10,7 @@ most important component" of effective LLM forecasting.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import time
@@ -161,7 +162,7 @@ class NewsFetcher:
         question = self._sanitize_question(question)
 
         # Check cache
-        cache_key = question[:100]
+        cache_key = hashlib.md5(question.encode()).hexdigest()
         cached = self._cache.get(cache_key)
         if cached and (time.time() - cached[0]) < self.cache_ttl_s:
             return cached[1]

@@ -27,6 +27,7 @@ class MarketPosition(BaseModel):
     neg_risk: bool = False
     event_id: str = ""
     last_update: float = Field(default_factory=time.time)
+    created_at: float = Field(default_factory=time.time)
     price_estimated: bool = False  # True if avg_price was estimated (not from fill)
 
     @property
@@ -123,16 +124,18 @@ class MarketPosition(BaseModel):
             if is_yes:
                 # Selling YES → reducing YES position
                 if self.yes_size > 0:
+                    actual_sell = min(size, self.yes_size)
                     cost_per_share = self.yes_avg_price
-                    pnl = size * (price - cost_per_share) - fee
+                    pnl = actual_sell * (price - cost_per_share) - fee
                     self.realized_pnl += pnl
                     self.yes_size = max(0.0, self.yes_size - size)
                     self.yes_cost_basis = self.yes_size * self.yes_avg_price
             else:
                 # Selling NO → reducing NO position
                 if self.no_size > 0:
+                    actual_sell = min(size, self.no_size)
                     cost_per_share = self.no_avg_price
-                    pnl = size * (price - cost_per_share) - fee
+                    pnl = actual_sell * (price - cost_per_share) - fee
                     self.realized_pnl += pnl
                     self.no_size = max(0.0, self.no_size - size)
                     self.no_cost_basis = self.no_size * self.no_avg_price

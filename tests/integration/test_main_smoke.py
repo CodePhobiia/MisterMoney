@@ -73,7 +73,7 @@ def test_markout_tracker_instantiation():
     from pmm1.analytics.markout_tracker import MarkoutTracker
 
     tracker = MarkoutTracker()
-    assert isinstance(tracker._pending, list)
+    assert isinstance(tracker._pending_by_id, dict)
 
 
 def test_inventory_carry_tracker_instantiation():

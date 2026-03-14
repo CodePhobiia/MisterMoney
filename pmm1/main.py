@@ -85,7 +85,7 @@ from pmm1.storage.postgres import PostgresStore
 from pmm1.storage.redis import RedisStateStore
 from pmm1.storage.spine import SpineEmitter, make_session_id, resolve_git_sha
 from pmm1.strategy.binary_parity import BinaryParityDetector
-from pmm1.strategy.exit_manager import ExitManager
+from pmm1.strategy.exit_manager import ExitManager, SellSignal
 from pmm1.strategy.fair_value import FairValueModel
 from pmm1.strategy.features import FeatureEngine
 from pmm1.strategy.fill_escalation import FillEscalator
@@ -2075,8 +2075,13 @@ async def run(settings: Settings | None = None) -> None:
 
         # PM-10: Cancel opposing side to prevent stale quote exposure
         if order_manager and not paper_mode:
-            asyncio.create_task(
-                order_manager.cancel_opposing_on_fill(token_id, side)
+            _cancel_task = asyncio.create_task(
+                order_manager.cancel_opposing_on_fill(
+                    token_id, side
+                )
+            )
+            _cancel_task.add_done_callback(
+                _task_done_callback
             )
 
         pmm2_on_fill(
@@ -2790,7 +2795,7 @@ async def run(settings: Settings | None = None) -> None:
                                 continue
                             _tid = getattr(_md, "token_id_yes", "")
                             _bk = state.book_manager.get(_tid) if _tid else None
-                            _p_market = _bk.get_midpoint() if _bk else 0.5
+                            _p_market = (_bk.get_midpoint() if _bk else None) or 0.5
                             _signal = exit_manager.get_kelly_exit_signal(
                                 _cid, _est.p_calibrated, _p_market,
                             )
@@ -2800,6 +2805,21 @@ async def run(settings: Settings | None = None) -> None:
                                     cid=_cid[:16],
                                     signal=_signal,
                                 )
+                                _urgency = (
+                                    "high"
+                                    if _signal == "kelly_sl"
+                                    else "medium"
+                                )
+                                exit_signals.append(SellSignal(
+                                    token_id=_tid,
+                                    condition_id=_cid,
+                                    size=abs(
+                                        _pos.net_exposure
+                                    ),
+                                    price=_p_market,
+                                    urgency=_urgency,
+                                    reason=f"kelly_{_signal}",
+                                ))
                 except Exception as _kelly_exit_err:
                     logger.debug("kelly_exit_check_error", error=str(_kelly_exit_err))
 
@@ -3292,7 +3312,7 @@ async def run(settings: Settings | None = None) -> None:
                     # MM-10: Suppress negative-EV quotes
                     _as_cost = markout_tracker.get_as_cost(md.condition_id)
                     if (
-                        _as_cost > 0
+                        _as_cost != 0
                         and quote_intent.bid_price
                         and quote_intent.ask_price
                     ):
@@ -3681,7 +3701,7 @@ async def run(settings: Settings | None = None) -> None:
                         # MM-10: Suppress negative-EV quotes (NO token)
                         _as_cost_no = markout_tracker.get_as_cost(md.condition_id)
                         if (
-                            _as_cost_no > 0
+                            _as_cost_no != 0
                             and quote_intent_no.bid_price
                             and quote_intent_no.ask_price
                         ):
@@ -4151,14 +4171,39 @@ async def run(settings: Settings | None = None) -> None:
                     state.order_tracker.cleanup_terminal()
 
                 # ── Periodic analytics saves ──
-                try:
-                    edge_tracker.save(settings.analytics.edge_tracker_persist_path)
-                    spread_optimizer.save("data/spread_optimizer_state.json")
-                    market_profitability.save("data/market_profitability.json")
-                    signal_value_tracker.save("data/signal_value.json")
-                    post_mortem.save("data/post_mortem.json")
-                except Exception as _save_err:
-                    logger.warning("periodic_analytics_save_error", error=str(_save_err))
+                for _sname, _sfn in [
+                    ("edge_tracker", lambda: edge_tracker.save(
+                        settings.analytics.edge_tracker_persist_path
+                    )),
+                    ("spread_optimizer", lambda: (
+                        spread_optimizer.save(
+                            "data/spread_optimizer_state.json"
+                        )
+                    )),
+                    ("market_profitability", lambda: (
+                        market_profitability.save(
+                            "data/market_profitability.json"
+                        )
+                    )),
+                    ("signal_value", lambda: (
+                        signal_value_tracker.save(
+                            "data/signal_value.json"
+                        )
+                    )),
+                    ("post_mortem", lambda: (
+                        post_mortem.save(
+                            "data/post_mortem.json"
+                        )
+                    )),
+                ]:
+                    try:
+                        _sfn()
+                    except Exception as _save_err:
+                        logger.warning(
+                            "periodic_analytics_save_error",
+                            module=_sname,
+                            error=str(_save_err),
+                        )
 
                 # CL-06: Update LLM cost tracking
                 if llm_reasoner:
@@ -4271,15 +4316,40 @@ async def run(settings: Settings | None = None) -> None:
                 pass
 
         # ── Persist all analytics state on shutdown ──
-        try:
-            edge_tracker.save(settings.analytics.edge_tracker_persist_path)
-            spread_optimizer.save("data/spread_optimizer_state.json")
-            market_profitability.save("data/market_profitability.json")
-            signal_value_tracker.save("data/signal_value.json")
-            post_mortem.save("data/post_mortem.json")
-            logger.info("analytics_state_saved_on_shutdown")
-        except Exception as _shutdown_save_err:
-            logger.error("analytics_shutdown_save_failed", error=str(_shutdown_save_err))
+        for _sname, _sfn in [
+            ("edge_tracker", lambda: edge_tracker.save(
+                settings.analytics.edge_tracker_persist_path
+            )),
+            ("spread_optimizer", lambda: (
+                spread_optimizer.save(
+                    "data/spread_optimizer_state.json"
+                )
+            )),
+            ("market_profitability", lambda: (
+                market_profitability.save(
+                    "data/market_profitability.json"
+                )
+            )),
+            ("signal_value", lambda: (
+                signal_value_tracker.save(
+                    "data/signal_value.json"
+                )
+            )),
+            ("post_mortem", lambda: (
+                post_mortem.save(
+                    "data/post_mortem.json"
+                )
+            )),
+        ]:
+            try:
+                _sfn()
+            except Exception as _save_err:
+                logger.error(
+                    "analytics_shutdown_save_failed",
+                    module=_sname,
+                    error=str(_save_err),
+                )
+        logger.info("analytics_state_saved_on_shutdown")
 
         # Paper mode final summary
         if paper_mode and paper_engine and paper_logger:

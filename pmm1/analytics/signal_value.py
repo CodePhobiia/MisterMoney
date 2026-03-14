@@ -191,8 +191,15 @@ class SignalValueTracker:
         def _rank(values: list[float]) -> list[float]:
             indexed = sorted(enumerate(values), key=lambda t: t[1])
             ranks = [0.0] * n
-            for rank, (idx, _) in enumerate(indexed):
-                ranks[idx] = float(rank)
+            i = 0
+            while i < n:
+                j = i
+                while j < n - 1 and indexed[j + 1][1] == indexed[j][1]:
+                    j += 1
+                avg_rank = (i + j) / 2.0
+                for k in range(i, j + 1):
+                    ranks[indexed[k][0]] = avg_rank
+                i = j + 1
             return ranks
 
         rx = _rank(x)

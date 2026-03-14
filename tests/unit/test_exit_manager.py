@@ -50,6 +50,7 @@ def _make_position(
     no_avg_price: float = 0.0,
     last_update: float | None = None,
 ) -> MarketPosition:
+    ts = last_update if last_update is not None else time.time() - 7200
     return MarketPosition(
         condition_id=condition_id,
         token_id_yes=token_yes,
@@ -58,7 +59,8 @@ def _make_position(
         no_size=no_size,
         yes_avg_price=yes_avg_price,
         no_avg_price=no_avg_price,
-        last_update=last_update if last_update is not None else time.time() - 7200,
+        last_update=ts,
+        created_at=ts,
     )
 
 

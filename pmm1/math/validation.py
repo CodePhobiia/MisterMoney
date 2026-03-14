@@ -641,27 +641,23 @@ def pav_calibrate(probs: list[float], outcomes: list[float]) -> list[float]:
     order = sorted(range(n), key=lambda i: probs[i])
     sorted_outcomes = [outcomes[i] for i in order]
 
-    # PAV algorithm
-    result = list(sorted_outcomes)
-    weights = [1] * n
-    i = 0
-    while i < n - 1:
-        if result[i] > result[i + 1]:
-            w = weights[i] + weights[i + 1]
-            val = (weights[i] * result[i] + weights[i + 1] * result[i + 1]) / w
-            result[i] = val
-            result[i + 1] = val
-            weights[i] = w
-            weights[i + 1] = w
-            while i > 0 and result[i - 1] > result[i]:
-                w = weights[i - 1] + weights[i]
-                val = (weights[i - 1] * result[i - 1] + weights[i] * result[i]) / w
-                result[i - 1] = val
-                result[i] = val
-                weights[i - 1] = w
-                weights[i] = w
-                i -= 1
-        i += 1
+    # PAV algorithm using block stack (value, weight, count)
+    blocks: list[tuple[float, float, int]] = []
+    for val in sorted_outcomes:
+        blocks.append((val, 1.0, 1))
+        while (
+            len(blocks) >= 2
+            and blocks[-2][0] > blocks[-1][0]
+        ):
+            v1, w1, c1 = blocks.pop()
+            v2, w2, c2 = blocks.pop()
+            merged = (w1 * v1 + w2 * v2) / (w1 + w2)
+            blocks.append((merged, w1 + w2, c1 + c2))
+
+    # Expand blocks back to individual positions
+    result: list[float] = []
+    for val, _, count in blocks:
+        result.extend([val] * count)
 
     # Unsort
     calibrated = [0.0] * n

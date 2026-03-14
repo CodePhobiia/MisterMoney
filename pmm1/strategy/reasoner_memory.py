@@ -98,6 +98,10 @@ class ReasonerMemory:
         )
         self._resolved.append(est)
 
+        # Cap in-memory to match persistence window
+        if len(self._resolved) > 5000:
+            self._resolved = self._resolved[-5000:]
+
         logger.info(
             "reasoner_resolution_recorded",
             condition_id=condition_id[:16],

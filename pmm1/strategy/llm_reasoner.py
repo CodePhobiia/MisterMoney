@@ -680,6 +680,10 @@ class LLMReasoner:
             challenge_resp = await self._call_opus(
                 challenge_prompt, model=self.config.challenge_model,
             )
+            if challenge_resp is None:
+                p_challenged = p_blind
+                uncertainty = blind_uncertainty
+                raise ValueError("challenge_api_returned_none")
             chal_in = challenge_resp.get("input_tokens", 0)
             chal_out = challenge_resp.get("output_tokens", 0)
             total_input += chal_in

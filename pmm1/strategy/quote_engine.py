@@ -167,6 +167,10 @@ class QuoteEngine:
         # A-S optimal half-spread
         delta_as = (gamma * sigma_eff ** 2 * t_eff) / 2 + (1 / gamma) * math.log(1 + gamma / kappa)
 
+        # Binary market: clamp half-spread to valid range
+        # A-S formula overestimates for [0,1] markets due to 1/gamma
+        delta_as = min(0.49, delta_as)
+
         # CL-01: Blend with learned optimal spread if available
         if optimal_base_spread is not None and optimal_base_spread > 0:
             delta_as = 0.7 * delta_as + 0.3 * optimal_base_spread
@@ -413,6 +417,13 @@ class QuoteEngine:
                 (Decimal(str(mid + tick_size)) / tick)
                 .to_integral_value(rounding=ROUND_CEILING) * tick
             )
+            # Re-clamp after resolution to stay in valid range
+            bid_price = max(
+                tick_size, min(1.0 - tick_size, bid_price),
+            )
+            ask_price = max(
+                tick_size, min(1.0 - tick_size, ask_price),
+            )
 
         # 4. Size (dollar-based)
         reward_boost = 1.0 + reward_ev * 5.0 if reward_ev > 0 else 1.0
@@ -556,7 +567,7 @@ class QuoteEngine:
                     if base.bid_price else None
                 ),
                 bid_size=(
-                    round((base.bid_size or 0) * frac, 2)
+                    max(5.0, round((base.bid_size or 0) * frac, 2))
                     if base.bid_size else None
                 ),
                 ask_price=(
@@ -564,7 +575,7 @@ class QuoteEngine:
                     if base.ask_price else None
                 ),
                 ask_size=(
-                    round((base.ask_size or 0) * frac, 2)
+                    max(5.0, round((base.ask_size or 0) * frac, 2))
                     if base.ask_size else None
                 ),
                 reservation_price=base.reservation_price,

@@ -123,16 +123,18 @@ class DrawdownGovernor:
 
     def initialize(self, starting_nav: float) -> None:
         """Initialize at the start of a trading day."""
-        # Preserve session peak across daily resets
+        # Preserve session peak and absolute kill across daily resets
         session_peak = max(
             starting_nav, self._state.session_peak_nav,
         )
+        was_killed = self._state.absolute_kill_triggered
         self._state = DrawdownState(
             daily_high_watermark=starting_nav,
             current_nav=starting_nav,
             day_start_nav=starting_nav,
             day_start_time=time.time(),
             session_peak_nav=session_peak,
+            absolute_kill_triggered=was_killed,
         )
         logger.info("drawdown_governor_initialized", nav=starting_nav)
 

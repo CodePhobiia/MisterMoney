@@ -376,9 +376,14 @@ class ExitManager:
 
         if hours_left <= cfg.exit_start_hours:
             # Gradual exit ramp
-            fraction = 1.0 - (hours_left - cfg.exit_complete_hours) / (
-                cfg.exit_start_hours - cfg.exit_complete_hours
-            )
+            denom = cfg.exit_start_hours - cfg.exit_complete_hours
+            if denom <= 0:
+                fraction = 1.0
+            else:
+                fraction = 1.0 - (
+                    hours_left - cfg.exit_complete_hours
+                ) / denom
+            fraction = max(0.0, min(1.0, fraction))
             sell_size = max(5.0, round(size * fraction, 2))
             if sell_size > size:
                 sell_size = size
@@ -405,7 +410,7 @@ class ExitManager:
         cfg = self.config.take_profit
 
         # Minimum hold time check
-        hold_seconds = now - pos.last_update
+        hold_seconds = now - getattr(pos, 'created_at', pos.last_update)
         if hold_seconds < cfg.min_hold_minutes * 60:
             return None
 
