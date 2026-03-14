@@ -1,7 +1,7 @@
 """Tests for ReasonerMemory."""
 
-import tempfile
 import os
+import tempfile
 
 from pmm1.strategy.reasoner_memory import ReasonerMemory
 

@@ -10,8 +10,10 @@ class FakeBook:
     def get_bids(self, n=3): return [FakeLevel(0.54, 150), FakeLevel(0.53, 200)]
     def get_asks(self, n=3): return [FakeLevel(0.56, 80), FakeLevel(0.57, 120)]
     def get_depth_within(self, cents, side="both"):
-        if side == "bid": return 350.0
-        if side == "ask": return 200.0
+        if side == "bid":
+            return 350.0
+        if side == "ask":
+            return 200.0
         return 550.0
 
 

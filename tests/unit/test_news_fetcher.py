@@ -1,9 +1,8 @@
 """Tests for NewsFetcher."""
 
-from pmm1.strategy.news_fetcher import NewsFetcher
-
-
 import pytest
+
+from pmm1.strategy.news_fetcher import NewsFetcher
 
 
 @pytest.mark.asyncio
