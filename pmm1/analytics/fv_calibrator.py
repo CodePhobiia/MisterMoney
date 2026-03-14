@@ -20,7 +20,7 @@ log = structlog.get_logger(__name__)
 @dataclass
 class CalibrationSample:
     """A resolved market with its feature vector and outcome."""
-    features: dict[str, float]
+    features: dict[str, str]
     predicted_p: float
     market_p: float
     outcome: float  # 1.0 = YES, 0.0 = NO
@@ -48,7 +48,7 @@ class FairValueCalibrator:
         predicted_p: float,
         market_p: float,
         outcome: float,
-        features: dict[str, float] | None = None,
+        features: dict[str, str] | None = None,
     ) -> None:
         """Record a resolved market for calibration."""
         self.samples.append(CalibrationSample(
@@ -103,6 +103,49 @@ class FairValueCalibrator:
             and brier_skill > 0.0
         )
 
+    def get_conditional_bias(self, features: dict[str, str]) -> float:
+        """Compute bias correction conditioned on features.
+
+        CL-04: Per-group bias = avg(predicted - outcome) for groups with n>=20.
+        Returns the average bias across all matching feature groups.
+        """
+        if len(self.samples) < 20:
+            return 0.0
+
+        biases: list[float] = []
+        for key, value in features.items():
+            # Find samples matching this feature
+            matching = [s for s in self.samples if s.features.get(key) == value]
+            if len(matching) >= 20:
+                bias = sum(s.predicted_p - s.outcome for s in matching) / len(matching)
+                biases.append(bias)
+
+        if not biases:
+            return 0.0
+        return sum(biases) / len(biases)
+
+    @staticmethod
+    def bin_probability(p: float) -> str:
+        """Bin probability into 5 ranges for conditional calibration."""
+        if p < 0.2:
+            return "0.00-0.20"
+        elif p < 0.4:
+            return "0.20-0.40"
+        elif p < 0.6:
+            return "0.40-0.60"
+        elif p < 0.8:
+            return "0.60-0.80"
+        return "0.80-1.00"
+
+    @staticmethod
+    def bin_uncertainty(u: float) -> str:
+        """Bin uncertainty into 3 levels."""
+        if u < 0.15:
+            return "low"
+        elif u < 0.25:
+            return "medium"
+        return "high"
+
     def save(self, path: str) -> None:
         """Save calibration state."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +155,7 @@ class FairValueCalibrator:
                     "predicted_p": s.predicted_p,
                     "market_p": s.market_p,
                     "outcome": s.outcome,
+                    "features": s.features,  # CL-04: persist features for conditional calibration
                 }
                 for s in self.samples[-500:]  # Keep recent
             ],
@@ -127,7 +171,7 @@ class FairValueCalibrator:
                 data = json.load(f)
             self.samples = [
                 CalibrationSample(
-                    features={},
+                    features=s.get("features", {}),
                     predicted_p=s["predicted_p"],
                     market_p=s["market_p"],
                     outcome=s["outcome"],

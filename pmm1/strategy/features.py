@@ -40,6 +40,8 @@ class FeatureVector(BaseModel):
 
     # Volatility
     realized_vol: float = 0.0  # V_t: short-horizon realized volatility
+    sigma_eff: float = 0.25  # MM-02: binary-appropriate volatility
+    kappa_estimate: float = 0.1  # MM-03 placeholder: adverse-selection intensity
     vol_regime: str = "normal"  # low, normal, high, extreme
 
     # Time features
@@ -179,6 +181,7 @@ class FeatureEngine:
     def __init__(self, trade_window_s: float = 60.0) -> None:
         self._trade_accumulators: dict[str, TradeAccumulator] = {}
         self._trade_window_s = trade_window_s
+        self._kappa_ema: dict[str, float] = {}  # MM-03: per-token kappa EMA
 
     def get_accumulator(self, token_id: str) -> TradeAccumulator:
         """Get or create a trade accumulator for a token."""
@@ -266,14 +269,35 @@ class FeatureEngine:
 
         # Volatility
         realized_vol = acc.get_realized_volatility()
-        if realized_vol < 0.001:
+
+        # MM-02: Binary-appropriate volatility
+        # Bernoulli variance p*(1-p) is the correct variance for binary outcomes
+        # Blend with realized vol for robustness against non-binary price dynamics
+        bernoulli_var = midpoint * (1.0 - midpoint)
+        sigma_eff = (0.7 * bernoulli_var + 0.3 * min(realized_vol ** 2, 0.25)) ** 0.5
+
+        # Derive vol_regime from sigma_eff instead of raw log-return vol
+        # sigma_eff ranges: 0 (at p=0 or p=1) to 0.5 (at p=0.5)
+        if sigma_eff < 0.15:
             vol_regime = "low"
-        elif realized_vol < 0.01:
+        elif sigma_eff < 0.30:
             vol_regime = "normal"
-        elif realized_vol < 0.05:
+        elif sigma_eff < 0.42:
             vol_regime = "high"
         else:
             vol_regime = "extreme"
+
+        # MM-03: Dynamic kappa (order arrival rate) estimation
+        # kappa = alpha * trade_intensity + beta * avg_book_depth
+        alpha_kappa = 0.5
+        beta_kappa = 0.01
+        raw_kappa = alpha_kappa * trade_intensity + beta_kappa * (bid_depth_2c + ask_depth_2c) / 2.0
+        # EMA with 5-minute halflife (~300 observations at 1/sec)
+        ema_decay = 0.997  # exp(-1/300)
+        prev_kappa = self._kappa_ema.get(token_id, raw_kappa)
+        kappa_ema = ema_decay * prev_kappa + (1 - ema_decay) * raw_kappa
+        self._kappa_ema[token_id] = kappa_ema
+        kappa_estimate = max(0.01, kappa_ema)
 
         # Time features
         time_to_resolution_hours = float("inf")
@@ -304,6 +328,8 @@ class FeatureEngine:
             trade_intensity=trade_intensity,
             sweep_intensity=sweep_intensity,
             realized_vol=realized_vol,
+            sigma_eff=sigma_eff,
+            kappa_estimate=kappa_estimate,  # MM-03: dynamic kappa
             vol_regime=vol_regime,
             time_to_resolution_hours=time_to_resolution_hours,
             time_to_resolution_fraction=time_to_resolution_fraction,

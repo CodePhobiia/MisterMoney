@@ -109,9 +109,16 @@ class QuoteEngine:
         # Dynamic gamma: ramp from base to max as inventory ages
         if position_age_hours > 0 and halflife > 0:
             age_factor = 1.0 - math.exp(-0.693 * position_age_hours / halflife)
-            effective_gamma = gamma_base + (gamma_max - gamma_base) * age_factor
         else:
-            effective_gamma = gamma_base
+            age_factor = 0.0
+
+        # MM-11: Inventory-proportional urgency
+        max_position = getattr(self.config, 'max_position_shares', 200.0)
+        inv_fraction = abs(market_inventory) / max(1.0, max_position)
+        inv_urgency = min(1.0, inv_fraction ** 0.5)  # sqrt for diminishing sensitivity
+
+        # Use whichever is stronger: age or inventory urgency
+        effective_gamma = gamma_base + (gamma_max - gamma_base) * max(age_factor, inv_urgency)
 
         r_t = fair_value - effective_gamma * market_inventory - eta * cluster_inventory
         return max(epsilon, min(1.0 - epsilon, r_t))
@@ -122,9 +129,11 @@ class QuoteEngine:
         tick_size: float = 0.01,
         reward_ev: float = 0.0,
     ) -> float:
-        """Compute half-spread δ_t from §7.
+        """Avellaneda-Stoikov optimal half-spread.
 
-        δ_t = max(tick/2, δ_0 + δ_t^tox + δ_t^lat + δ_t^vol − δ_t^reward)
+        delta = (gamma * sigma_eff^2 * t_eff) / 2 + (1/gamma) * ln(1 + gamma/kappa)
+
+        Plus additive adjustments for latency and reward discount.
 
         Args:
             features: Current market features.
@@ -134,32 +143,26 @@ class QuoteEngine:
         Returns:
             Half-spread in price units (not cents).
         """
-        delta_0 = self.config.base_half_spread_cents / 100.0  # Convert cents to price
+        gamma = self.config.inventory_skew_gamma
+        sigma_eff = max(0.01, features.sigma_eff)  # from MM-02 Phase 1
 
-        # Toxicity component: widen on aggressive flow
-        delta_tox = 0.0
-        if features.sweep_intensity > 0.5:
-            delta_tox = 0.005  # +0.5¢ for high sweep activity
-        elif features.sweep_intensity > 0.2:
-            delta_tox = 0.002
+        # Time horizon: normalize to [0, 1] session
+        t_eff = min(features.time_to_resolution_hours, 24.0) / 24.0
+        t_eff = max(0.01, t_eff)  # Floor to prevent zero
 
-        # Latency component (simplified): widen if data is stale
+        # Order arrival rate (kappa) from features
+        kappa = max(0.01, features.kappa_estimate)
+
+        # A-S optimal half-spread
+        delta_as = (gamma * sigma_eff ** 2 * t_eff) / 2 + (1 / gamma) * math.log(1 + gamma / kappa)
+
+        # Latency component (keep from original)
         delta_lat = 0.003 if features.is_stale else 0.0
 
-        # Volatility component
-        delta_vol = 0.0
-        if features.vol_regime == "extreme":
-            delta_vol = 0.01
-        elif features.vol_regime == "high":
-            delta_vol = 0.005
-        elif features.vol_regime == "normal":
-            delta_vol = 0.001
-
-        # Reward discount: tighten spread to capture rewards
+        # Reward discount
         delta_reward = reward_ev * self.config.reward_capture_weight
 
-        # Combine
-        half_spread = delta_0 + delta_tox + delta_lat + delta_vol - delta_reward
+        half_spread = delta_as + delta_lat - delta_reward
         min_half_spread = tick_size / 2.0
 
         return max(min_half_spread, half_spread)
@@ -201,13 +204,17 @@ class QuoteEngine:
             # Kelly sizing (Paper 2 §1 + §2)
             from pmm1.math.kelly import kelly_bet_dollars
 
+            # KP-01: Adaptive lambda ramp — scale with edge_confidence
+            effective_lambda = (
+                cfg.kelly_base_lambda
+                + (cfg.kelly_max_lambda - cfg.kelly_base_lambda) * edge_confidence
+            )
+
             _, dollar_size = kelly_bet_dollars(
                 p_true=fair_value,
                 p_market=market_price,
                 nav=nav,
-                lambda_frac=(
-                    cfg.kelly_fraction * edge_confidence
-                ),
+                lambda_frac=effective_lambda,
                 adverse_selection_lambda=(
                     cfg.kelly_adverse_selection_lambda
                 ),
@@ -437,7 +444,11 @@ class QuoteEngine:
         Returns:
             (should_cross, take_ev)
         """
-        threshold = self.config.take_threshold_cents / 100.0
+        # KP-09: Scale threshold with execution costs
+        base_threshold = self.config.take_threshold_cents / 100.0
+        # Add estimated slippage proportional to quantity
+        slippage_estimate = 0.001 * quantity  # ~0.1c per share
+        effective_threshold = base_threshold + fee + slippage + slippage_estimate
 
         if side == "BUY":
             raw_edge = (fair_value - execution_price) * quantity
@@ -446,7 +457,7 @@ class QuoteEngine:
 
         take_ev = raw_edge - fee - slippage - haircut * quantity
 
-        should_cross = take_ev > threshold * quantity
+        should_cross = raw_edge > effective_threshold * quantity
 
         if should_cross:
             logger.info(
@@ -455,7 +466,7 @@ class QuoteEngine:
                 fair_value=f"{fair_value:.4f}",
                 price=f"{execution_price:.4f}",
                 take_ev=f"{take_ev:.4f}",
-                threshold=f"{threshold:.4f}",
+                threshold=f"{effective_threshold:.4f}",
             )
 
         return should_cross, take_ev

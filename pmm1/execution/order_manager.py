@@ -4,9 +4,11 @@ Per cycle: cancel stale → submit new → reconcile
 
 Rules:
 - postOnly=true with GTC or short GTD
-- TTL default: 20–45s effective
-- Reprice on: price move ≥1 tick, size move ≥20%, age>TTL,
-  tick size change, fill changes inventory
+- TTL default: 60s (MM-06: extended from 30s to reduce churn)
+- Reprice on: price move ≥1 tick (aggressive) or ≥2 ticks (passive),
+  size move ≥30%, age>TTL, tick size change, fill changes inventory
+- MM-06: Queue-aware — skip cancel when new price is worse unless >3 ticks off-market
+- PM-10: Post-fill opposing side cancellation to prevent stale quote exposure
 """
 
 from __future__ import annotations
@@ -88,11 +90,12 @@ class OrderManager:
         client: ClobPrivateClient,
         order_tracker: OrderTracker,
         batcher: OrderBatcher | None = None,
-        order_ttl_s: int = 30,
+        order_ttl_s: int = 60,
         use_gtd: bool = True,
         post_only: bool = True,
         reprice_threshold_ticks: float = 1.0,
-        reprice_threshold_size_pct: float = 0.20,
+        reprice_threshold_ticks_passive: float = 2.0,
+        reprice_threshold_size_pct: float = 0.30,
         spine_emitter: SpineEmitter | None = None,
     ) -> None:
         self._client = client
@@ -102,6 +105,7 @@ class OrderManager:
         self._use_gtd = use_gtd
         self._post_only = post_only
         self._reprice_threshold_ticks = reprice_threshold_ticks
+        self._reprice_threshold_ticks_passive = reprice_threshold_ticks_passive
         self._reprice_threshold_size_pct = reprice_threshold_size_pct
         self._server_time_offset: int = 0
         self._spine = spine_emitter
@@ -182,8 +186,17 @@ class OrderManager:
         desired_request: CreateOrderRequest,
         tick_size: Decimal,
         extra_reasons: list[str] | None = None,
+        mid_price: float | None = None,
     ) -> list[str]:
-        """Return explicit reasons a live order should be replaced."""
+        """Return explicit reasons a live order should be replaced.
+
+        MM-06: Uses a two-tier reprice threshold to reduce cancel/replace churn
+        and preserve FIFO queue position on Polymarket's CLOB.
+        - Passive orders (bid < mid, ask > mid) use the wider passive threshold.
+        - Aggressive/off-market orders use the tighter standard threshold.
+        - If the new price is WORSE (further from mid), skip cancel unless
+          the order is > 3 ticks off-market.
+        """
         reasons = list(extra_reasons or [])
         if live.age_seconds > self._order_ttl_s:
             reasons.append("ttl_expired")
@@ -191,8 +204,43 @@ class OrderManager:
         tick_float = float(tick_size)
         desired_price = float(desired_request.price)
         price_diff = abs(live.price_float - desired_price)
-        if price_diff >= tick_float * self._reprice_threshold_ticks:
-            reasons.append("price_move")
+
+        # MM-06: Determine if the live order is passive relative to mid
+        is_passive = False
+        if mid_price is not None and mid_price > 0:
+            if live.side == "BUY" and live.price_float < mid_price:
+                is_passive = True
+            elif live.side == "SELL" and live.price_float > mid_price:
+                is_passive = True
+
+        # MM-06: Select reprice threshold based on passive vs aggressive
+        effective_threshold = (
+            self._reprice_threshold_ticks_passive
+            if is_passive
+            else self._reprice_threshold_ticks
+        )
+
+        # Use half-tick epsilon to absorb floating-point drift in price comparisons
+        tick_eps = tick_float * 0.1
+        if price_diff >= tick_float * effective_threshold - tick_eps:
+            # MM-06: For passive orders, if the new price is WORSE (further from
+            # mid), skip the cancel unless the live order is > 3 ticks off-market.
+            # This preserves FIFO queue position for well-placed passive quotes.
+            # Aggressive orders always reprice — no queue benefit to protect.
+            skip_for_queue = False
+            if is_passive and mid_price is not None and mid_price > 0:
+                old_dist = abs(live.price_float - mid_price)
+                new_dist = abs(desired_price - mid_price)
+                if new_dist > old_dist:
+                    # New price is worse (further from mid)
+                    off_market_ticks = (
+                        old_dist / tick_float if tick_float > 0 else 0.0
+                    )
+                    if off_market_ticks <= 3.0:
+                        skip_for_queue = True  # preserve queue position
+
+            if not skip_for_queue:
+                reasons.append("price_move")
 
         desired_size = float(desired_request.size)
         live_remaining = live.remaining_size_float
@@ -252,6 +300,7 @@ class OrderManager:
         desired_strategy: str,
         no_desired_reasons: list[str],
         extra_reason_builder: Callable[[TrackedOrder], list[str]] | None = None,
+        mid_price: float | None = None,
     ) -> None:
         """Plan keep/cancel/submit actions for one token side."""
         if desired_request is None:
@@ -278,6 +327,7 @@ class OrderManager:
                 desired_request,
                 Decimal(desired_request.tick_size),
                 extra_reasons=extra_reasons,
+                mid_price=mid_price,
             )
             evaluations.append((live, reasons))
 
@@ -351,12 +401,16 @@ class OrderManager:
                 neg_risk=intent.neg_risk,
             )
 
+        # MM-06: Use reservation_price as mid for passive/aggressive threshold selection
+        mid = intent.reservation_price if intent.reservation_price > 0 else None
+
         self._plan_side(
             diff=diff,
             live_orders=live_bids,
             desired_request=desired_bid,
             desired_strategy=intent.strategy,
             no_desired_reasons=intent.bid_suppression_reasons or ["quote_removed"],
+            mid_price=mid,
         )
         self._plan_side(
             diff=diff,
@@ -364,6 +418,7 @@ class OrderManager:
             desired_request=desired_ask,
             desired_strategy=intent.strategy,
             no_desired_reasons=intent.ask_suppression_reasons or ["quote_removed"],
+            mid_price=mid,
         )
 
         for submission in diff.to_submit:
@@ -763,6 +818,50 @@ class OrderManager:
         except Exception as e:
             logger.error("market_cancel_failed", token_id=token_id[:16], error=str(e))
             return False
+
+    async def cancel_opposing_on_fill(self, token_id: str, filled_side: str) -> None:
+        """Cancel opposing side orders after a fill to prevent stale quote exposure.
+
+        PM-10: After a fill, the remaining opposite-side order is stale
+        and exposed to adverse selection until the next quote cycle recomputes.
+        """
+        opposing = "SELL" if filled_side == "BUY" else "BUY"
+        canceled = 0
+        for order in list(self._tracker.get_active_orders(token_id)):
+            if order.side == opposing:
+                try:
+                    await self._client.cancel_order(order.order_id)
+                    self._tracker.update_state(
+                        order.order_id,
+                        OrderState.CANCELED,
+                        source="post_fill_cancel",
+                    )
+                    await self._emit_order_event(
+                        event_type="order_cancel_requested",
+                        strategy=order.strategy or "mm",
+                        condition_id=order.condition_id,
+                        token_id=order.token_id,
+                        order_id=order.order_id,
+                        payload_json={
+                            "side": order.side,
+                            "source": "post_fill_cancel",
+                            "filled_side": filled_side,
+                        },
+                    )
+                    canceled += 1
+                except Exception as e:
+                    logger.warning(
+                        "post_fill_cancel_failed",
+                        order_id=order.order_id,
+                        error=str(e),
+                    )
+        if canceled:
+            logger.info(
+                "post_fill_opposing_canceled",
+                token_id=token_id[:16],
+                side=opposing,
+                count=canceled,
+            )
 
     async def submit_exit(
         self,

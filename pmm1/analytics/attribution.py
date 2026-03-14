@@ -64,13 +64,22 @@ class PnLAttributor:
         """Add a fill record for attribution."""
         self._fills.append(fill)
 
-    def compute(self) -> Attribution:
-        """Compute full PnL attribution."""
+    def compute(
+        self,
+        market_carry: dict[str, float] | None = None,
+    ) -> Attribution:
+        """Compute full PnL attribution.
+
+        Args:
+            market_carry: Per-market carry PnL from InventoryCarryTracker.
+                          Maps condition_id -> carry amount.
+        """
         attribution = Attribution()
 
         if not self._fills:
             return attribution
 
+        carry = market_carry or {}
         attribution.period_start = self._fills[0].fill_timestamp
         attribution.total_fills = len(self._fills)
 
@@ -92,7 +101,10 @@ class PnLAttributor:
 
         # Compute market attribution
         for condition_id, fills in market_fills.items():
-            mattr = self._compute_market_attribution(condition_id, fills)
+            carry_pnl = carry.get(condition_id, 0.0)
+            mattr = self._compute_market_attribution(
+                condition_id, fills, carry_pnl=carry_pnl,
+            )
             attribution.by_market[condition_id] = mattr
 
         return attribution
@@ -149,9 +161,18 @@ class PnLAttributor:
         )
 
     def _compute_market_attribution(
-        self, condition_id: str, fills: list[FillRecord]
+        self,
+        condition_id: str,
+        fills: list[FillRecord],
+        carry_pnl: float = 0.0,
     ) -> MarketAttribution:
-        """Compute attribution for a single market."""
+        """Compute attribution for a single market.
+
+        Args:
+            condition_id: Market condition ID.
+            fills: Fill records for this market.
+            carry_pnl: Inventory carry PnL from InventoryCarryTracker.
+        """
         total_pnl = 0.0
         total_volume = 0.0
         spread_capture = 0.0
@@ -181,11 +202,12 @@ class PnLAttributor:
 
         return MarketAttribution(
             condition_id=condition_id,
-            total_pnl=total_pnl,
+            total_pnl=total_pnl + carry_pnl,
             fill_count=len(fills),
             total_volume=total_volume,
             spread_capture=spread_capture,
             adverse_selection=adverse_selection,
+            inventory_pnl=carry_pnl,
         )
 
     def reset(self) -> Attribution:

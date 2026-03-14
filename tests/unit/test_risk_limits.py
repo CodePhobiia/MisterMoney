@@ -235,6 +235,61 @@ class TestThematicCorrelation:
         assert remaining == pytest.approx(1.0)
 
 
+class TestAskSizeLimit:
+    """KP-06: Asymmetric risk limits for asks."""
+
+    def test_ask_size_capped(self):
+        """SELL order for 100 shares when position is 100 → capped at 50."""
+        limits = _make_limits(nav=1000.0)
+        pos = limits.positions.register_market("cond-1", "yes-1", "no-1")
+        pos.yes_size = 100.0
+        pos.yes_avg_price = 0.50
+        pos.yes_cost_basis = 50.0
+
+        result = limits.check_ask_size("cond-1", proposed_sell_size=100.0)
+        assert result.passed is False
+        assert any("ask_size_exceeds_position_pct" in b for b in result.breaches)
+        assert result.adjustments["max_sell_size"] == pytest.approx(50.0)
+
+    def test_ask_within_limit_passes(self):
+        """Sell 40 out of 100 shares (40% < 50%) → passes."""
+        limits = _make_limits(nav=1000.0)
+        pos = limits.positions.register_market("cond-1", "yes-1", "no-1")
+        pos.yes_size = 100.0
+        pos.yes_avg_price = 0.50
+        pos.yes_cost_basis = 50.0
+
+        result = limits.check_ask_size("cond-1", proposed_sell_size=40.0)
+        assert result.passed is True
+
+    def test_ask_no_position_passes(self):
+        """No position → sell check passes (nothing to cap against)."""
+        limits = _make_limits(nav=1000.0)
+        result = limits.check_ask_size("cond-unknown", proposed_sell_size=100.0)
+        assert result.passed is True
+
+    def test_apply_to_quote_caps_ask_size(self):
+        """apply_to_quote should cap ask size based on position."""
+        limits = _make_limits(nav=1000.0, per_market_gross_nav=0.10)
+        pos = limits.positions.register_market("cond-1", "yes-1", "no-1")
+        pos.yes_size = 100.0
+        pos.yes_avg_price = 0.50
+        pos.yes_cost_basis = 50.0
+
+        intent = QuoteIntent(
+            condition_id="cond-1",
+            token_id="yes-1",
+            bid_price=0.50,
+            bid_size=5.0,
+            ask_price=0.51,
+            ask_size=100.0,  # Trying to sell entire position
+        )
+        result, diagnostics = limits.apply_to_quote_with_diagnostics(intent)
+        # Ask should be capped at 50% of 100 = 50
+        assert result.ask_size == pytest.approx(50.0)
+        assert "ask_size_exceeds_position_pct" in diagnostics.ask_reasons
+
+
 class TestNavZeroBlocks:
     def test_nav_zero_blocks_all_checks(self):
         """R-C1: All 4 risk checks must fail when NAV is zero."""

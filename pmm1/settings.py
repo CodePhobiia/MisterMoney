@@ -92,11 +92,15 @@ class PricingConfig(BaseModel):
     k_3: float = 0.2  # resolution risk
     k_4: float = 0.1  # model error
     # Kelly sizing parameters (Paper 2 §1)
-    kelly_enabled: bool = False
+    kelly_enabled: bool = True
     kelly_fraction: float = 0.25  # quarter-Kelly default
+    kelly_base_lambda: float = 0.10  # KP-01: adaptive ramp floor
+    kelly_max_lambda: float = 0.35  # KP-01: adaptive ramp ceiling
     kelly_min_edge: float = 0.03  # 3% minimum edge to size
     kelly_max_position_nav: float = 0.05  # 5% max per position
     kelly_adverse_selection_lambda: float = 1.0  # 1.0 = blend handles AS
+    # MM-11: Inventory-proportional gamma
+    max_position_shares: float = 200.0
     # Fill model coefficients
     theta_0: float = -1.0
     theta_1: float = 5.0
@@ -113,6 +117,8 @@ class RiskConfig(BaseModel):
     total_arb_gross_nav: float = 0.25
     max_orders_per_market_side: int = 3
     max_quoted_markets: int = 20
+    # KP-06: Asymmetric ask-side limit — cap sells at this fraction of position per cycle
+    max_ask_pct_of_position: float = 0.50
     daily_pause_drawdown_nav: float = 0.015
     daily_wider_drawdown_nav: float = 0.025
     daily_flatten_drawdown_nav: float = 0.04
@@ -188,6 +194,14 @@ class StorageConfig(BaseModel):
     redis_url: str = "redis://localhost:6379/0"
     postgres_dsn: str = "postgresql://pmm1:pmm1@localhost:5432/pmm1"
     parquet_dir: str = "./data/parquet"
+
+
+class AnalyticsConfig(BaseModel):
+    """Analytics and learning system configuration."""
+
+    edge_tracker_persist_path: str = "data/edge_tracker.json"
+    edge_tracker_discount: float = 0.8
+    carry_snapshot_interval_s: float = 60.0
 
 
 class TakeProfitConfig(BaseModel):
@@ -390,6 +404,7 @@ class Settings(BaseSettings):
     exit: ExitConfig = Field(default_factory=ExitConfig)
     v3: V3Config = Field(default_factory=V3Config)
     ops: OpsConfig = Field(default_factory=OpsConfig)
+    analytics: AnalyticsConfig = Field(default_factory=AnalyticsConfig)
     config_metadata: dict[str, Any] = Field(default_factory=dict, exclude=True)
     raw_config: dict[str, Any] = Field(default_factory=dict, exclude=True)
     config_base_path: str = Field(default="", exclude=True)

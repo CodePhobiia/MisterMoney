@@ -77,15 +77,24 @@ def annualized_sharpe(
     return per_trade_sr * math.sqrt(trades_per_year)
 
 
-def rolling_sharpe(returns: list[float], window: int = 100) -> float:
+def rolling_sharpe(
+    returns: list[float],
+    window: int = 100,
+    lo_correction: bool = False,
+    annualization_factor: int = 500,
+) -> float:
     """Rolling Sharpe ratio over recent trades.
 
     Args:
         returns: Per-trade returns (positive = profit).
         window: Number of recent trades to consider.
+        lo_correction: If True, apply Lo (2002) autocorrelation correction.
+        annualization_factor: Trades per year for annualization when using
+            Lo correction.
 
     Returns:
-        Sharpe ratio (mean / std of returns).
+        Sharpe ratio (mean / std of returns).  When lo_correction is True
+        the returned value is the annualized, autocorrelation-corrected SR.
     """
     if len(returns) < 2:
         return 0.0
@@ -98,7 +107,15 @@ def rolling_sharpe(returns: list[float], window: int = 100) -> float:
     if var <= 0:
         return 0.0 if mean == 0 else 10.0 if mean > 0 else -10.0
 
-    return mean / math.sqrt(var)
+    raw_sr = mean / math.sqrt(var)
+
+    if lo_correction:
+        corrected, _ = lo_corrected_sharpe(
+            recent, annualization_factor=annualization_factor,
+        )
+        return corrected
+
+    return raw_sr
 
 
 def sprt_update(
@@ -301,6 +318,178 @@ def log_loss(probs: list[float], outcomes: list[float]) -> float:
             total -= math.log(1.0 - p)
 
     return total / len(probs)
+
+
+def glr_to_pvalue(glr_stat: float) -> float:
+    """Convert GLR statistic to chi-squared(1) p-value.
+
+    Uses Wilson-Hilferty approximation for chi-squared survival function.
+    """
+    if glr_stat <= 0:
+        return 1.0
+    # Wilson-Hilferty approximation for chi-squared(1) CDF
+    z = (glr_stat ** (1 / 3) - (1 - 2 / 9)) / math.sqrt(2 / 9)
+    # Standard normal survival function approximation
+    return 0.5 * math.erfc(z / math.sqrt(2))
+
+
+class CusumDetector:
+    """Two-sided CUSUM for detecting edge appearance/disappearance.
+
+    Upper CUSUM detects positive edge (reinforce).
+    Lower CUSUM detects edge disappearance (defensive mode).
+
+    ARL0 ~500, designed to detect 5% shift in win rate.
+    """
+
+    def __init__(
+        self, mu0: float = 0.5, k: float = 0.025, h: float = 4.0,
+    ) -> None:
+        self.mu0 = mu0  # null mean (break-even win rate)
+        self.k = k       # allowance parameter (half the shift to detect)
+        self.h = h       # threshold (controls ARL0)
+        self.S_up = 0.0
+        self.S_dn = 0.0
+        self._alarm_up = False
+        self._alarm_dn = False
+
+    def update(self, x: float) -> None:
+        """Update with new observation (1.0 = win, 0.0 = loss)."""
+        self.S_up = max(0.0, self.S_up + x - self.mu0 - self.k)
+        self.S_dn = max(0.0, self.S_dn - x + self.mu0 - self.k)
+        if self.S_up >= self.h:
+            self._alarm_up = True
+        if self.S_dn >= self.h:
+            self._alarm_dn = True
+
+    def reset(self) -> None:
+        self.S_up = 0.0
+        self.S_dn = 0.0
+        self._alarm_up = False
+        self._alarm_dn = False
+
+    @property
+    def edge_alarm(self) -> bool:
+        """True if positive edge detected."""
+        return self._alarm_up
+
+    @property
+    def no_edge_alarm(self) -> bool:
+        """True if edge disappearance detected."""
+        return self._alarm_dn
+
+    @property
+    def status(self) -> str:
+        if self._alarm_dn:
+            return "edge_lost"
+        if self._alarm_up:
+            return "edge_detected"
+        return "monitoring"
+
+
+def lo_corrected_sharpe(
+    returns: list[float],
+    annualization_factor: int = 500,
+    max_lag: int = 5,
+) -> tuple[float, float]:
+    """Sharpe ratio with Lo (2002) autocorrelation correction.
+
+    Standard annualization overstates Sharpe by up to 65% with positive
+    autocorrelation. This correction accounts for serial correlation.
+
+    Returns:
+        (corrected_sharpe, standard_error)
+    """
+    n = len(returns)
+    if n < max_lag + 2:
+        return (0.0, float("inf"))
+
+    mean_r = sum(returns) / n
+    var_r = sum((r - mean_r) ** 2 for r in returns) / (n - 1)
+    if var_r < 1e-15:
+        return (0.0, float("inf"))
+
+    std_r = var_r ** 0.5
+    sr_per_trade = mean_r / std_r
+
+    # Compute empirical autocorrelations up to max_lag
+    autocorrs: list[float] = []
+    for lag in range(1, max_lag + 1):
+        cov = sum(
+            (returns[i] - mean_r) * (returns[i - lag] - mean_r)
+            for i in range(lag, n)
+        ) / (n - 1)
+        autocorrs.append(cov / var_r)
+
+    # Lo correction: eta(q) = q + 2 * sum_{k=1}^{q-1} (q-k) * rho_k
+    q = annualization_factor
+    eta = float(q)
+    for lag_idx, rho_k in enumerate(autocorrs):
+        k = lag_idx + 1
+        if k < q:
+            eta += 2 * (q - k) * rho_k
+
+    # Prevent negative eta (pathological case)
+    eta = max(1.0, eta)
+
+    # Corrected annualized Sharpe
+    # Naive: SR_annual = SR_per_trade * sqrt(q)
+    # Lo:    SR_annual = SR_per_trade * q / sqrt(eta)
+    # When eta == q (iid), this equals the naive formula.
+    corrected_sr = sr_per_trade * q / eta ** 0.5
+
+    # Standard error of Sharpe ratio
+    se = ((1 + 0.5 * sr_per_trade ** 2) / n) ** 0.5
+
+    return (corrected_sr, se)
+
+
+def brier_decomposition(
+    probs: list[float],
+    outcomes: list[float],
+    n_bins: int = 10,
+) -> tuple[float, float, float]:
+    """Murphy (1973) Brier score decomposition.
+
+    BS = reliability - resolution + uncertainty
+
+    - Reliability (calibration error): lower is better
+    - Resolution (forecast sharpness): higher is better
+    - Uncertainty (inherent task difficulty): not controllable
+
+    Returns:
+        (reliability, resolution, uncertainty)
+    """
+    n = len(probs)
+    if n == 0:
+        return (0.0, 0.0, 0.25)
+
+    base_rate = sum(outcomes) / n
+    uncertainty = base_rate * (1 - base_rate)
+
+    # Bin forecasts
+    bins: dict[int, list[tuple[float, float]]] = {}
+    for p, o in zip(probs, outcomes):
+        b = min(int(p * n_bins), n_bins - 1)
+        bins.setdefault(b, []).append((p, o))
+
+    reliability = 0.0
+    resolution = 0.0
+
+    for bin_items in bins.values():
+        n_k = len(bin_items)
+        if n_k == 0:
+            continue
+        avg_forecast = sum(p for p, _ in bin_items) / n_k
+        avg_outcome = sum(o for _, o in bin_items) / n_k
+
+        reliability += n_k * (avg_forecast - avg_outcome) ** 2
+        resolution += n_k * (avg_outcome - base_rate) ** 2
+
+    reliability /= n
+    resolution /= n
+
+    return (reliability, resolution, uncertainty)
 
 
 def _z_score(percentile: float) -> float:

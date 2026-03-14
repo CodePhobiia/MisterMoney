@@ -112,6 +112,7 @@ class PnLTracker:
         self._daily_rewards: float = 0.0
         self._daily_start_ts: float = time.time()
         self._reject_count: int = 0
+        self._inventory_carry: float = 0.0
 
     def record_fill(self, fill: FillRecord) -> None:
         """Record a fill for PnL tracking."""
@@ -149,6 +150,10 @@ class PnLTracker:
     def record_reject(self) -> None:
         """Record an order rejection."""
         self._reject_count += 1
+
+    def set_inventory_carry(self, amount: float) -> None:
+        """Set current inventory carry amount from InventoryCarryTracker."""
+        self._inventory_carry = amount
 
     def compute_snapshot(self, period_label: str = "session") -> PnLSnapshot:
         """Compute current PnL decomposition."""
@@ -206,6 +211,7 @@ class PnLTracker:
 
         snapshot.maker_rebates = self._daily_rebates
         snapshot.liquidity_rewards = self._daily_rewards
+        snapshot.inventory_carry = self._inventory_carry
         snapshot.total_trades = len(self._fills)
         snapshot.total_volume = total_volume
 

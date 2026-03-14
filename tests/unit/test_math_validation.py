@@ -4,9 +4,13 @@ import json
 import math
 
 from pmm1.math.validation import (
+    CusumDetector,
     annualized_sharpe,
+    brier_decomposition,
     brier_score,
     expected_calibration_error,
+    glr_to_pvalue,
+    lo_corrected_sharpe,
     log_loss,
     per_trade_sharpe,
     required_sample_size,
@@ -305,3 +309,146 @@ def test_sprt_glr_false_positive_rate():
             false_positives += 1
     fpr = false_positives / trials
     assert fpr < 0.10, f"False positive rate {fpr:.3f} exceeds 10%"
+
+
+# ── ST-09: GLR p-value export ─────────────────────────────────────
+
+
+def test_glr_to_pvalue():
+    """GLR=0 → p=1.0, GLR=3.84 → p≈0.05, GLR=6.63 → p≈0.01."""
+    assert glr_to_pvalue(0.0) == 1.0
+    assert glr_to_pvalue(-1.0) == 1.0
+
+    p_384 = glr_to_pvalue(3.84)
+    assert 0.03 <= p_384 <= 0.07, f"Expected ~0.05, got {p_384}"
+
+    p_663 = glr_to_pvalue(6.63)
+    assert 0.005 <= p_663 <= 0.02, f"Expected ~0.01, got {p_663}"
+
+
+# ── ST-01: CUSUM edge disappearance detector ──────────────────────
+
+
+def test_cusum_detects_shift():
+    """100 obs at 50% (no alarm), then 200 at 55% → edge_alarm fires."""
+    import random
+
+    random.seed(42)
+    det = CusumDetector(mu0=0.5, k=0.025, h=4.0)
+
+    # Phase 1: alternating wins/losses (exactly 50%, no alarm possible)
+    for i in range(100):
+        det.update(1.0 if i % 2 == 0 else 0.0)
+    assert not det.edge_alarm, "False alarm during fair-coin phase"
+
+    # Phase 2: biased coin at 55% — should eventually trigger
+    for _ in range(200):
+        det.update(1.0 if random.random() < 0.55 else 0.0)
+
+    assert det.edge_alarm, "CUSUM failed to detect 5% upward shift"
+    assert det.status in ("edge_detected", "edge_lost")
+
+
+def test_cusum_no_false_alarm():
+    """500 obs at exactly 50% — no alarm (ARL0 test).
+
+    Uses alternating wins/losses so the sequence is perfectly balanced.
+    """
+    det = CusumDetector(mu0=0.5, k=0.025, h=4.0)
+
+    for i in range(500):
+        det.update(1.0 if i % 2 == 0 else 0.0)
+
+    assert not det.edge_alarm, "False positive on fair coin (upper)"
+    assert not det.no_edge_alarm, "False positive on fair coin (lower)"
+    assert det.status == "monitoring"
+
+
+# ── ST-04: Sharpe autocorrelation correction (Lo 2002) ────────────
+
+
+def test_lo_corrected_sharpe_no_autocorrelation():
+    """With iid returns, Lo correction should be minimal."""
+    import random
+
+    random.seed(96)
+    # iid normal-ish returns with small positive mean
+    returns = [random.gauss(0.001, 0.01) for _ in range(500)]
+
+    corrected, se = lo_corrected_sharpe(returns, annualization_factor=500)
+    n = len(returns)
+    mean_r = sum(returns) / n
+    var_r = sum((r - mean_r) ** 2 for r in returns) / (n - 1)
+    naive_annual = (mean_r / var_r ** 0.5) * 500 ** 0.5
+
+    # With iid data the correction should leave the SR roughly the same
+    ratio = corrected / naive_annual if abs(naive_annual) > 1e-10 else 1.0
+    assert 0.85 <= ratio <= 1.15, (
+        f"Expected minimal correction, got ratio={ratio:.3f}"
+    )
+    assert se > 0 and math.isfinite(se)
+
+
+def test_lo_corrected_sharpe_positive_autocorrelation():
+    """With known rho≈0.1, corrected SR should be meaningfully lower."""
+    import random
+
+    random.seed(7)
+    n = 1000
+    # Generate AR(1) returns with rho ≈ 0.3 to make the effect strong
+    rho = 0.3
+    returns = [random.gauss(0.002, 0.01)]
+    for _ in range(n - 1):
+        r = 0.002 + rho * (returns[-1] - 0.002) + random.gauss(0, 0.01)
+        returns.append(r)
+
+    corrected, _ = lo_corrected_sharpe(returns, annualization_factor=500)
+    mean_r = sum(returns) / len(returns)
+    var_r = sum((r - mean_r) ** 2 for r in returns) / (len(returns) - 1)
+    naive_annual = (mean_r / var_r ** 0.5) * 500 ** 0.5
+
+    # Corrected should be noticeably lower than naive
+    assert corrected < naive_annual * 0.95, (
+        f"Expected >=5% reduction, naive={naive_annual:.3f}, "
+        f"corrected={corrected:.3f}"
+    )
+
+
+# ── ST-05: Brier score decomposition (Murphy 1973) ────────────────
+
+
+def test_brier_decomposition_sums_to_brier():
+    """reliability - resolution + uncertainty ≈ brier_score."""
+    import random
+
+    random.seed(42)
+    probs = [random.random() for _ in range(200)]
+    outcomes = [1.0 if random.random() < p else 0.0 for p in probs]
+
+    rel, res, unc = brier_decomposition(probs, outcomes, n_bins=10)
+    reconstructed = rel - res + unc
+    actual = brier_score(probs, outcomes)
+
+    assert abs(reconstructed - actual) < 0.02, (
+        f"Decomposition mismatch: {reconstructed:.4f} vs {actual:.4f}"
+    )
+
+
+def test_brier_decomposition_perfect_calibration():
+    """Perfect forecaster → reliability ≈ 0."""
+    import random
+
+    random.seed(42)
+    # Use a large sample so empirical frequencies converge
+    probs = []
+    outcomes = []
+    for _ in range(5000):
+        p = random.choice([0.2, 0.4, 0.6, 0.8])
+        o = 1.0 if random.random() < p else 0.0
+        probs.append(p)
+        outcomes.append(o)
+
+    rel, res, unc = brier_decomposition(probs, outcomes, n_bins=10)
+    assert rel < 0.005, f"Expected reliability ≈ 0, got {rel:.4f}"
+    assert res > 0, "Resolution should be positive for a sharp forecaster"
+    assert 0.0 < unc < 0.26, f"Unexpected uncertainty: {unc:.4f}"

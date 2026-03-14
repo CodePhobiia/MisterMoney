@@ -12,9 +12,10 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from pmm1.analytics.fv_calibrator import FairValueCalibrator
+
 if TYPE_CHECKING:
     from pmm1.analytics.edge_tracker import EdgeTracker
-    from pmm1.analytics.fv_calibrator import FairValueCalibrator
 
 logger = structlog.get_logger(__name__)
 
@@ -87,10 +88,15 @@ class ResolutionRecorder:
                     condition_id=fill.condition_id,
                 )
             if self._fv_calibrator is not None:
+                features = {
+                    "prob_bin": FairValueCalibrator.bin_probability(fill.predicted_p),
+                    "side": fill.side,
+                }
                 self._fv_calibrator.record_sample(
                     predicted_p=fill.predicted_p,
                     market_p=fill.market_p,
                     outcome=outcome,
+                    features=features,
                 )
         if fills:
             logger.info(

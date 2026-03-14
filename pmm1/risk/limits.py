@@ -234,6 +234,46 @@ class RiskLimits:
             )
         return LimitCheckResult(passed=True)
 
+    def check_ask_size(
+        self,
+        condition_id: str,
+        proposed_sell_size: float,
+    ) -> LimitCheckResult:
+        """KP-06: Cap sell (ask) size at a fraction of current position per cycle.
+
+        Asks reduce exposure, but selling too much too fast creates its own risk
+        (adverse selection, market impact). Cap at max_ask_pct_of_position of
+        current position size.
+
+        Args:
+            condition_id: The market condition ID.
+            proposed_sell_size: Proposed number of shares to sell.
+
+        Returns:
+            LimitCheckResult with max allowed sell size if breached.
+        """
+        pos = self.positions.get(condition_id)
+        if pos is None:
+            # No position — can't sell what we don't have
+            return LimitCheckResult(passed=True)
+
+        position_size = pos.yes_size + pos.no_size
+        if position_size <= 0:
+            return LimitCheckResult(passed=True)
+
+        max_sell = position_size * self.config.max_ask_pct_of_position
+        if proposed_sell_size > max_sell:
+            return LimitCheckResult(
+                passed=False,
+                breaches=[
+                    f"ask_size_exceeds_position_pct: sell {proposed_sell_size:.2f} > "
+                    f"{max_sell:.2f} ({self.config.max_ask_pct_of_position*100:.0f}% "
+                    f"of position {position_size:.2f})"
+                ],
+                adjustments={"max_sell_size": max_sell},
+            )
+        return LimitCheckResult(passed=True)
+
     def apply_to_quote_with_diagnostics(
         self,
         intent: QuoteIntent,
@@ -319,9 +359,26 @@ class RiskLimits:
                         intent.bid_size = min(intent.bid_size, max_add / intent.bid_price)
                         diagnostics.bid_reasons.append("event_cluster")
 
-        # Restore ask side (never blocked by risk limits)
+        # Restore ask side — apply relaxed ask-side limit (KP-06)
         intent.ask_price = saved_ask_price
         intent.ask_size = saved_ask_size
+
+        if intent.ask_size and intent.ask_size > 0:
+            ask_check = self.check_ask_size(intent.condition_id, intent.ask_size)
+            if not ask_check.passed:
+                max_sell = ask_check.adjustments.get("max_sell_size", 0)
+                if max_sell <= 0:
+                    intent.ask_size = 0
+                    intent.ask_price = None
+                    diagnostics.ask_reasons.append("ask_size_exceeds_position_pct")
+                    logger.warning(
+                        "risk_zeroed_ask",
+                        condition_id=intent.condition_id[:16],
+                        reason="ask_size_exceeds_position_pct",
+                    )
+                else:
+                    intent.ask_size = max_sell
+                    diagnostics.ask_reasons.append("ask_size_exceeds_position_pct")
 
         # Total directional check
         net_add = (intent.bid_size or 0) * (intent.bid_price or 0.0)
