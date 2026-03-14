@@ -88,6 +88,44 @@ class TestTotalDirectional:
         result = limits.check_total_directional(proposed_additional_net=15.0)
         assert result.passed is False
 
+    def test_buy_increasing_exposure_past_limit_is_blocked(self):
+        """A buy that pushes net exposure past the limit should be blocked."""
+        limits = _make_limits(nav=1000.0, total_directional_nav=0.10)  # limit = 100
+        # Simulate existing directional exposure of 90 (near limit of 100)
+        pos = limits.positions.register_market("cond-1", "yes-1", "no-1")
+        pos.yes_size = 100.0
+        pos.yes_avg_price = 0.90
+        pos.yes_cost_basis = 90.0
+        # Mark-to-market: 100 shares * 0.90 = 90 net exposure
+        limits.set_price_oracle_provider(lambda: {"yes-1": 0.90, "no-1": 0.10})
+
+        # Proposed buy adds 20 more → abs(90 + 20) = 110 > 100 → blocked
+        result = limits.check_total_directional(proposed_additional_net=20.0)
+        assert result.passed is False
+        assert any("total_directional" in b for b in result.breaches)
+
+    def test_signed_input_hedging_reduces_exposure(self):
+        """A negative proposed_additional_net (hedge/sell) should reduce net exposure."""
+        limits = _make_limits(nav=1000.0, total_directional_nav=0.10)  # limit = 100
+        # Simulate existing directional exposure of 80
+        pos = limits.positions.register_market("cond-1", "yes-1", "no-1")
+        pos.yes_size = 100.0
+        pos.yes_avg_price = 0.80
+        pos.yes_cost_basis = 80.0
+        limits.set_price_oracle_provider(lambda: {"yes-1": 0.80, "no-1": 0.20})
+
+        # Proposed hedge (sell) reduces exposure: abs(80 + (-30)) = 50 < 100 → pass
+        result = limits.check_total_directional(proposed_additional_net=-30.0)
+        assert result.passed is True
+
+    def test_exactly_at_limit_passes(self):
+        """Exposure exactly at the limit should pass (not strictly greater)."""
+        limits = _make_limits(nav=1000.0, total_directional_nav=0.10)  # limit = 100
+        # No existing positions, so current_net = 0
+        # Proposed = 100 → abs(0 + 100) = 100, limit = 100 → 100 > 100 is False → pass
+        result = limits.check_total_directional(proposed_additional_net=100.0)
+        assert result.passed is True
+
     def test_uses_mark_to_market_directional_exposure(self):
         limits = _make_limits(nav=100.0, total_directional_nav=0.02)
         pos = limits.positions.register_market("cond-1", "yes-1", "no-1")

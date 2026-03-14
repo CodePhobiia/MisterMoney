@@ -278,7 +278,7 @@ class ReasonerMemory:
             ),
             "optimal_alpha": (
                 round(self.get_optimal_alpha(), 3)
-                if self.is_calibrated else 1.73
+                if self.is_calibrated else 1.3
             ),
             "brier_by_category": {
                 k: round(v, 4)
@@ -303,7 +303,7 @@ class ReasonerMemory:
                     "category": e.category,
                     "resolved_at": e.resolved_at,
                 }
-                for e in self._resolved[-500:]  # Keep recent
+                for e in self._resolved[-5000:]  # Keep recent
             ]
             with open(self.persist_path, "w") as f:
                 json.dump(data, f)

@@ -32,6 +32,7 @@ from pmm1.analytics.edge_tracker import EdgeTracker
 from pmm1.analytics.fv_calibrator import FairValueCalibrator
 from pmm1.analytics.metrics import MetricsCollector
 from pmm1.analytics.pnl import PnLTracker
+from pmm1.analytics.resolution_recorder import ResolutionRecorder
 from pmm1.api.clob_private import (
     ClobPrivateClient,
     CreateOrderRequest,
@@ -991,6 +992,7 @@ async def run(settings: Settings | None = None) -> None:
     # ── Paper 2 math wiring: EdgeTracker + FairValueCalibrator ──
     edge_tracker = EdgeTracker(min_trades=50, target_edge=0.05)
     fv_calibrator = FairValueCalibrator(min_samples=100)
+    resolution_recorder = ResolutionRecorder(edge_tracker, fv_calibrator)
 
     # ── Embedded Opus reasoner (OAuth, background loop) ──
     from pmm1.strategy.market_context import MarketContextBuilder
@@ -1900,25 +1902,17 @@ async def run(settings: Settings | None = None) -> None:
                 side=side,
             )
 
-        # Paper 2 §5: record fill for edge validation
-        if edge_tracker and mid_at_fill is not None:
-            edge_tracker.record_trade(
+        # Paper 2 §5: record fill for edge validation AT RESOLUTION TIME
+        # (not here -- outcome is unknown until market resolves)
+        # F01 fix: previously passed outcome=1.0 if BUY else 0.0 which
+        # encoded trade direction, not actual market resolution.
+        if resolution_recorder and mid_at_fill is not None:
+            resolution_recorder.record_fill(
+                condition_id=condition_id,
                 predicted_p=mid_at_fill,
                 market_p=price,
-                outcome=1.0 if side == "BUY" else 0.0,
                 pnl=realized_spread_capture or 0.0,
                 side=side,
-                condition_id=condition_id,
-            )
-
-        # Paper 2: record fill for FV calibration
-        if fv_calibrator and mid_at_fill is not None:
-            fv_calibrator.record_sample(
-                predicted_p=mid_at_fill,
-                market_p=price,
-                outcome=(
-                    1.0 if side == "BUY" else 0.0
-                ),
             )
 
         pnl_text = ""
@@ -2498,6 +2492,7 @@ async def run(settings: Settings | None = None) -> None:
     cycle_count = 0
     quote_interval = settings.bot.quote_cycle_ms / 1000.0
     last_rebate_check = 0.0  # S0-3: track last rebate check time
+    last_resolution_check = 0.0  # F01: track last resolution outcome check
     last_nav_snapshot_emit = 0.0
     summary_lifecycle_counts = zero_lifecycle_counts()
     summary_replacement_reason_counts: dict[str, int] = defaultdict(int)
@@ -2528,6 +2523,26 @@ async def run(settings: Settings | None = None) -> None:
                 except Exception as e:
                     logger.error("rebate_check_error", error=str(e))
                     last_rebate_check = time.time()  # Don't retry immediately on error
+
+            # ── F01: Check for resolved markets — every 5 minutes ──
+            # When a market resolves, flush pending fills to edge_tracker /
+            # fv_calibrator with the ACTUAL outcome (not trade side).
+            if resolution_recorder and resolution_recorder.pending_count > 0:
+                if (time.time() - last_resolution_check) >= 300:
+                    last_resolution_check = time.time()
+                    try:
+                        _pending_cids = list(resolution_recorder._pending.keys())
+                        for _cid in _pending_cids[:10]:  # batch: max 10 per cycle
+                            _mkt = await gamma.get_market_by_condition(_cid)
+                            if _mkt and _mkt.closed:
+                                _prices = _mkt.outcome_prices_list
+                                if len(_prices) >= 1 and _prices[0] in (0.0, 1.0):
+                                    resolution_recorder.on_market_resolved(
+                                        _cid,
+                                        outcome=_prices[0],  # 1.0=YES, 0.0=NO
+                                    )
+                    except Exception as _e:
+                        logger.warning("resolution_check_error", error=str(_e))
 
             # ── Kill switch check (skip in paper mode) ──
             if not paper_mode:

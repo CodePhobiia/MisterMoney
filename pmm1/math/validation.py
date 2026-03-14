@@ -96,7 +96,7 @@ def rolling_sharpe(returns: list[float], window: int = 100) -> float:
     var = sum((r - mean) ** 2 for r in recent) / (n - 1)
 
     if var <= 0:
-        return 0.0 if mean == 0 else float("inf") if mean > 0 else float("-inf")
+        return 0.0 if mean == 0 else 10.0 if mean > 0 else -10.0
 
     return mean / math.sqrt(var)
 

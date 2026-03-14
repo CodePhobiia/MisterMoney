@@ -213,7 +213,12 @@ class QuoteEngine:
                 min_edge=cfg.kelly_min_edge,
                 max_position_nav=cfg.kelly_max_position_nav,
             )
-            # Adjust for correlated simultaneous positions (M5)
+            # M5: Correlation adjustment for simultaneous positions.
+            # We pass 1.0 (not the actual Kelly fraction) because the function
+            # is linear in f_star, so multi_bet_kelly_adjustment(1.0, N, rho)
+            # returns the pure scaling factor 1/(1+(N-1)*rho) which we then
+            # multiply into dollar_size. Mathematically equivalent to passing
+            # the real fraction and using the result directly.
             if n_active_positions > 1:
                 from pmm1.math.kelly import multi_bet_kelly_adjustment
                 corr_factor = multi_bet_kelly_adjustment(
@@ -343,7 +348,19 @@ class QuoteEngine:
             n_active_positions=n_active_positions,
         )
 
-        # Asymmetric sizing: smaller on the side with more inventory
+        # Asymmetric sizing to encourage position flattening:
+        #
+        # When long YES (inventory > 0):
+        #   - Reduce bid_size: don't accumulate more long
+        #   - Boost ask_size: encourage selling to flatten
+        #
+        # When short YES (inventory < 0):
+        #   - Reduce ask_size: don't increase the short further
+        #   - Boost bid_size: encourage buying to close the short
+        #
+        # Note: market_inventory is negative in the short case, so
+        # (1.0 + 0.05 * negative_value) < 1.0 → reduces ask_size ✓
+        # (1.0 - 0.03 * negative_value) > 1.0 → boosts bid_size ✓
         bid_size = size
         ask_size = size
 

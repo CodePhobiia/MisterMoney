@@ -158,6 +158,8 @@ class LiveMutationGuard:
                     },
                 )
 
+        # Only BUY orders reach this point — SELLs return early (line 105-115),
+        # so proposed_additional_net is always positive here.
         directional_check = self._risk_limits.check_total_directional(
             proposed_additional_net=size * price,
         )

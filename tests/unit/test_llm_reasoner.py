@@ -523,6 +523,30 @@ async def test_call_opus_uses_model_parameter():
     assert captured_body["model"] == "default-model"
 
 
+def test_decay_move_factor_capped():
+    """F06: move_factor is capped at 5.0, so signal doesn't fully collapse."""
+    est = _make_estimate(p_calibrated=0.70)
+    # Set age to 120 seconds
+    est.generated_at = time.time() - 120
+
+    decayed = est.decay_toward_market(
+        market_mid=0.50,
+        half_life_s=900.0,
+        price_change_since_signal=0.50,
+    )
+    # With cap (move_factor=5.0), signal should still be measurably above 0.50
+    assert decayed > 0.50 + 0.01, (
+        f"Decayed value {decayed} should be measurably above 0.50"
+    )
+
+
+def test_reasoner_config_redacts_auth_token():
+    """F13: auth_token is not visible in repr()."""
+    config = ReasonerConfig(auth_token="sk-ant-secret-token")
+    config_repr = repr(config)
+    assert "sk-ant-secret" not in config_repr
+
+
 def test_class_level_circuit_constants():
     """Circuit breaker constants are class-level."""
     assert LLMReasoner._MAX_CONSECUTIVE_FAILURES == 5

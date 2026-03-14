@@ -88,3 +88,26 @@ def test_brier_by_category():
     by_cat = mem.get_brier_by_category()
     assert "sports" in by_cat
     assert "politics" in by_cat
+
+
+def test_1000_entries_survive_save_load():
+    """F04: 1000 entries survive save/load round-trip (retention is 5000, not 500)."""
+    path = os.path.join(tempfile.mkdtemp(), "mem.json")
+    mem = ReasonerMemory(persist_path=path, min_for_calibration=2)
+
+    for i in range(1000):
+        mem.record_resolution(
+            f"m{i}", float(i % 2), 0.5, 0.5, 0.5, 0.2, "test",
+        )
+
+    # Reload from disk
+    mem2 = ReasonerMemory(persist_path=path, min_for_calibration=2)
+    assert len(mem2._resolved) == 1000
+
+
+def test_get_summary_default_alpha():
+    """F12/F15: Empty ReasonerMemory returns optimal_alpha == 1.3."""
+    path = os.path.join(tempfile.mkdtemp(), "mem_alpha.json")
+    mem = ReasonerMemory(persist_path=path, min_for_calibration=50)
+    summary = mem.get_summary()
+    assert summary["optimal_alpha"] == 1.3

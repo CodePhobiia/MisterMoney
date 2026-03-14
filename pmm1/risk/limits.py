@@ -156,7 +156,7 @@ class RiskLimits:
         current_net = self.positions.get_total_directional_exposure_mark_to_market(
             price_oracle=self._current_price_oracle()
         )
-        new_net = current_net + abs(proposed_additional_net)
+        new_net = abs(current_net + proposed_additional_net)
         limit = self._effective_limit(self.config.total_directional_nav) * self._nav
 
         if new_net > limit:

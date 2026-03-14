@@ -90,7 +90,7 @@ class LLMEstimate:
         slower when stable (signal still relevant).
         """
         age = self.age_seconds
-        move_factor = 1.0 + abs(price_change_since_signal) * 20
+        move_factor = min(5.0, 1.0 + abs(price_change_since_signal) * 20)
         lam = math.exp(-age * move_factor / half_life_s)
         return lam * self.p_calibrated + (1.0 - lam) * market_mid
 
@@ -100,7 +100,7 @@ class ReasonerConfig:
     """Configuration for the embedded LLM reasoner."""
 
     enabled: bool = False
-    auth_token: str = ""  # sk-ant-oat01-... OAuth token
+    auth_token: str = field(default="", repr=False)  # sk-ant-oat01-... OAuth token
     model: str = "claude-opus-4-6-20250610"
     blind_model: str = "claude-sonnet-4-6-20250514"
     challenge_model: str = "claude-opus-4-6-20250610"

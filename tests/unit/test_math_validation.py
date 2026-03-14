@@ -1,5 +1,6 @@
 """Tests for statistical validation — Paper 2 §5 worked examples."""
 
+import json
 import math
 
 from pmm1.math.validation import (
@@ -227,6 +228,27 @@ def test_paper2_worked_example_200_trades():
     sr_trade = per_trade_sharpe(edge, p_market)
     sr_annual = annualized_sharpe(sr_trade, n)
     assert abs(sr_annual - 2.26) < 0.1
+
+
+def test_rolling_sharpe_capped_positive():
+    """F02: Constant positive returns produce finite Sharpe <= 10.0."""
+    sr = rolling_sharpe([0.05] * 100)
+    assert math.isfinite(sr)
+    assert sr <= 10.0
+
+
+def test_rolling_sharpe_capped_negative():
+    """F02: Constant negative returns produce finite Sharpe >= -10.0."""
+    sr = rolling_sharpe([-0.05] * 100)
+    assert math.isfinite(sr)
+    assert sr >= -10.0
+
+
+def test_rolling_sharpe_json_serializable():
+    """F02: rolling_sharpe result is JSON-serializable (no inf/nan)."""
+    sr = rolling_sharpe([1.0] * 50)
+    # Must not raise
+    json.dumps({"sharpe": sr})
 
 
 def test_sprt_glr_detects_small_edge():

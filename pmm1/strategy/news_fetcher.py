@@ -49,6 +49,30 @@ class NewsFetcher:
         self._total_calls = 0
         self._total_errors = 0
 
+    @staticmethod
+    def _sanitize_question(question: str) -> str:
+        """Sanitize a market question to prevent prompt injection.
+
+        - Strips control characters (below 0x20) except space and tab.
+        - Removes lines starting with common prompt injection prefixes.
+        - Truncates to 500 characters.
+        """
+        # Strip control characters (keep space 0x20, tab 0x09, newline 0x0A)
+        question = "".join(
+            ch for ch in question
+            if ch >= " " or ch in ("\t", "\n")
+        )
+        # Remove prompt injection patterns (lines beginning with role prefixes)
+        question = re.sub(
+            r"(?mi)^(SYSTEM|ASSISTANT|Human|user)\s*:.*$",
+            "",
+            question,
+        )
+        # Collapse any leftover blank lines from removal
+        question = re.sub(r"\n{2,}", "\n", question).strip()
+        # Truncate to 500 characters
+        return question[:500]
+
     def _evict_stale_cache(self) -> None:
         """Remove stale news cache entries to prevent memory leaks."""
         stale = [
@@ -89,6 +113,8 @@ class NewsFetcher:
         """
         if self.backend == "none" or not self.api_key:
             return ""
+
+        question = self._sanitize_question(question)
 
         # Check cache
         cache_key = question[:100]
