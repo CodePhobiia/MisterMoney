@@ -139,6 +139,7 @@ class QuoteEngine:
         tick_size: float = 0.01,
         reward_ev: float = 0.0,
         optimal_base_spread: float | None = None,  # CL-01
+        optimal_gamma: float | None = None,
     ) -> float:
         """Avellaneda-Stoikov optimal half-spread.
 
@@ -155,6 +156,8 @@ class QuoteEngine:
             Half-spread in price units (not cents).
         """
         gamma = self.config.inventory_skew_gamma
+        if optimal_gamma is not None and optimal_gamma > 0:
+            gamma = 0.7 * gamma + 0.3 * optimal_gamma
         sigma_eff = max(0.01, features.sigma_eff)  # from MM-02 Phase 1
 
         # Time horizon: normalize to [0, 1] session
@@ -348,6 +351,7 @@ class QuoteEngine:
         edge_confidence: float = 1.0,
         n_active_positions: int = 1,
         optimal_base_spread: float | None = None,  # CL-01
+        optimal_gamma: float | None = None,
         shrinkage: float | None = None,        # KP-02
         dd_size_cap: float | None = None,      # KP-04
         diversity_disc: float | None = None,   # KP-05
@@ -377,7 +381,9 @@ class QuoteEngine:
         )
 
         # 2. Half spread
-        delta_t = self.compute_half_spread(features, tick_size, reward_ev, optimal_base_spread)
+        delta_t = self.compute_half_spread(
+            features, tick_size, reward_ev, optimal_base_spread, optimal_gamma,
+        )
 
         # MM-07: Asymmetric spread skew
         # When long: wider bid (don't accumulate), tighter ask (eager to sell)
@@ -527,6 +533,7 @@ class QuoteEngine:
         n_active_positions: int = 1,
         n_layers: int = 3,
         optimal_base_spread: float | None = None,  # CL-01
+        optimal_gamma: float | None = None,
         shrinkage: float | None = None,        # KP-02
         dd_size_cap: float | None = None,      # KP-04
         diversity_disc: float | None = None,   # KP-05
@@ -547,6 +554,7 @@ class QuoteEngine:
             nav=nav, edge_confidence=edge_confidence,
             n_active_positions=n_active_positions,
             optimal_base_spread=optimal_base_spread,
+            optimal_gamma=optimal_gamma,
             shrinkage=shrinkage,
             dd_size_cap=dd_size_cap,
             diversity_disc=diversity_disc,

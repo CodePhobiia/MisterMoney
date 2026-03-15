@@ -19,6 +19,7 @@ logger = structlog.get_logger(__name__)
 
 # Spread buckets in price units (0.5c to 3c)
 SPREAD_BUCKETS = [0.005, 0.01, 0.015, 0.02, 0.025, 0.03]
+GAMMA_BUCKETS = [0.005, 0.01, 0.015, 0.025, 0.04, 0.06]
 
 
 class BucketStats:
@@ -69,12 +70,22 @@ class SpreadOptimizer:
                              spread_capture=0.008, adverse_selection_5s=-0.003)
     """
 
-    def __init__(self, default_spread: float = 0.01, decay: float = 0.95) -> None:
+    def __init__(
+        self,
+        default_spread: float = 0.01,
+        decay: float = 0.95,
+        default_gamma: float = 0.015,
+    ) -> None:
         self.default_spread = default_spread
+        self.default_gamma = default_gamma
         self.decay = decay
         self._market_buckets: dict[str, dict[int, BucketStats]] = {}
         self._global_buckets: dict[int, BucketStats] = {
             i: BucketStats() for i in range(len(SPREAD_BUCKETS))
+        }
+        self._market_gamma_buckets: dict[str, dict[int, BucketStats]] = {}
+        self._global_gamma_buckets: dict[int, BucketStats] = {
+            i: BucketStats() for i in range(len(GAMMA_BUCKETS))
         }
 
     def _get_buckets(self, condition_id: str) -> dict[int, BucketStats]:
@@ -90,6 +101,23 @@ class SpreadOptimizer:
         best = 0
         for i, bucket_spread in enumerate(SPREAD_BUCKETS):
             dist = abs(spread - bucket_spread)
+            if dist < min_dist:
+                min_dist = dist
+                best = i
+        return best
+
+    def _get_gamma_buckets(self, condition_id: str) -> dict[int, BucketStats]:
+        if condition_id not in self._market_gamma_buckets:
+            self._market_gamma_buckets[condition_id] = {
+                i: BucketStats() for i in range(len(GAMMA_BUCKETS))
+            }
+        return self._market_gamma_buckets[condition_id]
+
+    def _classify_gamma_bucket(self, gamma: float) -> int:
+        min_dist = float("inf")
+        best = 0
+        for i, bucket_gamma in enumerate(GAMMA_BUCKETS):
+            dist = abs(gamma - bucket_gamma)
             if dist < min_dist:
                 min_dist = dist
                 best = i
@@ -112,30 +140,39 @@ class SpreadOptimizer:
         best_idx = max(buckets, key=lambda i: buckets[i].sample())
         return SPREAD_BUCKETS[best_idx]
 
+    def get_optimal_gamma(self, condition_id: str) -> float:
+        """Thompson-sample the best gamma bucket for this market."""
+        buckets = self._get_gamma_buckets(condition_id)
+        total_obs = sum(b.n for b in buckets.values())
+        if total_obs < 3:
+            global_obs = sum(b.n for b in self._global_gamma_buckets.values())
+            if global_obs < 10:
+                return self.default_gamma
+            buckets = self._global_gamma_buckets
+        best_idx = max(buckets, key=lambda i: buckets[i].sample())
+        return GAMMA_BUCKETS[best_idx]
+
     def record_fill(
         self,
         condition_id: str,
         spread_at_fill: float,
         spread_capture: float,
         adverse_selection_5s: float = 0.0,
+        gamma_at_fill: float | None = None,
     ) -> None:
-        """Record fill outcome for learning.
-
-        Args:
-            condition_id: Market identifier
-            spread_at_fill: Half-spread that was quoted when fill occurred
-            spread_capture: Actual spread captured (positive = good)
-            adverse_selection_5s: 5-second adverse selection (negative = bad)
-        """
-        reward = spread_capture + adverse_selection_5s  # Net spread after AS
+        """Record fill outcome for learning."""
+        reward = spread_capture + adverse_selection_5s
         bucket_idx = self._classify_bucket(spread_at_fill)
-
-        # Update market-specific buckets
         buckets = self._get_buckets(condition_id)
         buckets[bucket_idx].update(reward, self.decay)
-
-        # Update global buckets
         self._global_buckets[bucket_idx].update(reward, self.decay)
+
+        if gamma_at_fill is not None:
+            gamma_reward = spread_capture + 2 * adverse_selection_5s
+            gamma_idx = self._classify_gamma_bucket(gamma_at_fill)
+            gamma_buckets = self._get_gamma_buckets(condition_id)
+            gamma_buckets[gamma_idx].update(gamma_reward, self.decay)
+            self._global_gamma_buckets[gamma_idx].update(gamma_reward, self.decay)
 
     def save(self, path: str) -> None:
         """Persist to JSON."""
@@ -146,6 +183,13 @@ class SpreadOptimizer:
                 "markets": {
                     cid: {str(k): v.to_dict() for k, v in buckets.items()}
                     for cid, buckets in self._market_buckets.items()
+                },
+                "global_gamma": {
+                    str(k): v.to_dict() for k, v in self._global_gamma_buckets.items()
+                },
+                "market_gamma": {
+                    cid: {str(k): v.to_dict() for k, v in buckets.items()}
+                    for cid, buckets in self._market_gamma_buckets.items()
                 },
             }
             tmp = path + ".tmp"
@@ -169,7 +213,17 @@ class SpreadOptimizer:
                 self._market_buckets[cid] = {
                     int(k): BucketStats.from_dict(v) for k, v in buckets.items()
                 }
-            logger.info("spread_optimizer_loaded", markets=len(self._market_buckets))
+            for k, v in data.get("global_gamma", {}).items():
+                self._global_gamma_buckets[int(k)] = BucketStats.from_dict(v)
+            for cid, buckets in data.get("market_gamma", {}).items():
+                self._market_gamma_buckets[cid] = {
+                    int(k): BucketStats.from_dict(v) for k, v in buckets.items()
+                }
+            logger.info(
+                "spread_optimizer_loaded",
+                markets=len(self._market_buckets),
+                gamma_markets=len(self._market_gamma_buckets),
+            )
         except Exception as e:
             logger.warning("spread_optimizer_load_failed", error=str(e))
 

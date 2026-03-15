@@ -165,3 +165,52 @@ def test_save_atomic(tmp_path):
 
     assert os.path.exists(path)
     assert not os.path.exists(tmp_file)
+
+
+def test_get_optimal_gamma_default():
+    """Before any fills, gamma should be the default."""
+    from pmm1.analytics.spread_optimizer import SpreadOptimizer
+    so = SpreadOptimizer()
+    gamma = so.get_optimal_gamma("test_market")
+    assert gamma == so.default_gamma
+
+
+def test_get_optimal_gamma_after_fills():
+    """After fills, gamma should come from Thompson sampling."""
+    from pmm1.analytics.spread_optimizer import GAMMA_BUCKETS, SpreadOptimizer
+    so = SpreadOptimizer()
+    for _ in range(20):
+        so.record_fill(
+            "toxic_market",
+            spread_at_fill=0.015,
+            spread_capture=0.003,
+            adverse_selection_5s=-0.008,
+            gamma_at_fill=0.04,
+        )
+    gamma = so.get_optimal_gamma("toxic_market")
+    assert gamma in GAMMA_BUCKETS
+
+
+def test_gamma_save_load_roundtrip(tmp_path):
+    """Gamma buckets survive save/load."""
+    from pmm1.analytics.spread_optimizer import SpreadOptimizer
+    so = SpreadOptimizer()
+    for _ in range(10):
+        so.record_fill(
+            "mkt1", spread_at_fill=0.015,
+            spread_capture=0.003, adverse_selection_5s=-0.005,
+            gamma_at_fill=0.04,
+        )
+    path = str(tmp_path / "spread_opt.json")
+    so.save(path)
+
+    so2 = SpreadOptimizer()
+    so2.load(path)
+    assert so2.get_optimal_gamma("mkt1") is not None
+
+
+def test_default_gamma_property():
+    """SpreadOptimizer has default_gamma."""
+    from pmm1.analytics.spread_optimizer import SpreadOptimizer
+    so = SpreadOptimizer(default_gamma=0.015)
+    assert so.default_gamma == 0.015
