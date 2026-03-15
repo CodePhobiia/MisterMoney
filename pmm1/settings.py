@@ -94,9 +94,9 @@ class PricingConfig(BaseModel):
     # Kelly sizing parameters (Paper 2 §1)
     kelly_enabled: bool = True
     kelly_fraction: float = 0.25  # quarter-Kelly default
-    kelly_base_lambda: float = 0.10  # KP-01: adaptive ramp floor
+    kelly_base_lambda: float = 0.20  # KP-01: adaptive ramp floor (was 0.10 — cold-start deadlock)
     kelly_max_lambda: float = 0.35  # KP-01: adaptive ramp ceiling
-    kelly_min_edge: float = 0.03  # 3% minimum edge to size
+    kelly_min_edge: float = 0.01  # 1% minimum edge to size (was 3% — too strict for cold start)
     kelly_max_position_nav: float = 0.05  # 5% max per position
     kelly_adverse_selection_lambda: float = 1.0  # 1.0 = blend handles AS
     # MM-11: Inventory-proportional gamma

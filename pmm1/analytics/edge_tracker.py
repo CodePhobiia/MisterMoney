@@ -189,8 +189,9 @@ class EdgeTracker:
         """
         n = len(self.trades)
         if n < self.min_trades:
-            # Linear ramp from 0.1 to 0.5 over min_trades
-            return 0.1 + 0.4 * (n / self.min_trades)
+            # Linear ramp from 0.3 to 0.5 over min_trades
+            # Floor at 0.3 (was 0.1) to prevent cold-start deadlock
+            return 0.3 + 0.2 * (n / self.min_trades)
 
         if self.sprt_decision == "edge_confirmed":
             return 1.0

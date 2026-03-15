@@ -14,7 +14,7 @@ def test_edge_tracker_empty():
     summary = tracker.get_summary()
     assert summary["total_trades"] == 0
     assert summary["sprt_decision"] == "undecided"
-    assert summary["edge_confidence"] == 0.1
+    assert summary["edge_confidence"] == 0.3  # Cold-start floor raised from 0.1
 
 
 def test_edge_tracker_low_trade_count():
