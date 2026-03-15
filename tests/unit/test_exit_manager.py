@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from pmm1.math.kelly import kelly_growth_rate
 from pmm1.settings import (
     ExitConfig,
     FlattenConfig,
@@ -1151,3 +1152,54 @@ class TestKellyExit:
         # Large edge: fraction will be substantial, growth positive
         sig = em.get_kelly_exit_signal("cond-1", p_true=0.80, p_market=0.50)
         assert sig is None
+
+
+# --- Kelly-rational exit tests ---
+
+
+def test_kelly_growth_rate_no_edge():
+    """When p_fair == p_market, growth rate is 0."""
+    assert kelly_growth_rate(0.50, 0.50) == pytest.approx(0.0, abs=1e-10)
+
+
+def test_kelly_growth_rate_positive_edge():
+    """When we have edge, growth rate is positive."""
+    g = kelly_growth_rate(0.60, 0.50)
+    assert g > 0
+
+
+def test_kelly_growth_rate_increases_with_edge():
+    """More edge = higher growth rate."""
+    g_small = kelly_growth_rate(0.55, 0.50)
+    g_large = kelly_growth_rate(0.70, 0.50)
+    assert g_large > g_small
+
+
+def test_kelly_exit_triggers_when_edge_gone():
+    """Should exit when growth rate < exit urgency."""
+    growth = kelly_growth_rate(0.50, 0.50)
+    cost_to_exit = 0.01
+    time_remaining = 2.0
+    urgency = cost_to_exit / max(0.1, time_remaining)
+    assert growth < urgency
+
+
+def test_kelly_exit_holds_with_strong_edge():
+    """Should hold when growth rate >> exit urgency."""
+    growth = kelly_growth_rate(0.70, 0.50)
+    cost_to_exit = 0.01
+    time_remaining = 10.0
+    urgency = cost_to_exit / max(0.1, time_remaining)
+    assert growth > urgency
+
+
+def test_kelly_exit_time_decay():
+    """As time shrinks, urgency increases."""
+    growth = kelly_growth_rate(0.55, 0.50)
+    cost = 0.01
+
+    urgency_10h = cost / 10.0
+    urgency_01h = cost / 0.1
+
+    assert growth > urgency_10h
+    assert growth < urgency_01h

@@ -2,10 +2,11 @@
 
 Layers (priority order):
 1. FLATTEN — emergency operator command or kill switch
-2. STOP-LOSS — drawdown-triggered mandatory exit
-3. RESOLUTION — time-based ramp before market end_date
-4. TAKE-PROFIT — threshold-triggered partial/full exit
-5. ORPHAN — positions not in active universe
+2. KELLY-RATIONAL EXIT — exit when Kelly growth rate < exit urgency
+3. STOP-LOSS — drawdown-triggered mandatory exit
+4. RESOLUTION — time-based ramp before market end_date
+5. TAKE-PROFIT — threshold-triggered partial/full exit
+6. ORPHAN — positions not in active universe
 """
 
 from __future__ import annotations
@@ -137,21 +138,38 @@ class ExitManager:
                         signals.append(sig)
                         continue  # Don't stack signals for this side
 
-                # 2. STOP-LOSS
+                # 2. KELLY-RATIONAL EXIT
+                if avg_price > 0 and current_price is not None:
+                    _p_fair = getattr(md, '_latest_fair_value', None) if md else None
+                    _time_remaining = (
+                        getattr(md, 'hours_to_end', 24.0) if md else 24.0
+                    )
+                    _half_spread = getattr(md, '_latest_half_spread', 0.01) if md else 0.01
+                    sig = self._check_kelly_rational_exit(
+                        pos, token_id, inv_size, avg_price, current_price,
+                        p_fair=_p_fair,
+                        time_remaining_hours=_time_remaining,
+                        half_spread=_half_spread,
+                    )
+                    if sig:
+                        signals.append(sig)
+                        continue
+
+                # 3. STOP-LOSS
                 if self.config.stop_loss.enabled and avg_price > 0 and current_price is not None:
                     sig = self._check_stop_loss(pos, token_id, inv_size, avg_price, current_price)
                     if sig:
                         signals.append(sig)
                         continue
 
-                # 3. RESOLUTION
+                # 4. RESOLUTION
                 if self.config.resolution.enabled and md and md.end_date:
                     sig = self._check_resolution(pos, token_id, inv_size, md, current_price)
                     if sig:
                         signals.append(sig)
                         continue
 
-                # 4. TAKE-PROFIT
+                # 5. TAKE-PROFIT
                 if self.config.take_profit.enabled and avg_price > 0 and current_price is not None:
                     sig = self._check_take_profit(
                         pos, token_id, inv_size,
@@ -161,7 +179,7 @@ class ExitManager:
                         signals.append(sig)
                         continue
 
-                # 5. ORPHAN (only check periodically)
+                # 6. ORPHAN (only check periodically)
                 if (
                     is_orphan and
                     now - self._last_orphan_check >= self.config.orphan.check_interval_s
@@ -268,6 +286,49 @@ class ExitManager:
             urgency="critical",
             reason="flatten",
         )
+
+    def _check_kelly_rational_exit(
+        self,
+        pos: MarketPosition,
+        token_id: str,
+        size: float,
+        avg_price: float,
+        current_price: float,
+        p_fair: float | None,
+        time_remaining_hours: float,
+        half_spread: float,
+    ) -> SellSignal | None:
+        """Kelly-rational exit: exit when growth rate < cost to stay."""
+        if p_fair is None or current_price is None:
+            return None
+        if avg_price <= 0:
+            return None
+
+        from pmm1.math.kelly import kelly_growth_rate
+
+        growth = kelly_growth_rate(p_fair, current_price)
+        cost_to_exit = max(0.001, half_spread)
+        urgency = cost_to_exit / max(0.1, time_remaining_hours)
+
+        if growth < urgency:
+            logger.info(
+                "kelly_rational_exit",
+                condition_id=pos.condition_id[:16],
+                growth=f"{growth:.6f}",
+                urgency=f"{urgency:.6f}",
+                p_fair=f"{p_fair:.3f}",
+                p_market=f"{current_price:.3f}",
+                time_h=f"{time_remaining_hours:.1f}",
+            )
+            return SellSignal(
+                token_id=token_id,
+                condition_id=pos.condition_id,
+                size=size,
+                price=current_price,
+                urgency="medium",
+                reason="kelly_rational_exit",
+            )
+        return None
 
     def _check_stop_loss(
         self,
