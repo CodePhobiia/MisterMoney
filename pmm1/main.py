@@ -2058,6 +2058,7 @@ async def run(settings: Settings | None = None) -> None:
                     spread_at_fill=spread_optimizer.get_optimal_base_spread(condition_id),
                     spread_capture=realized_spread_capture or 0.0,
                     adverse_selection_5s=adverse_selection_estimate or 0.0,
+                    gamma_at_fill=spread_optimizer.get_optimal_gamma(condition_id),
                 )
 
             # CL-05: Post-mortem classification
@@ -2597,6 +2598,7 @@ async def run(settings: Settings | None = None) -> None:
     )
 
     # ── Main quote loop ──
+    _toxicity_mute_until: dict[str, float] = {}
     cycle_count = 0
     quote_interval = settings.bot.quote_cycle_ms / 1000.0
     last_rebate_check = 0.0  # S0-3: track last rebate check time
@@ -3268,8 +3270,31 @@ async def run(settings: Settings | None = None) -> None:
                         cluster_inventory=cluster_inv,
                     )
 
+                    # Toxicity pause: suppress quoting when VPIN is dangerously high
+                    if features.vpin > settings.pricing.toxicity_pause_vpin:
+                        _toxicity_mute_until[md.condition_id] = (
+                            time.time() + settings.pricing.toxicity_pause_seconds
+                        )
+                    if time.time() < _toxicity_mute_until.get(md.condition_id, 0):
+                        for _sup_tok in filter(None, [md.token_id_yes, md.token_id_no]):
+                            suppress_result = await _clear_token_quotes(
+                                _sup_tok,
+                                md.condition_id,
+                                state.tick_sizes.get(_sup_tok, Decimal("0.01")),
+                                md.neg_risk,
+                                ["toxicity_pause"],
+                                ["toxicity_pause"],
+                            )
+                            _merge_replacement_reasons(
+                                cycle_replacement_reason_counts, suppress_result,
+                            )
+                        continue
+
                     # ── CL-01/KP-02/KP-04: Compute analytics-derived pricing params ──
                     _optimal_spread = spread_optimizer.get_optimal_base_spread(
+                        md.condition_id,
+                    )
+                    _optimal_gamma = spread_optimizer.get_optimal_gamma(
                         md.condition_id,
                     )
                     _edge = abs(fv_estimate.fair_value - features.midpoint)
@@ -3299,6 +3324,7 @@ async def run(settings: Settings | None = None) -> None:
                         edge_confidence=_edge_confidence,
                         n_active_positions=len(state.active_markets),
                         optimal_base_spread=_optimal_spread,
+                        optimal_gamma=_optimal_gamma,
                         shrinkage=_shrinkage,
                         dd_size_cap=_dd_cap,
                     )
@@ -3688,6 +3714,7 @@ async def run(settings: Settings | None = None) -> None:
                             edge_confidence=_edge_confidence,
                             n_active_positions=len(state.active_markets),
                             optimal_base_spread=_optimal_spread,
+                            optimal_gamma=_optimal_gamma,
                             shrinkage=_shrinkage,
                             dd_size_cap=_dd_cap,
                         )

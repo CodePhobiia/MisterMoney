@@ -104,6 +104,9 @@ class PricingConfig(BaseModel):
     # Fill model coefficients
     theta_0: float = -1.0
     theta_1: float = 5.0
+    # Toxicity-based quoting pause
+    toxicity_pause_vpin: float = 0.55
+    toxicity_pause_seconds: float = 30.0
     theta_2: float = 0.5
     theta_3: float = 1.0
 
