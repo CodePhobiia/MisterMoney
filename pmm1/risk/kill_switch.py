@@ -246,3 +246,114 @@ class KillSwitch:
             "reconciliation_mismatch_count": self._reconciliation_mismatch_count,
             "total_triggers": len(self._trigger_history),
         }
+
+
+class MismatchTracker:
+    """Per-market staged recovery for reconciliation mismatches.
+
+    Stage 0: Clean — quote normally
+    Stage 1: Skip quoting this market for skip_duration_s
+    Stage 2: Read-only (no orders) for this market
+    Stage 3: FLATTEN_ONLY with auto-recovery attempts
+    """
+
+    def __init__(
+        self,
+        skip_duration_s: float = 30.0,
+        clean_reset_s: float = 600.0,
+        max_recovery_attempts: int = 3,
+    ) -> None:
+        self._skip_duration_s = skip_duration_s
+        self._clean_reset_s = clean_reset_s
+        self._max_recovery_attempts = max_recovery_attempts
+
+        self._stages: dict[str, int] = {}
+        self._last_mismatch_ts: dict[str, float] = {}
+        self._skip_until: dict[str, float] = {}
+        self._recovery_attempts: dict[str, int] = {}
+
+    def get_stage(self, condition_id: str) -> int:
+        return self._stages.get(condition_id, 0)
+
+    def record_mismatch(self, condition_id: str) -> int:
+        """Record a mismatch. Returns the new stage (1-3)."""
+        current = self._stages.get(condition_id, 0)
+        new_stage = min(3, current + 1)
+        self._stages[condition_id] = new_stage
+        self._last_mismatch_ts[condition_id] = time.time()
+
+        if new_stage == 1:
+            self._skip_until[condition_id] = time.time() + self._skip_duration_s
+
+        logger.warning(
+            "mismatch_stage_escalated",
+            condition_id=condition_id[:16],
+            old_stage=current,
+            new_stage=new_stage,
+        )
+        return new_stage
+
+    def record_clean(self, condition_id: str) -> None:
+        """Record clean reconciliation — reset to stage 0."""
+        if condition_id in self._stages:
+            old = self._stages[condition_id]
+            if old > 0:
+                logger.info(
+                    "mismatch_stage_cleared",
+                    condition_id=condition_id[:16],
+                    old_stage=old,
+                )
+            del self._stages[condition_id]
+            self._last_mismatch_ts.pop(condition_id, None)
+            self._skip_until.pop(condition_id, None)
+
+    def should_skip(self, condition_id: str) -> bool:
+        """Stage 1+: should we skip quoting this market?"""
+        stage = self.get_stage(condition_id)
+        if stage == 0:
+            return False
+        if stage >= 2:
+            return True
+        return time.time() < self._skip_until.get(condition_id, 0)
+
+    def is_read_only(self, condition_id: str) -> bool:
+        """Stage 2+: market is read-only."""
+        return self.get_stage(condition_id) >= 2
+
+    def should_flatten(self, condition_id: str) -> bool:
+        """Stage 3: should FLATTEN_ONLY."""
+        return self.get_stage(condition_id) >= 3
+
+    def attempt_recovery(self, condition_id: str) -> bool:
+        """Attempt recovery from Stage 3. Returns True if allowed."""
+        attempts = self._recovery_attempts.get(condition_id, 0)
+        if attempts >= self._max_recovery_attempts:
+            logger.critical(
+                "mismatch_recovery_exhausted",
+                condition_id=condition_id[:16],
+                attempts=attempts,
+            )
+            return False
+
+        self._recovery_attempts[condition_id] = attempts + 1
+        self._stages[condition_id] = 0
+        self._skip_until.pop(condition_id, None)
+        logger.info(
+            "mismatch_recovery_attempted",
+            condition_id=condition_id[:16],
+            attempt=attempts + 1,
+            max_attempts=self._max_recovery_attempts,
+        )
+        return True
+
+    def get_status(self) -> dict[str, Any]:
+        return {
+            "tracked_markets": len(self._stages),
+            "stages": {
+                cid: {
+                    "stage": stage,
+                    "recovery_attempts": self._recovery_attempts.get(cid, 0),
+                }
+                for cid, stage in self._stages.items()
+            },
+        }
